@@ -1,0 +1,119 @@
+# duopipe peer configuration example
+#
+# Usage: duopipe peer -c peer.toml
+#        duopipe peer --default-config   # loads ~/.config/duopipe/peer.toml
+#
+# One peer DIALS (connect = "dial"), the other LISTENS (connect = "listen").
+# Over the single connection, EITHER side may declare:
+#   - local forwards  (-L): this peer listens locally, the peer connects to dest
+#   - remote forwards (-R): the peer listens, forwarding back to our local dest
+#
+# Trust model: once ALPN + token auth succeeds, the peer is fully trusted (there
+# are no per-destination allowlists). CLI flags take precedence over this file.
+
+mode = "iroh"
+
+[iroh]
+# Connection role: "dial" or "listen".
+connect = "dial"
+
+# --- when connect = "dial" ---
+# EndpointId of the peer to dial. Get it from the listening peer's startup log
+# or via: duopipe show-id --secret-file peer.key
+peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+
+# Auth token presented to the listening peer.
+# Generate with: duopipe generate-auth-token
+# SECURITY: Plaintext 'auth_token' is not allowed in config files. Use
+# 'auth_token_file' (recommended), DUOPIPE_AUTH_TOKEN, or an age-encrypted value.
+auth_token_file = "~/.config/duopipe/token.txt"
+
+# --- when connect = "listen" (comment out the dial fields above) ---
+# Stable identity so the dialing peer can reach this one.
+# Generate with: duopipe generate-key --output peer.key
+# secret_file = "./peer.key"
+#
+# Accepted auth tokens (one per line, # comments allowed).
+# auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
+
+# ALPN token (REQUIRED for both roles). Pre-shared token embedded in the QUIC
+# ALPN identifier; rejects unknown peers at the handshake before any stream opens.
+# Both peers must use the same token. Generate with: duopipe generate-alpn-token
+# SECURITY: Plaintext 'alpn_token' is not allowed in config files. Use
+# 'alpn_token_file' (recommended), DUOPIPE_ALPN_TOKEN, or an age-encrypted value.
+alpn_token_file = "~/.config/duopipe/alpn_token.txt"
+
+# Maximum concurrent data streams per connection (default: 100).
+# max_sessions = 100
+
+# Custom relay server URL(s) for failover. Defaults to iroh's public relays.
+# relay_urls = ["https://relay1.example.com", "https://relay2.example.com"]
+
+# Custom DNS server URL for iroh endpoint discovery (pkarr), or "none" to disable
+# DNS discovery. NOT system DNS; does not affect destination resolution.
+# NOTE: URL must include the /pkarr path. Both peers must match.
+# dns_server = "https://dns.example.com/pkarr"
+# dns_server = "none"
+
+# ============================================================================
+# Local forwards (-L): this peer listens locally, the peer connects to dest.
+# The 'dest' scheme (tcp:// or udp://) selects the protocol.
+# ============================================================================
+[[iroh.local_forward]]
+listen = "127.0.0.1:15678"
+dest = "tcp://127.0.0.1:5678"
+
+[[iroh.local_forward]]
+listen = "127.0.0.1:15679"
+dest = "tcp://127.0.0.1:5679"
+
+# ============================================================================
+# Remote forwards (-R): the peer binds 'bind' and forwards back to our 'dest'.
+# The 'bind' scheme (tcp:// or udp://) selects the protocol.
+# ============================================================================
+[[iroh.remote_forward]]
+bind = "tcp://0.0.0.0:6574"
+dest = "127.0.0.1:6574"
+
+[[iroh.remote_forward]]
+bind = "udp://127.0.0.1:5447"
+dest = "127.0.0.1:5447"
+
+# ============================================================================
+# Encrypted Inline Secrets (Optional)
+# ============================================================================
+# Instead of _file variants, you can encrypt secrets directly in this config
+# using age encryption (useful for managing multiple configs with one key).
+#
+# 1. Generate a key: duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
+# 2. Encrypt a value: echo -n "token" | duopipe config-encryption encrypt-value --recipient age1...
+# 3. Paste the ageenc:... output as a TOML string value.
+#
+# encryption_key_file is required at runtime to decrypt ageenc: values.
+# encryption_recipient is only used by `encrypt-value` to select the public key.
+#
+# encryption_key_file = "~/.config/duopipe/age.key"
+# encryption_recipient = "age1..."
+#
+# auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
+# alpn_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
+
+# ============================================================================
+# Transport Tuning (Optional)
+# ============================================================================
+# Fine-tune the QUIC transport layer. All values have sensible defaults.
+[iroh.transport]
+# Congestion controller: cubic (default), bbr, or newreno.
+# congestion_controller = "cubic"
+
+# QUIC per-stream receive window in bytes (default: 67108864 = 64MB).
+# Valid range: 1024 (1KB) to 67108864 (64MB).
+# receive_window = 67108864
+
+# QUIC send window in bytes (default: 67108864 = 64MB).
+# send_window = 67108864
+
+# QUIC ACK-eliciting threshold (default: unset = iroh/quinn default cadence).
+# Leave unset unless you have measured a benefit. 0 = ACK every packet.
+# Valid range: 0 to 65535.
+# ack_eliciting_threshold = 2
