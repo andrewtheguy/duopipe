@@ -439,7 +439,7 @@ graph TB
 
 ## Configuration System
 
-A single, symmetric `PeerConfig` drives the peer. There is no `role` enum; the connection role is selected by `[iroh].connect` (`"dial"` or `"listen"`).
+A single, symmetric `PeerConfig` drives the peer. There is no `role` enum; the connection role is selected by the top-level `connect` key (`"dial"` or `"listen"`).
 
 ### Configuration File Structure
 
@@ -483,8 +483,8 @@ The connection role and its role-specific requirements (`peer_node_id` + an auth
 
 | Credential | Env Vars / CLI Flags | Config Keys (TOML: use `_file` variants or age-encrypted inline) | Expected Usage |
 |------------|-----------|-------------|----------------|
-| **ALPN Token** | `DUOPIPE_ALPN_TOKEN` or `--alpn-token-file` | `[iroh].alpn_token_file` or age-encrypted `[iroh].alpn_token` | Pre-handshake QUIC ALPN filter (`mf/2/<token>`). One shared value for both peers. |
-| **Auth Token** | Dial peer: `DUOPIPE_AUTH_TOKEN` or `--auth-token-file`<br>Listen peer: `DUOPIPE_AUTH_TOKENS` or `--auth-tokens-file` | Dial peer: `[iroh].auth_token_file` or age-encrypted `[iroh].auth_token`<br>Listen peer: `[iroh].auth_tokens_file` or age-encrypted `[iroh].auth_tokens` | Connection-level credential validated on the first bi-stream. The dial peer **presents** one token; the listen peer **accepts** a set. Use separate values per dialer for revocation/rotation. |
+| **ALPN Token** | `DUOPIPE_ALPN_TOKEN` or `--alpn-token-file` | `alpn_token_file` or age-encrypted `alpn_token` | Pre-handshake QUIC ALPN filter (`mf/2/<token>`). One shared value for both peers. |
+| **Auth Token** | Dial peer: `DUOPIPE_AUTH_TOKEN` or `--auth-token-file`<br>Listen peer: `DUOPIPE_AUTH_TOKENS` or `--auth-tokens-file` | Dial peer: `auth_token_file` or age-encrypted `auth_token`<br>Listen peer: `auth_tokens_file` or age-encrypted `auth_tokens` | Connection-level credential validated on the first bi-stream. The dial peer **presents** one token; the listen peer **accepts** a set. Use separate values per dialer for revocation/rotation. |
 
 Example usage with files (recommended):
 
@@ -521,39 +521,30 @@ Example config usage (plaintext tokens are not allowed in TOML config files — 
 
 ```toml
 # peer-listen.toml — using _file variants
-mode = "iroh"
-
-[iroh]
 connect = "listen"
 secret_file = "/etc/duopipe/peer.key"
 alpn_token_file = "/etc/duopipe/alpn_token.txt"
 auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
 
-[[iroh.local_forward]]
+[[local_forward]]
 listen = "127.0.0.1:2222"
 dest = "tcp://127.0.0.1:22"
 ```
 
 ```toml
 # peer-dial.toml — using _file variants
-mode = "iroh"
-
-[iroh]
 connect = "dial"
 peer_node_id = "<ENDPOINT_ID>"
 alpn_token_file = "~/.config/duopipe/alpn_token.txt"
 auth_token_file = "~/.config/duopipe/token.txt"
 
-[[iroh.remote_forward]]
+[[remote_forward]]
 bind = "tcp://0.0.0.0:6574"
 dest = "127.0.0.1:6574"
 ```
 
 ```toml
 # peer-dial.toml — using age-encrypted inline values
-mode = "iroh"
-
-[iroh]
 connect = "dial"
 peer_node_id = "<ENDPOINT_ID>"
 encryption_key_file = "~/.config/duopipe/age.key"
@@ -605,7 +596,7 @@ sequenceDiagram
 
 ```mermaid
 graph TB
-    A[Load Config] --> B{mode = iroh?}
+    A[Load Config] --> B{config present?}
     B -->|No| C[Error: Missing/invalid mode]
     B -->|Yes| F{Check sections}
 
@@ -692,8 +683,8 @@ Iroh mode uses two layers of authentication. First, a pre-shared ALPN token is e
 
 #### ALPN Token vs Auth Token
 
-- **ALPN Token** (`DUOPIPE_ALPN_TOKEN` env var / `--alpn-token-file` / `[iroh].alpn_token_file`): Pre-handshake shared value used for QUIC ALPN filtering. Both peers must use the same value.
-- **Auth Token** (listen peer: `DUOPIPE_AUTH_TOKENS` env var / `--auth-tokens-file` / `[iroh].auth_tokens_file`; dial peer: `DUOPIPE_AUTH_TOKEN` env var / `--auth-token-file` / `[iroh].auth_token_file`): Connection-level token validated on the first bi-stream.
+- **ALPN Token** (`DUOPIPE_ALPN_TOKEN` env var / `--alpn-token-file` / `alpn_token_file`): Pre-handshake shared value used for QUIC ALPN filtering. Both peers must use the same value.
+- **Auth Token** (listen peer: `DUOPIPE_AUTH_TOKENS` env var / `--auth-tokens-file` / `auth_tokens_file`; dial peer: `DUOPIPE_AUTH_TOKEN` env var / `--auth-token-file` / `auth_token_file`): Connection-level token validated on the first bi-stream.
 - **Mapping**: These are **distinct tokens**, not the same value. In code, ALPN tokens are 14-char Base64URL values, while auth tokens are 47-char `i...` tokens. Typical setup is one shared ALPN token plus per-dialer auth tokens for revocation.
 
 1. **ALPN Filtering**: Both peers set `DUOPIPE_ALPN_TOKEN`. The token is embedded in the QUIC ALPN identifier (`mf/2/<token>`). Connections without a matching ALPN are rejected at the handshake level — acting as a lightweight "port knock".

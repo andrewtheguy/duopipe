@@ -11,9 +11,6 @@
 # Trust model: once ALPN + token auth succeeds, the peer is fully trusted (there
 # are no per-destination allowlists). CLI flags take precedence over this file.
 
-mode = "iroh"
-
-[iroh]
 # Connection role: "dial" or "listen".
 connect = "dial"
 
@@ -59,11 +56,11 @@ alpn_token_file = "~/.config/duopipe/alpn_token.txt"
 # Local forwards (-L): this peer listens locally, the peer connects to dest.
 # The 'dest' scheme (tcp:// or udp://) selects the protocol.
 # ============================================================================
-[[iroh.local_forward]]
+[[local_forward]]
 listen = "127.0.0.1:15678"
 dest = "tcp://127.0.0.1:5678"
 
-[[iroh.local_forward]]
+[[local_forward]]
 listen = "127.0.0.1:15679"
 dest = "tcp://127.0.0.1:5679"
 
@@ -71,11 +68,11 @@ dest = "tcp://127.0.0.1:5679"
 # Remote forwards (-R): the peer binds 'bind' and forwards back to our 'dest'.
 # The 'bind' scheme (tcp:// or udp://) selects the protocol.
 # ============================================================================
-[[iroh.remote_forward]]
+[[remote_forward]]
 bind = "tcp://0.0.0.0:6574"
 dest = "127.0.0.1:6574"
 
-[[iroh.remote_forward]]
+[[remote_forward]]
 bind = "udp://127.0.0.1:5447"
 dest = "127.0.0.1:5447"
 
@@ -102,7 +99,7 @@ dest = "127.0.0.1:5447"
 # Transport Tuning (Optional)
 # ============================================================================
 # Fine-tune the QUIC transport layer. All values have sensible defaults.
-[iroh.transport]
+[transport]
 # Congestion controller: cubic (default), bbr, or newreno.
 # congestion_controller = "cubic"
 

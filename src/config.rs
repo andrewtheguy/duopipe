@@ -1,13 +1,11 @@
 //! Configuration file support for duopipe.
 //!
-//! A single symmetric peer config:
-//! - `mode` field for validation (mode only accepts "iroh")
-//! - Mode-specific section: [iroh]
+//! A single symmetric peer config with all keys at the top level.
 //!
-//! `[iroh].connect` selects the connection role ("dial" or "listen"). Over one
+//! `connect` selects the connection role ("dial" or "listen"). Over one
 //! established connection a peer can run many tunnels in both directions:
-//! local forwards (`-L`, `[[iroh.local_forward]]`) and remote forwards
-//! (`-R`, `[[iroh.remote_forward]]`). `validate()` checks required fields and
+//! local forwards (`-L`, `[[local_forward]]`) and remote forwards
+//! (`-R`, `[[remote_forward]]`). `validate()` checks required fields and
 //! address formats at parse time.
 
 use anyhow::{Context, Result};
@@ -81,7 +79,7 @@ impl IrohConfig {
         use crate::encryption::is_age_encrypted;
         if self.auth_token.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
             anyhow::bail!(
-                "[iroh] Plaintext 'auth_token' is not allowed in config files. \
+                "Plaintext 'auth_token' is not allowed in config files. \
                  Use 'auth_token_file', set DUOPIPE_AUTH_TOKEN env var, \
                  or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
             );
@@ -92,21 +90,21 @@ impl IrohConfig {
             .is_some_and(|vs| vs.iter().any(|v| !is_age_encrypted(v)))
         {
             anyhow::bail!(
-                "[iroh] Plaintext 'auth_tokens' is not allowed in config files. \
+                "Plaintext 'auth_tokens' is not allowed in config files. \
                  Use 'auth_tokens_file', set DUOPIPE_AUTH_TOKENS env var, \
                  or use age-encrypted values. See: duopipe config-encryption encrypt-value --help"
             );
         }
         if self.alpn_token.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
             anyhow::bail!(
-                "[iroh] Plaintext 'alpn_token' is not allowed in config files. \
+                "Plaintext 'alpn_token' is not allowed in config files. \
                  Use 'alpn_token_file', set DUOPIPE_ALPN_TOKEN env var, \
                  or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
             );
         }
         if self.secret.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
             anyhow::bail!(
-                "[iroh] Plaintext 'secret' is not allowed in config files. \
+                "Plaintext 'secret' is not allowed in config files. \
                  Use 'secret_file', set DUOPIPE_SECRET env var, \
                  or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
             );
@@ -142,7 +140,7 @@ impl IrohConfig {
         let key_path = encryption_key_file.ok_or_else(|| {
             anyhow::anyhow!(
                 "Age-encrypted values found but no encryption key file specified.\n\
-                 Set [iroh].encryption_key_file in config, use --encryption-key-file, \
+                 Set encryption_key_file in config, use --encryption-key-file, \
                  or set DUOPIPE_ENCRYPTION_KEY_FILE env var."
             )
         })?;
@@ -221,13 +219,6 @@ pub enum ConfigSource {
     None,
 }
 
-/// Connection mode. Only iroh is supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Iroh,
-}
-
 /// Congestion controller algorithm selection.
 ///
 /// Controls how the QUIC connection manages congestion and adjusts sending rates.
@@ -290,14 +281,11 @@ pub struct TransportTuning {
     pub ack_eliciting_threshold: Option<u32>,
 }
 
-/// Unified peer configuration.
+/// Unified peer configuration. All keys live at the top level.
 #[derive(Deserialize, Default)]
 pub struct PeerConfig {
-    // Validation field
-    pub mode: Option<Mode>,
-
-    // Mode-specific section
-    pub iroh: Option<IrohConfig>,
+    #[serde(flatten)]
+    pub iroh: IrohConfig,
 }
 
 // ============================================================================
@@ -444,7 +432,7 @@ pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Res
 impl PeerConfig {
     /// Get iroh config section.
     pub fn iroh(&self) -> Option<&IrohConfig> {
-        self.iroh.as_ref()
+        Some(&self.iroh)
     }
 
     /// Validate config structure and address formats.
@@ -453,29 +441,24 @@ impl PeerConfig {
     /// (`peer_node_id` for dial, secret for listen) are resolved and enforced in
     /// `main.rs` after merging CLI/env overrides, since those can supply the values.
     pub fn validate(&self, source: ConfigSource) -> Result<()> {
-        self.mode.context(
-            "Config file missing required 'mode' field. Add: mode = \"iroh\"",
-        )?;
-
-        if let Some(ref iroh) = self.iroh {
-            if source == ConfigSource::File {
-                iroh.reject_plaintext_secrets()?;
-            }
-            if iroh.secret.is_some() && iroh.secret_file.is_some() {
-                anyhow::bail!("[iroh] Use only one of 'secret' or 'secret_file'.");
-            }
-            if iroh.auth_tokens.is_some() && iroh.auth_tokens_file.is_some() {
-                anyhow::bail!("[iroh] Use only one of 'auth_tokens' or 'auth_tokens_file'.");
-            }
-            if iroh.auth_token.is_some() && iroh.auth_token_file.is_some() {
-                anyhow::bail!("[iroh] Use only one of 'auth_token' or 'auth_token_file'.");
-            }
-            if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
-                anyhow::bail!("[iroh] Use only one of 'alpn_token' or 'alpn_token_file'.");
-            }
-            validate_forward_specs(&iroh.local_forward, &iroh.remote_forward)?;
-            validate_transport_tuning(&iroh.transport, "iroh")?;
+        let iroh = &self.iroh;
+        if source == ConfigSource::File {
+            iroh.reject_plaintext_secrets()?;
         }
+        if iroh.secret.is_some() && iroh.secret_file.is_some() {
+            anyhow::bail!("Use only one of 'secret' or 'secret_file'.");
+        }
+        if iroh.auth_tokens.is_some() && iroh.auth_tokens_file.is_some() {
+            anyhow::bail!("Use only one of 'auth_tokens' or 'auth_tokens_file'.");
+        }
+        if iroh.auth_token.is_some() && iroh.auth_token_file.is_some() {
+            anyhow::bail!("Use only one of 'auth_token' or 'auth_token_file'.");
+        }
+        if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
+            anyhow::bail!("Use only one of 'alpn_token' or 'alpn_token_file'.");
+        }
+        validate_forward_specs(&iroh.local_forward, &iroh.remote_forward)?;
+        validate_transport_tuning(&iroh.transport, "transport")?;
 
         Ok(())
     }
@@ -558,10 +541,39 @@ mod tests {
     use super::*;
 
     fn peer_config_with_iroh(iroh: IrohConfig) -> PeerConfig {
-        PeerConfig {
-            mode: Some(Mode::Iroh),
-            iroh: Some(iroh),
-        }
+        PeerConfig { iroh }
+    }
+
+    #[test]
+    fn parses_flattened_toml() {
+        let toml = r#"
+connect = "dial"
+peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+max_sessions = 100
+
+[[local_forward]]
+listen = "127.0.0.1:15678"
+dest = "tcp://127.0.0.1:5678"
+
+[[remote_forward]]
+bind = "tcp://0.0.0.0:6574"
+dest = "127.0.0.1:6574"
+
+[transport]
+congestion_controller = "bbr"
+receive_window = 67108864
+"#;
+        let cfg: PeerConfig = toml::from_str(toml).expect("flattened TOML should parse");
+        assert_eq!(cfg.iroh.connect, Some(ConnectRole::Dial));
+        assert_eq!(cfg.iroh.max_sessions, Some(100));
+        assert_eq!(cfg.iroh.local_forward.len(), 1);
+        assert_eq!(cfg.iroh.remote_forward.len(), 1);
+        assert_eq!(
+            cfg.iroh.transport.congestion_controller,
+            CongestionController::Bbr
+        );
+        assert_eq!(cfg.iroh.transport.receive_window, Some(67108864));
+        cfg.validate(ConfigSource::File).expect("config should validate");
     }
 
     #[test]
