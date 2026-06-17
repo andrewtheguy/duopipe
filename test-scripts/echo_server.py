@@ -17,7 +17,14 @@ import threading
 import sys
 from datetime import datetime
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 19999
+if len(sys.argv) > 1:
+    try:
+        PORT = int(sys.argv[1])
+    except ValueError:
+        print(f"Error: port must be a valid integer, got: {sys.argv[1]!r}")
+        sys.exit(1)
+else:
+    PORT = 19999
 connection_count = 0
 lock = threading.Lock()
 

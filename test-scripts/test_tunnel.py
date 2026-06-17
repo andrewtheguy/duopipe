@@ -65,6 +65,9 @@ def parse_args():
         idx = args.index('--stream')
         if idx + 1 < len(args) and not args[idx + 1].startswith('-'):
             stream_duration = int(args[idx + 1])
+            if stream_duration <= 0:
+                print("Error: --stream duration must be greater than 0")
+                sys.exit(1)
         else:
             stream_duration = 5  # default
 
@@ -118,6 +121,27 @@ def format_bytes(n: int) -> str:
 first_connect_lock = threading.Lock()
 first_connect_done = False
 
+def process_recv_data(data: bytes, recv_buf: bytes, pending_payloads: dict, stats: Stats) -> bytes:
+    """Account for received data, parse newline-delimited lines, and verify
+    each against pending_payloads. Returns the updated recv_buf."""
+    stats.recv_bytes += len(data)
+    stats.update_recv(data)
+    recv_buf += data
+    while b'\n' in recv_buf:
+        line, recv_buf = recv_buf.split(b'\n', 1)
+        stats.recv_msgs += 1
+        line_str = line.decode('utf-8', errors='replace')
+        found = False
+        for seq, payload in list(pending_payloads.items()):
+            if payload in line_str:
+                stats.verified += 1
+                del pending_payloads[seq]
+                found = True
+                break
+        if not found and 'SEQ' in line_str:
+            stats.corrupted += 1
+    return recv_buf
+
 def stream_session(duration: float, stats: Stats):
     """Stream data through a tunnel for the specified duration."""
     global first_connect_done
@@ -161,22 +185,7 @@ def stream_session(duration: float, stats: Stats):
             try:
                 data = sock.recv(8192)
                 if data:
-                    stats.recv_bytes += len(data)
-                    stats.update_recv(data)
-                    recv_buf += data
-                    while b'\n' in recv_buf:
-                        line, recv_buf = recv_buf.split(b'\n', 1)
-                        stats.recv_msgs += 1
-                        line_str = line.decode('utf-8', errors='replace')
-                        found = False
-                        for seq, payload in list(pending_payloads.items()):
-                            if payload in line_str:
-                                stats.verified += 1
-                                del pending_payloads[seq]
-                                found = True
-                                break
-                        if not found and 'SEQ' in line_str:
-                            stats.corrupted += 1
+                    recv_buf = process_recv_data(data, recv_buf, pending_payloads, stats)
             except BlockingIOError:
                 pass
             except Exception:
@@ -189,22 +198,7 @@ def stream_session(duration: float, stats: Stats):
             try:
                 data = sock.recv(8192)
                 if data:
-                    stats.recv_bytes += len(data)
-                    stats.update_recv(data)
-                    recv_buf += data
-                    while b'\n' in recv_buf:
-                        line, recv_buf = recv_buf.split(b'\n', 1)
-                        stats.recv_msgs += 1
-                        line_str = line.decode('utf-8', errors='replace')
-                        found = False
-                        for seq, payload in list(pending_payloads.items()):
-                            if payload in line_str:
-                                stats.verified += 1
-                                del pending_payloads[seq]
-                                found = True
-                                break
-                        if not found and 'SEQ' in line_str:
-                            stats.corrupted += 1
+                    recv_buf = process_recv_data(data, recv_buf, pending_payloads, stats)
             except BlockingIOError:
                 pass
             except Exception:

@@ -21,9 +21,11 @@ LABEL org.opencontainers.image.source=https://github.com/andrewtheguy/duopipe
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     tini \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --user-group duopipe
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/duopipe"]
+USER duopipe
 
 FROM runtime-base AS runtime
 COPY --from=builder /duopipe /usr/local/bin/duopipe
