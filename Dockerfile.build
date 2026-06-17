@@ -1,0 +1,34 @@
+FROM rust:1.93-slim AS builder
+
+ARG TARGETPLATFORM
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
+    --mount=type=cache,target=/build/target,id=cargo-target-${TARGETPLATFORM} \
+    cargo build --release && \
+    cp target/release/duopipe /duopipe
+
+FROM scratch AS export
+COPY --from=builder /duopipe /duopipe
+
+FROM debian:bookworm-slim AS runtime-base
+LABEL org.opencontainers.image.source=https://github.com/andrewtheguy/duopipe
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --user-group duopipe
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/duopipe"]
+USER duopipe
+
+FROM runtime-base AS runtime
+COPY --from=builder /duopipe /usr/local/bin/duopipe
+
+FROM runtime-base AS runtime-prebuilt
+COPY duopipe /usr/local/bin/duopipe

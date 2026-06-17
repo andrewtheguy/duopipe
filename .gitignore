@@ -48,3 +48,14 @@ node_modules/
 # Certificates and keys
 *.pem
 *.key
+
+wg-test/
+
+tmp/
+
+test-scripts/.tunnel_keys
+test-scripts/.keys/
+
+.claude/
+
+*.pyc
