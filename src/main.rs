@@ -30,7 +30,7 @@ const LOG_CAPACITY: usize = 2000;
 
 use crate::config::{
     expand_tilde, load_peer_config, validate_allowed_sources, validate_request_specs,
-    validate_transport_tuning, ConfigSource, PeerConfig,
+    validate_transport_tuning, AllowedSources, ConfigSource, PeerConfig,
 };
 use crate::iroh_mode::endpoint::validate_relay_only;
 
@@ -149,7 +149,10 @@ fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
 /// the id), absent ⇒ Listen. The auth token comes from `config_auth_token`
 /// (already resolved/validated), or is generated for Listen. Evaluated before the
 /// peer starts so failures print plainly and exit.
-fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<ResolvedPeer>> {
+fn detect_env_preset(
+    config_auth_token: Option<String>,
+    allowed_sources: AllowedSources,
+) -> Result<Option<ResolvedPeer>> {
     if !env_truthy("DUOPIPE_TEST_MODE") {
         return Ok(None);
     }
@@ -167,6 +170,7 @@ fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<Resolve
                 peer_node_id: Some(id),
                 auth_token,
                 token_generated: false,
+                allowed_sources,
             }))
         }
         None => {
@@ -184,6 +188,7 @@ fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<Resolve
                 peer_node_id: None,
                 auth_token,
                 token_generated,
+                allowed_sources,
             }))
         }
     }
@@ -223,7 +228,7 @@ async fn run_peer_headless(
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
         requests: cfg.request.clone(),
-        allowed_sources: cfg.allowed_sources.clone(),
+        allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests,
         auth_token: resolved.auth_token,
         relay_urls,
@@ -329,7 +334,8 @@ async fn run_inner() -> Result<()> {
             let config_auth_token =
                 resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
             let preset =
-                detect_env_preset(config_auth_token.clone()).map_err(TunnelError::config)?;
+                detect_env_preset(config_auth_token.clone(), cfg.allowed_sources.clone())
+                    .map_err(TunnelError::config)?;
             // Autostart is a test-only convenience, gated by test mode.
             let autostart_requests = test_mode && env_truthy("DUOPIPE_AUTOSTART_REQUESTS");
 

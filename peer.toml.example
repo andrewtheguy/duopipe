@@ -44,20 +44,21 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # dns_server = "none"
 
 # ============================================================================
-# Tunnel requests: ask the peer to connect out to 'source'; deliver traffic to a
-# local listener bound at 'listen'. The 'source' scheme (tcp:// or udp://) selects
-# the protocol. 'name' is the label shown in the TUI. Nothing starts until you
-# activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1 in test mode).
+# Tunnel requests: ask the peer to connect out to 'remote_source'; deliver traffic
+# to a local listener bound at 'local_listen'. The 'remote_source' scheme (tcp://
+# or udp://) selects the protocol. 'name' is the label shown in the TUI. Nothing
+# starts until you activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1
+# in test mode).
 # ============================================================================
 [[request]]
 name = "db"
-source = "tcp://127.0.0.1:5678"
-listen = "127.0.0.1:15678"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
 [[request]]
 name = "cache"
-source = "tcp://127.0.0.1:5679"
-listen = "127.0.0.1:15679"
+remote_source = "tcp://127.0.0.1:5679"
+local_listen = "127.0.0.1:15679"
 
 # ============================================================================
 # Allowed source networks the peer may request of US (CIDR notation).

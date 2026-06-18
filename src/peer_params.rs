@@ -7,6 +7,7 @@
 use iroh::EndpointId;
 
 use crate::app_state::Role;
+use crate::config::AllowedSources;
 
 /// Role + target + credential, fully validated.
 ///
@@ -22,4 +23,7 @@ pub struct ResolvedPeer {
     /// `true` when `auth_token` was freshly generated (no token in config/env), so
     /// the TUI must surface it for the user to copy. `false` when supplied.
     pub token_generated: bool,
+    /// CIDR allowlist gating which of our sources the peer may request. Supplied by
+    /// config, or entered interactively in setup when config provides none.
+    pub allowed_sources: AllowedSources,
 }

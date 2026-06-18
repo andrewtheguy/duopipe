@@ -384,7 +384,7 @@ fn seed_tunnel_rows(config: &PeerConfig) {
         .iter()
         .map(|r| TunnelRow {
             name: r.name.clone(),
-            spec: format!("{} <- {}", r.listen, r.source),
+            spec: format!("{} <- {}", r.local_listen, r.remote_source),
             status: TunnelStatus::Idle,
             detail: String::new(),
         })
@@ -677,9 +677,10 @@ async fn connect_side(
 // Tunnel requests: opener / listen side
 // ============================================================================
 
-/// Run one tunnel request: bind the local `listen` address and, for each incoming
-/// connection, open a stream asking the peer to connect out to `source`. Runs
-/// until the listener errors or the caller cancels it (freeing the bound port).
+/// Run one tunnel request: bind the local `local_listen` address and, for each
+/// incoming connection, open a stream asking the peer to connect out to
+/// `remote_source`. Runs until the listener errors or the caller cancels it
+/// (freeing the bound port).
 async fn run_request(
     conn: Arc<iroh::endpoint::Connection>,
     req: RequestEntry,
@@ -687,12 +688,12 @@ async fn run_request(
     status: Arc<AppState>,
     idx: usize,
 ) -> Result<()> {
-    let hello = StreamHello::local_forward(&req.source);
-    let listen_addrs = resolve_listen_addrs(&req.listen)
+    let hello = StreamHello::local_forward(&req.remote_source);
+    let listen_addrs = resolve_listen_addrs(&req.local_listen)
         .await
-        .with_context(|| format!("Invalid request listen address '{}'", req.listen))?;
+        .with_context(|| format!("Invalid request listen address '{}'", req.local_listen))?;
 
-    if req.source.starts_with("udp://") {
+    if req.remote_source.starts_with("udp://") {
         let listen_addr = *listen_addrs
             .first()
             .context("No listen address resolved for request")?;
@@ -701,12 +702,12 @@ async fn run_request(
                 .await
                 .with_context(|| format!("Failed to bind UDP listener on {}", listen_addr))?,
         );
-        log::info!("Listening on UDP {} <- {}", listen_addr, req.source);
+        log::info!("Listening on UDP {} <- {}", listen_addr, req.remote_source);
         status.update_tunnel(idx, TunnelStatus::Listening, listen_addr.to_string());
         udp_listen_side(&conn, hello, udp_socket).await
     } else {
-        let listeners = bind_tcp_listeners(&listen_addrs, &req.source).await?;
-        status.update_tunnel(idx, TunnelStatus::Listening, req.listen.clone());
+        let listeners = bind_tcp_listeners(&listen_addrs, &req.remote_source).await?;
+        status.update_tunnel(idx, TunnelStatus::Listening, req.local_listen.clone());
         tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
     }
 }

@@ -279,7 +279,7 @@ A per-connection `Semaphore` (default `max_sessions = 100`) bounds concurrent **
 
 ### Request Data Flow
 
-A peer activates a request: it binds the local `listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1`); stopping one cancels its task and frees the bound port.
+A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1`); stopping one cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
@@ -468,8 +468,8 @@ auth_token_file = "/etc/duopipe/auth_token.txt"
 
 [[request]]
 name = "ssh"
-source = "tcp://127.0.0.1:22"
-listen = "127.0.0.1:2222"
+remote_source = "tcp://127.0.0.1:22"
+local_listen = "127.0.0.1:2222"
 ```
 
 ```toml

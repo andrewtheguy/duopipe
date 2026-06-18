@@ -188,8 +188,8 @@ auth_token_file = "/etc/duopipe/auth_token.txt"
 # A tunnel we can request: bind locally, ask the peer to reach its source.
 [[request]]
 name = "db"
-source = "tcp://127.0.0.1:5678"
-listen = "127.0.0.1:15678"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
 # What the peer is allowed to request of us (fail-closed if omitted).
 [allowed_sources]
@@ -249,8 +249,8 @@ Once connected, the requests you start in the TUI flow over the single connectio
 ```toml
 [[request]]
 name = "db"
-source = "tcp://127.0.0.1:5678"
-listen = "127.0.0.1:15678"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 ```
 
 - This request makes **this** peer listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **other** peer connects out to (subject to its `[allowed_sources]`).
@@ -260,7 +260,7 @@ Either peer may declare its own requests; they all share the one connection and 
 
 ### 3. SSH over a requested tunnel
 
-With a `[[request]]` of `source = "tcp://127.0.0.1:22"`, `listen = "127.0.0.1:2222"` (the other peer reaches the SSH server, and allows `127.0.0.0/8` in `[allowed_sources]`):
+With a `[[request]]` of `remote_source = "tcp://127.0.0.1:22"`, `local_listen = "127.0.0.1:2222"` (the other peer reaches the SSH server, and allows `127.0.0.0/8` in `[allowed_sources]`):
 
 ```bash
 ssh -p 2222 user@127.0.0.1
@@ -268,14 +268,14 @@ ssh -p 2222 user@127.0.0.1
 
 ### 4. UDP request (e.g., WireGuard/Game/DNS)
 
-UDP works too; the `source` scheme selects the protocol, and the address is gated by the peer's `allowed_sources.udp` list:
+UDP works too; the `remote_source` scheme selects the protocol, and the address is gated by the peer's `allowed_sources.udp` list:
 
 ```toml
 # This peer listens on UDP 51820; the other peer connects out to the UDP service.
 [[request]]
 name = "wg"
-source = "udp://127.0.0.1:51820"
-listen = "0.0.0.0:51820"
+remote_source = "udp://127.0.0.1:51820"
+local_listen = "0.0.0.0:51820"
 ```
 
 > **Note:** UDP requests use a single-peer-address reply model — suitable for single-client UDP services.
@@ -389,8 +389,8 @@ max_sessions = 100
 # Tunnel requests: bind locally, ask the peer to connect out to source.
 [[request]]
 name = "db"
-source = "tcp://127.0.0.1:5678"
-listen = "127.0.0.1:15678"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
 # Sources the peer may request of us (fail-closed if omitted).
 [allowed_sources]

@@ -58,7 +58,13 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     // Phase 1: resolve role/target/token (skip when a preset is supplied).
     let resolved = match launch.preset.clone() {
         Some(preset) => preset,
-        None => match run_setup(&mut terminal, &mut events, launch.config_auth_token.clone()).await
+        None => match run_setup(
+            &mut terminal,
+            &mut events,
+            launch.config_auth_token.clone(),
+            launch.allowed_sources.clone(),
+        )
+        .await
         {
             SetupOutcome::Resolved(r) => r,
             SetupOutcome::Quit => {
@@ -142,7 +148,7 @@ fn build_peer_config(
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
         requests: launch.requests.clone(),
-        allowed_sources: launch.allowed_sources.clone(),
+        allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests: launch.autostart_requests,
         auth_token: resolved.auth_token.clone(),
         relay_urls: launch.relay_urls.clone(),
@@ -160,8 +166,9 @@ async fn run_setup(
     terminal: &mut DefaultTerminal,
     events: &mut EventStream,
     config_auth_token: Option<String>,
+    config_allowed_sources: AllowedSources,
 ) -> SetupOutcome {
-    let mut state = SetupState::new(config_auth_token);
+    let mut state = SetupState::new(config_auth_token, config_allowed_sources);
     let mut tick = tokio::time::interval(TICK);
 
     loop {

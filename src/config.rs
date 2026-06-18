@@ -111,8 +111,8 @@ impl PeerConfig {
     }
 }
 
-/// A tunnel request: ask the peer to connect out to `source` and deliver the
-/// traffic to a local listener bound at `listen`.
+/// A tunnel request: ask the peer to connect out to `remote_source` and deliver
+/// the traffic to a local listener bound at `local_listen`.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RequestEntry {
@@ -120,9 +120,9 @@ pub struct RequestEntry {
     pub name: String,
     /// Remote origin on the peer to connect to (tcp://host:port or udp://host:port).
     /// The scheme selects the protocol of the local listener.
-    pub source: String,
+    pub remote_source: String,
     /// Local address to listen on (host:port) where traffic is delivered.
-    pub listen: String,
+    pub local_listen: String,
 }
 
 /// Source networks (CIDR) we will expose when the peer requests one of our
@@ -283,17 +283,18 @@ fn validate_host_port(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate tunnel-request address formats (`source` URL + `listen` host:port).
+/// Validate tunnel-request address formats (`remote_source` URL + `local_listen`
+/// host:port).
 pub fn validate_request_specs(requests: &[RequestEntry]) -> Result<()> {
     for r in requests {
-        validate_tcp_udp_url(&r.source, "request.source")?;
-        validate_host_port(&r.listen, "request.listen")?;
+        validate_tcp_udp_url(&r.remote_source, "request.remote_source")?;
+        validate_host_port(&r.local_listen, "request.local_listen")?;
     }
     Ok(())
 }
 
 /// Validate that a string is valid CIDR notation (IPv4 or IPv6).
-fn validate_cidr(cidr: &str) -> Result<()> {
+pub fn validate_cidr(cidr: &str) -> Result<()> {
     cidr.parse::<ipnet::IpNet>().with_context(|| {
         format!(
             "Invalid CIDR network '{}'. Expected format: 192.168.0.0/16 or ::1/128",
@@ -461,8 +462,8 @@ max_sessions = 100
 
 [[request]]
 name = "db"
-source = "tcp://127.0.0.1:5678"
-listen = "127.0.0.1:15678"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
 [allowed_sources]
 tcp = ["127.0.0.0/8", "::1/128"]
@@ -545,8 +546,8 @@ tcp = ["not-a-cidr"]
         let cfg = peer_config(PeerConfig {
             request: vec![RequestEntry {
                 name: "ok".into(),
-                source: "tcp://127.0.0.1:5678".into(),
-                listen: "127.0.0.1:15678".into(),
+                remote_source: "tcp://127.0.0.1:5678".into(),
+                local_listen: "127.0.0.1:15678".into(),
             }],
             ..Default::default()
         });
@@ -555,8 +556,8 @@ tcp = ["not-a-cidr"]
         let bad_listen = peer_config(PeerConfig {
             request: vec![RequestEntry {
                 name: "bad-listen".into(),
-                source: "tcp://127.0.0.1:5678".into(),
-                listen: "127.0.0.1".into(), // missing port
+                remote_source: "tcp://127.0.0.1:5678".into(),
+                local_listen: "127.0.0.1".into(), // missing port
             }],
             ..Default::default()
         });
@@ -565,8 +566,8 @@ tcp = ["not-a-cidr"]
         let bad_source = peer_config(PeerConfig {
             request: vec![RequestEntry {
                 name: "bad-source".into(),
-                source: "127.0.0.1:5678".into(), // missing scheme
-                listen: "127.0.0.1:15678".into(),
+                remote_source: "127.0.0.1:5678".into(), // missing scheme
+                local_listen: "127.0.0.1:15678".into(),
             }],
             ..Default::default()
         });
