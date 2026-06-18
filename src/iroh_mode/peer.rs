@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use iroh::endpoint::{ApplicationClose, ConnectionError};
 use iroh::EndpointId;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
@@ -66,6 +67,11 @@ const AUTH_FAILED_CODE: u32 = 1;
 
 /// Connection close code for authentication timeout (no auth within deadline).
 const AUTH_TIMEOUT_CODE: u32 = 2;
+
+/// Connection close code for a peer rejected because another peer already holds
+/// the single active-peer slot (listen role). Not an auth failure, so the dialer
+/// retries with backoff rather than treating it as fatal.
+const PEER_BUSY_CODE: u32 = 3;
 
 /// Maximum reconnect backoff for the dialing peer.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
@@ -263,11 +269,15 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
                 match handle_connection(conn, config.clone(), true).await {
                     Ok(()) => log::info!("Connection closed; will reconnect"),
                     Err(e) => {
-                        // Auth failures are fatal — retrying with the same token is futile.
-                        if e
-                            .downcast_ref::<TunnelError>()
-                            .is_some_and(|te| te.category == ErrorCategory::Auth)
-                        {
+                        // Auth failures (bad token) and rejections (peer already has
+                        // an active peer) are fatal — reconnecting can't succeed, and
+                        // for a rejection it would only race for the slot.
+                        if e.downcast_ref::<TunnelError>().is_some_and(|te| {
+                            matches!(
+                                te.category,
+                                ErrorCategory::Auth | ErrorCategory::Rejected
+                            )
+                        }) {
                             endpoint.close().await;
                             return Err(e);
                         }
@@ -313,6 +323,14 @@ async fn handle_connection(
         let accepted: HashSet<String> =
             std::iter::once(config.auth_token.clone()).collect();
         auth_as_listener(&conn, &accepted).await?;
+        // Single active peer: claim the slot atomically. A second authenticated
+        // dialer would otherwise duplicate every tunnel bind (the supervisors share
+        // one broadcast channel) and reseed the shared tunnel table to Idle.
+        if !config.status.try_claim_peer(&remote_id.to_string()) {
+            log::warn!("Rejecting {}: a peer is already connected", remote_id);
+            conn.close(PEER_BUSY_CODE.into(), b"peer_busy");
+            return Ok(());
+        }
         config.status.add_peer(remote_id.to_string());
         log::info!("Peer {} authenticated successfully", remote_id);
     }
@@ -370,9 +388,31 @@ async fn handle_connection(
         config.status.set_conn_status(ConnStatus::Closed);
     } else {
         config.status.remove_peer(&remote_id.to_string());
+        config.status.release_peer(&remote_id.to_string());
     }
     tasks.shutdown().await;
+
+    // A dialer rejected for the busy peer-slot must NOT reconnect: retrying would
+    // only race other dialers for the slot when the holder eventually drops, which
+    // is exactly the non-determinism the single-peer model avoids. Surface it as a
+    // fatal `Rejected` error so `run_dial` stops instead of backing off.
+    if is_dialer && is_peer_busy_close(&reason) {
+        return Err(TunnelError::rejected(anyhow::anyhow!(
+            "Peer rejected connection: it already has an active peer"
+        ))
+        .into());
+    }
     Ok(())
+}
+
+/// Whether `reason` is the listener closing us out for the busy peer slot
+/// (application close with [`PEER_BUSY_CODE`]).
+fn is_peer_busy_close(reason: &ConnectionError) -> bool {
+    matches!(
+        reason,
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+            if u64::from(*error_code) == PEER_BUSY_CODE as u64
+    )
 }
 
 /// Supervise this peer's tunnel requests over one connection. Listens for
@@ -824,4 +864,28 @@ async fn expect_ack(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use iroh::endpoint::VarInt;
+
+    fn app_close(code: u32) -> ConnectionError {
+        ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: VarInt::from_u32(code),
+            reason: Bytes::new(),
+        })
+    }
+
+    #[test]
+    fn peer_busy_close_is_detected_only_for_its_code() {
+        assert!(is_peer_busy_close(&app_close(PEER_BUSY_CODE)));
+        // Other application close codes (e.g. auth failures) are not peer-busy.
+        assert!(!is_peer_busy_close(&app_close(AUTH_FAILED_CODE)));
+        assert!(!is_peer_busy_close(&app_close(AUTH_TIMEOUT_CODE)));
+        // A non-application close (transport-level) is never peer-busy.
+        assert!(!is_peer_busy_close(&ConnectionError::LocallyClosed));
+    }
 }

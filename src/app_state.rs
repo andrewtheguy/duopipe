@@ -179,6 +179,11 @@ pub struct AppState {
     conn_status: RwLock<ConnStatus>,
     path: RwLock<PathInfo>,
     peers: RwLock<Vec<PeerRow>>,
+    /// Single-owner slot for the listen role: holds the `remote_id` of the one
+    /// authenticated peer allowed to drive tunnels at a time. Claimed atomically
+    /// after auth so a second dialer is rejected rather than duplicating binds and
+    /// reseeding the shared tunnel table. `None` when no peer is connected.
+    active_peer: RwLock<Option<String>>,
     /// Authoritative tunnel-request list, seeded from config and appended to at
     /// runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this, so a
     /// row's position is its request index (used to start/stop it).
@@ -210,6 +215,7 @@ impl AppState {
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
+            active_peer: RwLock::new(None),
             requests: RwLock::new(requests),
             tunnels: RwLock::new(Vec::new()),
             semaphore: RwLock::new(None),
@@ -273,6 +279,30 @@ impl AppState {
         let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|p| p.remote_id == remote_id) {
             peer.path = path;
+        }
+    }
+
+    /// Claim the single peer slot for `remote_id` (listen role). Returns `true` if
+    /// the slot was free and is now held by the caller, `false` if another peer
+    /// already holds it (the caller should reject this connection). The write lock
+    /// serializes simultaneous auths so exactly one claimant wins.
+    pub fn try_claim_peer(&self, remote_id: &str) -> bool {
+        let mut slot = self.active_peer.write();
+        if slot.is_none() {
+            *slot = Some(remote_id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Release the peer slot if `remote_id` holds it. A no-op for a connection that
+    /// never claimed it (e.g. one rejected as a duplicate), so it is safe to call
+    /// unconditionally on teardown.
+    pub fn release_peer(&self, remote_id: &str) {
+        let mut slot = self.active_peer.write();
+        if slot.as_deref() == Some(remote_id) {
+            *slot = None;
         }
     }
 
@@ -418,5 +448,23 @@ mod tests {
         let idx2 = state.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
         assert_eq!(idx2, 2);
         assert_eq!(state.get_request(0).unwrap().name, "db");
+    }
+
+    #[test]
+    fn single_active_peer_slot_admits_one_and_frees_on_release() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+
+        // First claimant wins the slot; a second, different peer is rejected.
+        assert!(state.try_claim_peer("peer-a"));
+        assert!(!state.try_claim_peer("peer-b"));
+
+        // Releasing a non-holder is a no-op (rejected peers call this on teardown),
+        // so the holder keeps the slot.
+        state.release_peer("peer-b");
+        assert!(!state.try_claim_peer("peer-b"));
+
+        // Once the holder releases, the next dialer can take over.
+        state.release_peer("peer-a");
+        assert!(state.try_claim_peer("peer-b"));
     }
 }
