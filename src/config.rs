@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 // Configuration Structures
 // ============================================================================
 
-/// iroh mode configuration for a symmetric peer.
+/// Unified peer configuration. All keys live at the top level.
 #[derive(Deserialize, Default, Clone)]
-pub struct IrohConfig {
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
     /// Connection role: "dial" (connect out to `peer_node_id`) or "listen" (accept).
     pub connect: Option<ConnectRole>,
     /// EndpointId of the peer to dial (required when `connect = "dial"`).
@@ -68,7 +69,7 @@ pub struct IrohConfig {
     pub transport: TransportTuning,
 }
 
-impl IrohConfig {
+impl PeerConfig {
     /// Reject plaintext sensitive fields when config is loaded from a file.
     ///
     /// Checked fields: `auth_token`, `auth_tokens`, `alpn_token`, `secret`.
@@ -191,6 +192,7 @@ pub enum ConnectRole {
 
 /// Local forward (-L): this peer binds `listen` locally and the peer connects to `dest`.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LocalForward {
     /// Local address to listen on (host:port).
     pub listen: String,
@@ -201,6 +203,7 @@ pub struct LocalForward {
 
 /// Remote forward (-R): ask the peer to bind `bind`, forwarding back to our local `dest`.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteForward {
     /// Address the peer should bind (tcp://host:port or udp://host:port).
     /// The scheme selects the protocol.
@@ -250,6 +253,7 @@ pub const DEFAULT_SEND_WINDOW: u32 = 64 * 1024 * 1024;
 ///
 /// These settings affect performance and memory usage of the QUIC transport layer.
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TransportTuning {
     /// Congestion controller algorithm (default: cubic).
     /// Options: cubic, bbr, newreno
@@ -279,13 +283,6 @@ pub struct TransportTuning {
     /// (peer ACKs every other packet). Only set this if you have measured a
     /// benefit. Valid range: 0 to 65535.
     pub ack_eliciting_threshold: Option<u32>,
-}
-
-/// Unified peer configuration. All keys live at the top level.
-#[derive(Deserialize, Default)]
-pub struct PeerConfig {
-    #[serde(flatten)]
-    pub iroh: IrohConfig,
 }
 
 // ============================================================================
@@ -430,18 +427,13 @@ pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Res
 // ============================================================================
 
 impl PeerConfig {
-    /// Get iroh config section.
-    pub fn iroh(&self) -> Option<&IrohConfig> {
-        Some(&self.iroh)
-    }
-
     /// Validate config structure and address formats.
     ///
     /// Note: the connection role (dial/listen) and its required fields
     /// (`peer_node_id` for dial, secret for listen) are resolved and enforced in
     /// `main.rs` after merging CLI/env overrides, since those can supply the values.
     pub fn validate(&self, source: ConfigSource) -> Result<()> {
-        let iroh = &self.iroh;
+        let iroh = self;
         if source == ConfigSource::File {
             iroh.reject_plaintext_secrets()?;
         }
@@ -540,12 +532,12 @@ pub fn load_peer_config(path: Option<&Path>) -> Result<PeerConfig> {
 mod tests {
     use super::*;
 
-    fn peer_config_with_iroh(iroh: IrohConfig) -> PeerConfig {
-        PeerConfig { iroh }
+    fn peer_config(cfg: PeerConfig) -> PeerConfig {
+        cfg
     }
 
     #[test]
-    fn parses_flattened_toml() {
+    fn parses_toml_config() {
         let toml = r#"
 connect = "dial"
 peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
@@ -563,22 +555,44 @@ dest = "127.0.0.1:6574"
 congestion_controller = "bbr"
 receive_window = 67108864
 "#;
-        let cfg: PeerConfig = toml::from_str(toml).expect("flattened TOML should parse");
-        assert_eq!(cfg.iroh.connect, Some(ConnectRole::Dial));
-        assert_eq!(cfg.iroh.max_sessions, Some(100));
-        assert_eq!(cfg.iroh.local_forward.len(), 1);
-        assert_eq!(cfg.iroh.remote_forward.len(), 1);
+        let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
+        assert_eq!(cfg.connect, Some(ConnectRole::Dial));
+        assert_eq!(cfg.max_sessions, Some(100));
+        assert_eq!(cfg.local_forward.len(), 1);
+        assert_eq!(cfg.remote_forward.len(), 1);
         assert_eq!(
-            cfg.iroh.transport.congestion_controller,
+            cfg.transport.congestion_controller,
             CongestionController::Bbr
         );
-        assert_eq!(cfg.iroh.transport.receive_window, Some(67108864));
+        assert_eq!(cfg.transport.receive_window, Some(67108864));
         cfg.validate(ConfigSource::File).expect("config should validate");
     }
 
     #[test]
+    fn rejects_unknown_field() {
+        // A leftover `mode = "iroh"` (or any unknown top-level key) must now error.
+        // Avoid unwrap_err so PeerConfig need not derive Debug (it holds secrets).
+        let toml = "connect = \"dial\"\nmode = \"iroh\"\n";
+        let err = match toml::from_str::<PeerConfig>(toml) {
+            Ok(_) => panic!("expected unknown-field error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("mode"), "error was: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_transport_field() {
+        let toml = "[transport]\nrecieve_window = 1024\n"; // typo
+        let err = match toml::from_str::<PeerConfig>(toml) {
+            Ok(_) => panic!("expected unknown-field error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("recieve_window"), "error was: {err}");
+    }
+
+    #[test]
     fn rejects_plaintext_auth_token_from_file() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             auth_token: Some("secret123".into()),
             ..Default::default()
         });
@@ -588,7 +602,7 @@ receive_window = 67108864
 
     #[test]
     fn allows_plaintext_auth_token_from_stdin() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             auth_token: Some("secret123".into()),
             ..Default::default()
         });
@@ -597,7 +611,7 @@ receive_window = 67108864
 
     #[test]
     fn rejects_plaintext_auth_tokens_from_file() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             auth_tokens: Some(vec!["tok1".into()]),
             ..Default::default()
         });
@@ -607,7 +621,7 @@ receive_window = 67108864
 
     #[test]
     fn rejects_plaintext_alpn_token_from_file() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             alpn_token: Some("alpn123".into()),
             ..Default::default()
         });
@@ -617,7 +631,7 @@ receive_window = 67108864
 
     #[test]
     fn rejects_plaintext_secret_from_file() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             secret: Some("base64secret".into()),
             ..Default::default()
         });
@@ -627,7 +641,7 @@ receive_window = 67108864
 
     #[test]
     fn allows_plaintext_secrets_from_stdin() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             auth_tokens: Some(vec!["tok1".into()]),
             alpn_token: Some("alpn123".into()),
             secret: Some("base64secret".into()),
@@ -640,7 +654,7 @@ receive_window = 67108864
 
     #[test]
     fn allows_age_encrypted_secrets_from_file() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             auth_token: Some(FAKE_AGE_ENCRYPTED.into()),
             auth_tokens: Some(vec![FAKE_AGE_ENCRYPTED.into()]),
             alpn_token: Some(FAKE_AGE_ENCRYPTED.into()),
@@ -652,7 +666,7 @@ receive_window = 67108864
 
     #[test]
     fn rejects_mixed_plaintext_age_auth_tokens_from_file() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             auth_tokens: Some(vec![FAKE_AGE_ENCRYPTED.into(), "plaintext".into()]),
             ..Default::default()
         });
@@ -662,7 +676,7 @@ receive_window = 67108864
 
     #[test]
     fn validates_forward_address_formats() {
-        let cfg = peer_config_with_iroh(IrohConfig {
+        let cfg = peer_config(PeerConfig {
             local_forward: vec![LocalForward {
                 listen: "127.0.0.1:15678".into(),
                 dest: "tcp://127.0.0.1:5678".into(),
@@ -675,7 +689,7 @@ receive_window = 67108864
         });
         assert!(cfg.validate(ConfigSource::Stdin).is_ok());
 
-        let bad_listen = peer_config_with_iroh(IrohConfig {
+        let bad_listen = peer_config(PeerConfig {
             local_forward: vec![LocalForward {
                 listen: "127.0.0.1".into(), // missing port
                 dest: "tcp://127.0.0.1:5678".into(),
@@ -684,7 +698,7 @@ receive_window = 67108864
         });
         assert!(bad_listen.validate(ConfigSource::Stdin).is_err());
 
-        let bad_dest = peer_config_with_iroh(IrohConfig {
+        let bad_dest = peer_config(PeerConfig {
             local_forward: vec![LocalForward {
                 listen: "127.0.0.1:15678".into(),
                 dest: "127.0.0.1:5678".into(), // missing scheme
@@ -696,7 +710,7 @@ receive_window = 67108864
 
     #[test]
     fn decrypt_secrets_missing_key_returns_error() {
-        let mut iroh = IrohConfig {
+        let mut iroh = PeerConfig {
             auth_token: Some(FAKE_AGE_ENCRYPTED.into()),
             ..Default::default()
         };

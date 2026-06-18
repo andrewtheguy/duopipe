@@ -258,7 +258,7 @@ fn parse_remote_forward(spec: &str) -> Result<RemoteForward> {
 /// Env vars take precedence over config for sensitive fields.
 fn resolve_peer_iroh_params(
     cli: &Command,
-    iroh_cfg: Option<&crate::config::IrohConfig>,
+    iroh_cfg: Option<&crate::config::PeerConfig>,
 ) -> Result<PeerIrohParams> {
     let cfg = iroh_cfg.cloned().unwrap_or_default();
 
@@ -478,11 +478,11 @@ async fn run_inner() -> Result<()> {
             let enc_key = encryption_key_file
                 .clone()
                 .or_else(|| env_var_opt("DUOPIPE_ENCRYPTION_KEY_FILE").map(PathBuf::from))
-                .or_else(|| cfg.iroh.encryption_key_file.clone())
+                .or_else(|| cfg.encryption_key_file.clone())
                 .map(|p| expand_tilde(&p));
-            cfg.iroh.decrypt_secrets(enc_key.as_deref())?;
+            cfg.decrypt_secrets(enc_key.as_deref())?;
 
-            let params = resolve_peer_iroh_params(&command, cfg.iroh())
+            let params = resolve_peer_iroh_params(&command, Some(&cfg))
                 .map_err(TunnelError::config)?;
 
             // Validate forward address formats (covers CLI-supplied -L/-R too).
