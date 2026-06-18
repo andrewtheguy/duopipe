@@ -166,22 +166,24 @@ fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<Resolve
                 role: Role::Dial,
                 peer_node_id: Some(id),
                 auth_token,
+                token_generated: false,
             }))
         }
         None => {
-            let auth_token = match config_auth_token {
-                Some(t) => t,
+            let (auth_token, token_generated) = match config_auth_token {
+                Some(t) => (t, false),
                 None => {
                     let t = auth::generate_token();
                     // Printed before TUI init so non-interactive tests can capture it.
                     eprintln!("auth_token: {t}");
-                    t
+                    (t, true)
                 }
             };
             Ok(Some(ResolvedPeer {
                 role: Role::Listen,
                 peer_node_id: None,
                 auth_token,
+                token_generated,
             }))
         }
     }

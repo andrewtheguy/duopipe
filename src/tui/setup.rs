@@ -69,14 +69,15 @@ impl SetupState {
 
 /// Finalize the Listen role: reuse the config/env token or generate a fresh one.
 fn finalize_listen(state: &SetupState) -> ResolvedPeer {
-    let auth_token = state
-        .config_auth_token
-        .clone()
-        .unwrap_or_else(auth::generate_token);
+    let (auth_token, token_generated) = match state.config_auth_token.clone() {
+        Some(token) => (token, false),
+        None => (auth::generate_token(), true),
+    };
     ResolvedPeer {
         role: Role::Listen,
         peer_node_id: None,
         auth_token,
+        token_generated,
     }
 }
 
@@ -116,6 +117,7 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                             role: Role::Dial,
                             peer_node_id: Some(id),
                             auth_token: token.clone(),
+                            token_generated: false,
                         }),
                         None => {
                             state.phase = SetupPhase::AuthToken;
@@ -152,6 +154,7 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                         role: Role::Dial,
                         peer_node_id: state.node_id,
                         auth_token: token,
+                        token_generated: false,
                     }),
                     Err(e) => {
                         state.error = Some(format!("Invalid auth token: {e}"));

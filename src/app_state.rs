@@ -155,6 +155,11 @@ pub struct PeerRow {
 /// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
 pub struct AppState {
     pub role: Role,
+    /// This machine's hostname, shown in the dashboard title.
+    pub hostname: String,
+    /// `true` when the auth token was freshly generated (not supplied by
+    /// config/env), so the dashboard flags it for the user to copy.
+    pub token_generated: bool,
     /// The shared auth token, shown in the listen-role dashboard so the dialer
     /// can copy it (it may be freshly generated each run).
     auth_token: RwLock<Option<String>>,
@@ -171,9 +176,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(role: Role, logs: Arc<LogBuffer>) -> Arc<Self> {
+    pub fn new(role: Role, token_generated: bool, logs: Arc<LogBuffer>) -> Arc<Self> {
         Arc::new(Self {
             role,
+            hostname: gethostname::gethostname().to_string_lossy().into_owned(),
+            token_generated,
             auth_token: RwLock::new(None),
             endpoint_id: RwLock::new(None),
             conn_status: RwLock::new(ConnStatus::Connecting),
@@ -257,6 +264,8 @@ impl AppState {
             .unwrap_or(0);
         AppSnapshot {
             role: self.role,
+            hostname: self.hostname.clone(),
+            token_generated: self.token_generated,
             endpoint_id: self.endpoint_id.read().clone(),
             auth_token: self.auth_token.read().clone(),
             conn_status: self.conn_status.read().clone(),
@@ -272,6 +281,8 @@ impl AppState {
 /// Owned, lock-free view of [`AppState`] for a single render pass.
 pub struct AppSnapshot {
     pub role: Role,
+    pub hostname: String,
+    pub token_generated: bool,
     pub endpoint_id: Option<String>,
     pub auth_token: Option<String>,
     pub conn_status: ConnStatus,

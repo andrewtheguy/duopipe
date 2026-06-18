@@ -67,7 +67,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     };
 
     // Phase 2: build state + spawn the runtime.
-    let state = AppState::new(resolved.role, launch.logs.clone());
+    let state = AppState::new(resolved.role, resolved.token_generated, launch.logs.clone());
     let cfg = build_peer_config(&resolved, &launch, state.clone());
     let mut runtime = tokio::spawn(crate::iroh_mode::run_peer(cfg));
 

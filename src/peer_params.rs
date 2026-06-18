@@ -19,4 +19,7 @@ pub struct ResolvedPeer {
     pub role: Role,
     pub peer_node_id: Option<EndpointId>,
     pub auth_token: String,
+    /// `true` when `auth_token` was freshly generated (no token in config/env), so
+    /// the TUI must surface it for the user to copy. `false` when supplied.
+    pub token_generated: bool,
 }

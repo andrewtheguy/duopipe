@@ -165,11 +165,8 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
         eprintln!("node_id: {endpoint_id}");
         eprintln!("auth_token: {}", config.auth_token);
     }
-    log::info!("EndpointId: {}", endpoint_id);
-    log::info!(
-        "Connect to this instance with node id {} and the auth token shown above.",
-        endpoint_id
-    );
+    log::info!("node id: {}", endpoint_id);
+    log::info!("Dial this instance with the node id and auth token.");
     log::info!("Waiting for peers to connect...");
 
     let shutdown = config.status.shutdown.clone();

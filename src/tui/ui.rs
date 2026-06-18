@@ -22,7 +22,7 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
     let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
     let [header_area, tunnels_area, peers_area, logs_area] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Length(tunnel_rows.clamp(4, 10)),
         Constraint::Length(peer_rows.clamp(3, 8)),
         Constraint::Min(3),
@@ -41,6 +41,11 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled("duopipe", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" @ "),
+            Span::styled(
+                snap.hostname.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  role: "),
             Span::styled(
                 snap.role.label(),
@@ -49,7 +54,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
             Span::raw("  sessions: "),
             Span::raw(format!("{}/{}", snap.sessions_used, snap.sessions_max)),
         ]),
-        Line::from(vec![Span::raw("EndpointId: "), Span::raw(endpoint)]),
+        Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
     ];
 
     if snap.role == Role::Dial {
@@ -61,14 +66,31 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
         ]));
     } else {
         // Listen role: surface the ephemeral node id + token the dialer needs.
-        // Both change each run, so show the token plainly for copying.
+        // Both change each run, so show the token plainly for copying. When the
+        // token was freshly generated (not from config), flag it so the user
+        // knows to copy it now along with the EndpointId above.
         let token = snap.auth_token.as_deref().unwrap_or("(pending)");
+        let label = if snap.token_generated {
+            "token (generated — copy now): "
+        } else {
+            "token: "
+        };
+        let token_color = if snap.token_generated {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
         lines.push(Line::from(vec![
-            Span::raw("token: "),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(token_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 token.to_string(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(token_color)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
