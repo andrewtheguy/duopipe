@@ -10,4 +10,4 @@ mod helpers;
 mod peer;
 
 // Re-export public API
-pub use peer::{run_peer, PeerConfig};
+pub use peer::{PeerConfig, run_peer};

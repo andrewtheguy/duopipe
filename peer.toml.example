@@ -1,9 +1,9 @@
 # duopipe peer configuration example
 #
-# Usage: duopipe peer -c peer.toml
-#        duopipe peer --default-config   # loads ~/.config/duopipe/peer.toml
+# Usage: duopipe start -c peer.toml
+#        duopipe start --default-config   # loads ~/.config/duopipe/peer.toml
 #
-# `duopipe peer` is interactive: on startup the TUI asks whether to connect to an
+# `duopipe start` is interactive: on startup the TUI asks whether to connect to an
 # existing instance. The role (dial/listen), the target node id, and (if missing)
 # the auth token are answered there — they are NOT config keys. This file supplies
 # the rest: the shared auth token, tunnel requests, the allowlist, relays, tuning.
@@ -16,9 +16,10 @@
 #
 # Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
-# (separate CIDR lists per protocol). Fail-closed: an empty or absent allowlist
-# rejects every incoming request. The iroh identity key is ephemeral (regenerated
-# every run), so a listening instance's node id changes between runs.
+# (separate CIDR lists per protocol). Empty/absent TCP defaults to dual-stack
+# localhost; empty/absent UDP rejects every incoming UDP request. The iroh
+# identity key is ephemeral (regenerated every run), so a listening instance's
+# node id changes between runs.
 
 # The shared auth token, presented by both sides. Optional: a fresh listening
 # instance generates one if absent (shown in the TUI). Generate with:
@@ -28,7 +29,7 @@
 auth_token_file = "~/.config/duopipe/token.txt"
 
 # Maximum concurrent data streams per connection (default: 100).
-# max_sessions = 100
+# max_streams = 100
 
 # Custom relay server URL(s) for failover. Defaults to iroh's public relays.
 # relay_urls = ["https://relay1.example.com", "https://relay2.example.com"]

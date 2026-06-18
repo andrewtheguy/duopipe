@@ -36,7 +36,10 @@ pub fn render_spans(input: &Input, style: Style) -> Vec<Span<'static>> {
 
     let mut spans = Vec::new();
     if cursor > 0 {
-        spans.push(Span::styled(chars[..cursor].iter().collect::<String>(), style));
+        spans.push(Span::styled(
+            chars[..cursor].iter().collect::<String>(),
+            style,
+        ));
     }
     if cursor < chars.len() {
         spans.push(Span::styled(chars[cursor].to_string(), cursor_style));

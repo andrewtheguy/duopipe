@@ -4,12 +4,12 @@ pub mod codec;
 
 // Connection-level authentication.
 pub use codec::{
-    decode_auth_request, decode_auth_response, encode_auth_request, encode_auth_response,
-    AuthRequest, AuthResponse,
+    AuthRequest, AuthResponse, decode_auth_request, decode_auth_response, encode_auth_request,
+    encode_auth_response,
 };
 
 // Per-stream dispatch.
 pub use codec::{
-    decode_stream_ack, decode_stream_hello, encode_stream_ack, encode_stream_hello,
-    read_length_prefixed, StreamAck, StreamHello,
+    StreamAck, StreamHello, decode_stream_ack, decode_stream_hello, encode_stream_ack,
+    encode_stream_hello, read_length_prefixed,
 };

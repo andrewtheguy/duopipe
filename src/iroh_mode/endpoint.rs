@@ -1,26 +1,26 @@
 //! Common endpoint helpers for iroh tunnel connections.
 
-use anyhow::{Context, Result};
-use crate::error::TunnelError;
-use futures::StreamExt;
-use iroh::{
-    address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{
-        presets, AckFrequencyConfig, Builder as EndpointBuilder, ControllerFactory, PathList,
-        QuicTransportConfig,
-    },
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
-};
-use iroh_mdns_address_lookup::MdnsAddressLookup;
-use noq_proto::congestion::{Bbr3Config, CubicConfig, NewRenoConfig};
-use log::{info, warn};
-use tokio::task::JoinHandle;
-use std::sync::Arc;
-use std::time::Duration;
 use crate::app_state::{AppState, PathInfo, PathKind, Role};
 use crate::config::{
-    CongestionController, TransportTuning, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW,
+    CongestionController, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, TransportTuning,
 };
+use crate::error::TunnelError;
+use anyhow::{Context, Result};
+use futures::StreamExt;
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
+    endpoint::{
+        AckFrequencyConfig, Builder as EndpointBuilder, ControllerFactory, PathList,
+        QuicTransportConfig, presets,
+    },
+};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
+use log::{info, warn};
+use noq_proto::congestion::{Bbr3Config, CubicConfig, NewRenoConfig};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
 use url::Url;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,7 +87,7 @@ pub fn parse_relay_mode(relay_urls: &[String]) -> Result<RelayMode> {
 pub fn validate_relay_only(relay_only: bool, relay_urls: &[String]) -> Result<()> {
     if relay_only && relay_urls.is_empty() {
         anyhow::bail!(
-            "--relay-only requires at least one --relay-url to be specified.\n\
+            "relay_only requires at least one relay_urls entry.\n\
             The default public relay is rate-limited and cannot be used for relay-only mode."
         );
     }
@@ -118,7 +118,8 @@ pub fn print_relay_status(relay_urls: &[String], relay_only: bool, using_custom_
 /// * `relay_mode` - The relay mode to use
 /// * `relay_only` - If true, only use relay connections (no direct P2P).
 /// * `dns_server` - Optional custom DNS server URL (e.g., "https://dns.example.com"), or "none" to disable DNS discovery
-/// * `secret_key` - Optional secret key (required for publishing to custom DNS server)
+/// * `secret_key` - Optional iroh identity key. Normal runtime passes `None`,
+///   so iroh generates an ephemeral identity.
 /// * `transport_tuning` - Optional transport layer tuning (congestion control, buffer sizes)
 pub fn create_endpoint_builder(
     relay_mode: RelayMode,
@@ -173,9 +174,17 @@ pub fn create_endpoint_builder(
         };
         transport_config = transport_config.send_window(send_window.into());
 
-        let recv_source = if tuning.receive_window.is_none() { "default" } else { "config" };
+        let recv_source = if tuning.receive_window.is_none() {
+            "default"
+        } else {
+            "config"
+        };
         let send_source = if tuning.send_window.is_none() {
-            if tuning.receive_window.is_none() { "default" } else { "derived" }
+            if tuning.receive_window.is_none() {
+                "default"
+            } else {
+                "derived"
+            }
         } else {
             "config"
         };
@@ -270,11 +279,13 @@ async fn wait_for_endpoint_online(endpoint: &Endpoint) -> Result<()> {
         Err(_) => Err(TunnelError::connection(anyhow::anyhow!(
             "Endpoint failed to come online after {}s - check relay server connectivity",
             RELAY_CONNECT_TIMEOUT.as_secs()
-        )).into()),
+        ))
+        .into()),
     }
 }
 
-/// Create a server endpoint with optional persistent identity.
+/// Create a listening endpoint. Normal runtime passes no secret key, so the
+/// endpoint identity is ephemeral and the node id changes every run.
 pub async fn create_server_endpoint(
     relay_urls: &[String],
     relay_only: bool,
@@ -287,9 +298,14 @@ pub async fn create_server_endpoint(
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder =
-        create_endpoint_builder(relay_mode, relay_only, dns_server, secret.as_ref(), transport_tuning)?
-            .alpns(vec![alpn.to_vec()]);
+    let mut builder = create_endpoint_builder(
+        relay_mode,
+        relay_only,
+        dns_server,
+        secret.as_ref(),
+        transport_tuning,
+    )?
+    .alpns(vec![alpn.to_vec()]);
 
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
@@ -305,8 +321,8 @@ pub async fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create a client endpoint.
-/// If a secret key is provided, the client will use a persistent identity for authentication.
+/// Create a dialing endpoint. Normal runtime passes no secret key, so the
+/// endpoint identity is ephemeral.
 pub async fn create_client_endpoint(
     relay_urls: &[String],
     relay_only: bool,
@@ -318,9 +334,15 @@ pub async fn create_client_endpoint(
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret_key, transport_tuning)?;
+    let mut builder = create_endpoint_builder(
+        relay_mode,
+        relay_only,
+        dns_server,
+        secret_key,
+        transport_tuning,
+    )?;
 
-    // Set the secret key for persistent identity (used for authentication)
+    // Set a caller-supplied identity key. The normal runtime leaves this unset.
     if let Some(secret) = secret_key {
         builder = builder.secret_key(secret.clone());
     }
@@ -335,7 +357,7 @@ pub async fn create_client_endpoint(
     Ok(endpoint)
 }
 
-/// Connect to a server endpoint with relay failover support.
+/// Connect to a listening endpoint with relay failover support.
 pub async fn connect_to_server(
     endpoint: &Endpoint,
     server_id: EndpointId,
@@ -377,7 +399,8 @@ pub async fn connect_to_server(
         Err(TunnelError::connection(anyhow::anyhow!(
             "Failed to connect via any relay: {}",
             last_error.unwrap_or_else(|| "No relay URLs provided".to_string())
-        )).into())
+        ))
+        .into())
     } else {
         // Include relay URLs in EndpointAddr if available, allowing iroh to use
         // the relay for initial connection when DNS discovery is disabled.
@@ -407,11 +430,13 @@ pub async fn connect_to_server(
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => Err(TunnelError::connection(
                 anyhow::Error::from(e).context("Failed to connect to server"),
-            ).into()),
+            )
+            .into()),
             Err(_) => Err(TunnelError::connection(anyhow::anyhow!(
                 "Connection timed out after {}s",
                 RELAY_CONNECT_TIMEOUT.as_secs()
-            )).into()),
+            ))
+            .into()),
         }
     }
 }

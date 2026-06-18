@@ -15,22 +15,22 @@ mod peer_params;
 mod signaling;
 mod tui;
 
+use crate::app_state::{AppState, Role};
+use crate::error::{ErrorCategory, TunnelError};
+use crate::peer_params::ResolvedPeer;
+use crate::tui::TuiLaunch;
 use ::iroh::EndpointId;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use crate::app_state::{AppState, Role};
-use crate::error::{ErrorCategory, TunnelError};
-use crate::peer_params::ResolvedPeer;
-use crate::tui::TuiLaunch;
 
 /// Capacity of the in-memory log ring buffer shown in the TUI.
 const LOG_CAPACITY: usize = 2000;
 
 use crate::config::{
-    expand_tilde, load_peer_config, validate_allowed_sources, validate_request_specs,
-    validate_transport_tuning, AllowedSources, ConfigSource, PeerConfig,
+    AllowedSources, ConfigSource, PeerConfig, expand_tilde, load_peer_config,
+    validate_allowed_sources, validate_request_specs, validate_transport_tuning,
 };
 use crate::iroh_mode::endpoint::validate_relay_only;
 
@@ -63,9 +63,10 @@ enum Command {
     },
     /// Generate an authentication token
     ///
-    /// The auth token is the shared secret presented by both sides. Put it in a
-    /// config `auth_token`/`auth_token_file`, or set DUOPIPE_AUTH_TOKEN. A fresh
-    /// listening instance generates one automatically if none is provided.
+    /// The auth token is the shared secret presented by both sides. Store it with
+    /// `auth_token_file`, an age-encrypted config `auth_token`, or
+    /// DUOPIPE_AUTH_TOKEN. A fresh listening instance generates one automatically
+    /// if none is provided.
     GenerateAuthToken {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
@@ -142,54 +143,72 @@ fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
     Ok(token)
 }
 
-/// Detect a test-mode preset from environment variables.
-///
-/// Requires `DUOPIPE_TEST_MODE` to be truthy (the single gate for all test-only
-/// env vars). Role is inferred from `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial (parse
-/// the id), absent ⇒ Listen. The auth token comes from `config_auth_token`
-/// (already resolved/validated), or is generated for Listen. Evaluated before the
-/// peer starts so failures print plainly and exit.
-fn detect_env_preset(
-    config_auth_token: Option<String>,
-    allowed_sources: AllowedSources,
-) -> Result<Option<ResolvedPeer>> {
-    if !env_truthy("DUOPIPE_TEST_MODE") {
-        return Ok(None);
+/// All test-only environment variables, read once behind the single
+/// `DUOPIPE_TEST_MODE` gate. `None` ⇒ test mode is off and no other `DUOPIPE_*`
+/// test var has any effect. This is the only place test-only env vars are read.
+struct TestEnv {
+    /// `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial that id; absent ⇒ Listen.
+    peer_node_id: Option<String>,
+    /// `DUOPIPE_AUTOSTART_REQUESTS`: auto-start all requests once connected.
+    autostart_requests: bool,
+}
+
+impl TestEnv {
+    /// Read the gate and, if set, every gated var.
+    fn from_env() -> Option<Self> {
+        if !env_truthy("DUOPIPE_TEST_MODE") {
+            return None;
+        }
+        Some(TestEnv {
+            peer_node_id: env_var_opt("DUOPIPE_PEER_NODE_ID"),
+            autostart_requests: env_truthy("DUOPIPE_AUTOSTART_REQUESTS"),
+        })
     }
 
-    match env_var_opt("DUOPIPE_PEER_NODE_ID") {
-        Some(node) => {
-            let id: EndpointId = node.parse().map_err(|_| {
-                anyhow::anyhow!("DUOPIPE_PEER_NODE_ID is not a valid node id.")
-            })?;
-            let auth_token = config_auth_token.context(
-                "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN or auth_token in the config.",
-            )?;
-            Ok(Some(ResolvedPeer {
-                role: Role::Dial,
-                peer_node_id: Some(id),
-                auth_token,
-                token_generated: false,
-                allowed_sources,
-            }))
-        }
-        None => {
-            let (auth_token, token_generated) = match config_auth_token {
-                Some(t) => (t, false),
-                None => {
-                    let t = auth::generate_token();
-                    // Printed before TUI init so non-interactive tests can capture it.
-                    eprintln!("auth_token: {t}");
-                    (t, true)
-                }
-            };
-            Ok(Some(ResolvedPeer {
-                role: Role::Listen,
-                peer_node_id: None,
-                auth_token,
-                token_generated,
-                allowed_sources,
-            }))
+    /// Resolve the role-dependent peer for this test run. Role is inferred from
+    /// `peer_node_id`: present ⇒ Dial (parse the id), absent ⇒ Listen. The auth
+    /// token comes from `config_auth_token` (already resolved/validated), or is
+    /// generated for Listen. Evaluated before the peer starts so failures print
+    /// plainly and exit.
+    fn resolve_preset(
+        &self,
+        config_auth_token: Option<String>,
+        allowed_sources: AllowedSources,
+    ) -> Result<ResolvedPeer> {
+        match &self.peer_node_id {
+            Some(node) => {
+                let id: EndpointId = node
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("DUOPIPE_PEER_NODE_ID is not a valid node id."))?;
+                let auth_token = config_auth_token.context(
+                    "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN, auth_token_file, or an age-encrypted auth_token in the config.",
+                )?;
+                Ok(ResolvedPeer {
+                    role: Role::Dial,
+                    peer_node_id: Some(id),
+                    auth_token,
+                    token_generated: false,
+                    allowed_sources,
+                })
+            }
+            None => {
+                let (auth_token, token_generated) = match config_auth_token {
+                    Some(t) => (t, false),
+                    None => {
+                        let t = auth::generate_token();
+                        // Printed before TUI init so non-interactive tests can capture it.
+                        eprintln!("auth_token: {t}");
+                        (t, true)
+                    }
+                };
+                Ok(ResolvedPeer {
+                    role: Role::Listen,
+                    peer_node_id: None,
+                    auth_token,
+                    token_generated,
+                    allowed_sources,
+                })
+            }
         }
     }
 }
@@ -290,8 +309,8 @@ async fn run_inner() -> Result<()> {
     // no TUI, logging to stderr, so it needs no terminal. `DUOPIPE_TEST_MODE` is
     // the single gate for all test-only env vars. Every other command logs to the
     // console as usual.
-    let test_mode = env_truthy("DUOPIPE_TEST_MODE");
-    let log_buffer = if matches!(&command, Command::Start { .. }) && !test_mode {
+    let test_env = TestEnv::from_env();
+    let log_buffer = if matches!(&command, Command::Start { .. }) && test_env.is_none() {
         if !std::io::stdout().is_terminal() {
             return Err(TunnelError::config(anyhow::anyhow!(
                 "duopipe start requires an interactive terminal (set DUOPIPE_TEST_MODE=1 for headless test mode)."
@@ -327,28 +346,30 @@ async fn run_inner() -> Result<()> {
             // Requests, allowlist, relays, and transport now come from config only.
             validate_request_specs(&cfg.request).map_err(TunnelError::config)?;
             validate_allowed_sources(&cfg.allowed_sources).map_err(TunnelError::config)?;
-            validate_transport_tuning(&cfg.transport, "transport")
-                .map_err(TunnelError::config)?;
+            validate_transport_tuning(&cfg.transport, "transport").map_err(TunnelError::config)?;
 
             let relay_urls = cfg.relay_urls.clone().unwrap_or_default();
             let relay_only = cfg.relay_only.unwrap_or(false);
             validate_relay_only(relay_only, &relay_urls).map_err(TunnelError::config)?;
 
-            // Resolve the shared auth token (env > config) and any non-interactive
-            // preset, both before startup so failures print plainly.
-            let config_auth_token =
-                resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
-            let preset =
-                detect_env_preset(config_auth_token.clone(), cfg.allowed_sources.clone())
-                    .map_err(TunnelError::config)?;
-            // Autostart is a test-only convenience, gated by test mode.
-            let autostart_requests = test_mode && env_truthy("DUOPIPE_AUTOSTART_REQUESTS");
+            // Resolve the shared auth token (env > config) before startup so
+            // failures print plainly.
+            let config_auth_token = resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
 
-            // Test mode: run headless with the resolved preset, no TUI.
+            // Test mode: resolve the preset and run headless, no TUI.
             // Interactive mode: hand off to the TUI lifecycle.
-            if let (true, Some(resolved)) = (test_mode, preset.clone()) {
-                return run_peer_headless(resolved, &cfg, relay_urls, relay_only, autostart_requests)
-                    .await;
+            if let Some(test_env) = &test_env {
+                let resolved = test_env
+                    .resolve_preset(config_auth_token, cfg.allowed_sources.clone())
+                    .map_err(TunnelError::config)?;
+                return run_peer_headless(
+                    resolved,
+                    &cfg,
+                    relay_urls,
+                    relay_only,
+                    test_env.autostart_requests,
+                )
+                .await;
             }
 
             let log_buffer = log_buffer.expect("start command initializes the TUI log buffer");
@@ -356,15 +377,12 @@ async fn run_inner() -> Result<()> {
                 logs: log_buffer,
                 requests: cfg.request.clone(),
                 allowed_sources: cfg.allowed_sources.clone(),
-                autostart_requests,
                 relay_urls,
                 relay_only,
                 dns_server: cfg.dns_server.clone(),
                 max_streams: cfg.max_streams,
                 transport: cfg.transport.clone(),
-                announce_endpoint: preset.is_some(),
                 config_auth_token,
-                preset,
             };
 
             tui::run_tui(launch).await
@@ -394,9 +412,7 @@ async fn run_inner() -> Result<()> {
             ConfigEncryptionCommand::EncryptValue { recipient, config } => {
                 let recipient_str = match (recipient, config) {
                     (Some(_), Some(_)) => {
-                        anyhow::bail!(
-                            "Cannot combine --recipient and --config. Use only one."
-                        );
+                        anyhow::bail!("Cannot combine --recipient and --config. Use only one.");
                     }
                     (Some(r), None) => r.clone(),
                     (None, Some(config_path)) => {
@@ -410,10 +426,9 @@ async fn run_inner() -> Result<()> {
                             encryption_recipient: Option<String>,
                         }
 
-                        let cfg: MinimalConfig =
-                            toml::from_str(&content).with_context(|| {
-                                format!("Failed to parse config: {}", expanded.display())
-                            })?;
+                        let cfg: MinimalConfig = toml::from_str(&content).with_context(|| {
+                            format!("Failed to parse config: {}", expanded.display())
+                        })?;
                         cfg.encryption_recipient.ok_or_else(|| {
                             anyhow::anyhow!(
                                 "No encryption_recipient found in {}",

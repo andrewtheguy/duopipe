@@ -11,7 +11,7 @@
 
 use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use std::path::Path;
 
 const AGEENC_PREFIX: &str = "ageenc:";
@@ -42,9 +42,13 @@ fn load_identity(path: &Path) -> Result<age::x25519::Identity> {
             )
         })?;
 
-    key_line
-        .parse::<age::x25519::Identity>()
-        .map_err(|e| anyhow::anyhow!("Failed to parse age identity from {}: {}", path.display(), e))
+    key_line.parse::<age::x25519::Identity>().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse age identity from {}: {}",
+            path.display(),
+            e
+        )
+    })
 }
 
 /// Decrypt an `ageenc:`-prefixed value using an identity file.
@@ -110,7 +114,10 @@ pub fn write_identity_file(
 
     let append = path.exists() && !force;
     let now = jiff::Zoned::now().strftime("%Y-%m-%dT%H:%M:%S%:z");
-    let block = format!("# created: {}\n# public key: {}\n{}\n", now, public_key, secret_key);
+    let block = format!(
+        "# created: {}\n# public key: {}\n{}\n",
+        now, public_key, secret_key
+    );
     let content = if append {
         format!("\n{}", block)
     } else {

@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 
 use crate::app_state::{AppSnapshot, AppState, Role, TunnelCommand};
-use crate::config::{
-    validate_request_specs, AllowedSources, RequestEntry, TransportTuning,
-};
+use crate::config::{AllowedSources, RequestEntry, TransportTuning, validate_request_specs};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use setup::{SetupOutcome, SetupState, Step};
@@ -36,21 +36,14 @@ pub struct TuiLaunch {
     pub logs: Arc<LogBuffer>,
     pub requests: Vec<RequestEntry>,
     pub allowed_sources: AllowedSources,
-    /// Autostart all requests once connected (test mode only; see `DUOPIPE_TEST_MODE`).
-    pub autostart_requests: bool,
     pub relay_urls: Vec<String>,
     pub relay_only: bool,
     pub dns_server: Option<String>,
     pub max_streams: Option<usize>,
     pub transport: TransportTuning,
-    /// Print the bound node id + token to stderr (non-interactive/test mode).
-    pub announce_endpoint: bool,
     /// A valid auth token from config/env (pre-seeds the dial flow; used directly
     /// for listen). Pre-validated in main.
     pub config_auth_token: Option<String>,
-    /// Pre-resolved role/target/token (env/non-interactive). When `Some`, the
-    /// interactive setup screen is skipped.
-    pub preset: Option<ResolvedPeer>,
 }
 
 /// Run the interactive setup, then the live dashboard, until the user quits or
@@ -59,23 +52,20 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut events = EventStream::new();
 
-    // Phase 1: resolve role/target/token (skip when a preset is supplied).
-    let resolved = match launch.preset.clone() {
-        Some(preset) => preset,
-        None => match run_setup(
-            &mut terminal,
-            &mut events,
-            launch.config_auth_token.clone(),
-            launch.allowed_sources.clone(),
-        )
-        .await
-        {
-            SetupOutcome::Resolved(r) => r,
-            SetupOutcome::Quit => {
-                ratatui::restore();
-                return Ok(());
-            }
-        },
+    // Phase 1: resolve role/target/token via the interactive setup screen.
+    let resolved = match run_setup(
+        &mut terminal,
+        &mut events,
+        launch.config_auth_token.clone(),
+        launch.allowed_sources.clone(),
+    )
+    .await
+    {
+        SetupOutcome::Resolved(r) => r,
+        SetupOutcome::Quit => {
+            ratatui::restore();
+            return Ok(());
+        }
     };
 
     // Phase 2: build state + spawn the runtime.
@@ -149,14 +139,14 @@ fn build_peer_config(
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
         allowed_sources: resolved.allowed_sources.clone(),
-        autostart_requests: launch.autostart_requests,
+        autostart_requests: false,
         auth_token: resolved.auth_token.clone(),
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),
         max_streams: launch.max_streams,
         transport: launch.transport.clone(),
-        announce_endpoint: launch.announce_endpoint,
+        announce_endpoint: false,
         status: state,
     }
 }
@@ -370,8 +360,10 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
     use std::fmt::Write as _;
 
     let now = jiff::Zoned::now();
-    let path =
-        std::env::temp_dir().join(format!("duopipe-conn-{}.txt", now.strftime("%Y%m%d-%H%M%S")));
+    let path = std::env::temp_dir().join(format!(
+        "duopipe-conn-{}.txt",
+        now.strftime("%Y%m%d-%H%M%S")
+    ));
 
     let mut out = String::new();
     let _ = writeln!(out, "duopipe connection info");

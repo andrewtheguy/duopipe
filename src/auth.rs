@@ -1,6 +1,6 @@
 //! Token-based authentication for iroh tunnel connections.
 //!
-//! Provides pre-shared token authentication for the iroh multi-source server.
+//! Provides pre-shared token authentication for the symmetric iroh peer runtime.
 //!
 //! ## Token Format
 //! - Exactly 47 characters
@@ -13,7 +13,7 @@
 //! Generate tokens with: `duopipe generate-auth-token`
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use std::collections::HashSet;
 use std::path::Path;
@@ -155,7 +155,12 @@ pub fn load_auth_token_from_file(path: &Path) -> Result<String> {
 
     if let Some((line_num, token)) = parse_token_lines(&content).next() {
         validate_token(token).with_context(|| {
-            format!("Invalid token at {}:{}: '{}'", path.display(), line_num, token)
+            format!(
+                "Invalid token at {}:{}: '{}'",
+                path.display(),
+                line_num,
+                token
+            )
         })?;
         return Ok(token.to_string());
     }
@@ -223,10 +228,12 @@ mod tests {
     fn test_validate_token_too_short() {
         let result = validate_token("ishort");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("exactly 47 characters"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exactly 47 characters")
+        );
     }
 
     #[test]
@@ -234,10 +241,12 @@ mod tests {
         let token = format!("{}{}", TOKEN_PREFIX, "A".repeat(TOKEN_LENGTH));
         let result = validate_token(&token);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("exactly 47 characters"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exactly 47 characters")
+        );
     }
 
     #[test]
@@ -248,10 +257,12 @@ mod tests {
 
         let result = validate_token(&token);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must start with 'i'"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must start with 'i'")
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ The role is chosen **at startup**: the TUI asks "Connect to an existing instance
 Each peer declares **tunnel requests** in config (the connection role is chosen at startup, not here):
 
 - **`[[request]]`** (`name`, `remote_source`, `local_listen`): this peer binds a local listener at `local_listen`; each accepted connection asks the *other* peer to connect out to `remote_source`, then bridges the two. Requests are activated on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
-- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Fail-closed — an empty or absent list rejects every request.
+- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Empty or absent TCP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); empty or absent UDP rejects every UDP request.
 
 #### Non-interactive mode (testing)
 
@@ -264,7 +264,7 @@ graph TB
     A[accept_bi: new stream] --> B[Read StreamHello<br/>HELLO_TIMEOUT 10s]
     B --> C{LocalForward source}
 
-    C --> S{source in allowed_sources?<br/>fail-closed}
+    C --> S{source in allowed_sources?<br/>TCP default localhost<br/>UDP fail-closed}
     S -->|no| R[Reply StreamAck rejected]
     S -->|yes| D[Acquire session permit]
     D --> E[Connect out to source<br/>tcp:// or udp://]
@@ -279,7 +279,7 @@ A per-connection `Semaphore` (default `max_streams = 100`) bounds concurrent for
 
 ### Request Data Flow
 
-A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1`); stopping one cancels its task and frees the bound port.
+A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode); stopping one cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
@@ -290,7 +290,7 @@ sequenceDiagram
 
     App->>O: connect to local listener
     O->>P: open_bi() + StreamHello::LocalForward{source}
-    P->>P: check source against allowed_sources (fail-closed)
+    P->>P: check source against allowed_sources
     alt allowed & connect ok
         P->>T: connect out to source
         P-->>O: StreamAck{accepted: true}
@@ -510,7 +510,7 @@ sequenceDiagram
 
     alt Config loaded
         Config->>Config: Parse TOML
-        Config->>Config: Validate address formats + auth token
+        Config->>Config: Validate structure, address formats, and secret rules
         Config-->>Main: Validated config
         Main->>Main: Apply env overrides (DUOPIPE_AUTH_TOKEN wins)
     end
@@ -598,7 +598,7 @@ graph TB
 
 **Two trusted endpoints, coordinated out-of-band.** duopipe is built for a link between **two parties who trust each other** or **one person across their own devices** — not a public service or multi-tenant gateway. Several design choices follow directly from this assumption:
 
-- **Out-of-band credential exchange.** The ephemeral node id and the shared auth token change every run and carry no directory or discovery-by-name; the two operators pass them over a side channel they already share (chat, an existing SSH session, a password manager, a second device under their control) before connecting.
+- **Out-of-band credential exchange.** The ephemeral node id changes every run, and any generated auth token is per-run too. The node id and shared token carry no directory or discovery-by-name; the two operators pass them over a side channel they already share (chat, an existing SSH session, a password manager, a second device under their control) before connecting.
 - **Interactive, co-operated runtime.** Both ends run the TUI and watch shared status — connection state, the bound peer, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* happens between the two humans (or the one human on two screens), not automatically.
 - **Symmetric mutual trust.** Because either peer may *request* tunnels of the other once authenticated, the token should only ever be shared with an endpoint you trust; the `[allowed_sources]` allowlist then bounds what that trusted peer can actually reach.
 
@@ -610,7 +610,7 @@ graph TB
 
 The binding persists even while no peer is connected. To admit a different node id, the operator either restarts the listener or presses `u` in the listen dashboard (`AppState::unbind_session`), which clears the binding so the next authenticated peer may bind.
 
-**Auth, then a fail-closed source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the session binding admits the peer, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). The check is **fail-closed** — an empty or absent list rejects every requested source — so a peer can only reach addresses you explicitly allow. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
+**Auth, then a source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the session binding admits the peer, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); empty or absent UDP rejects every UDP request. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
@@ -864,7 +864,7 @@ The `iroh::Endpoint` provides:
 - `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`. When `announce_endpoint` is set (non-interactive mode) it prints `node_id:` and `auth_token:` to stderr.
 - `run_dial` — `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs two concurrent halves over the one connection: an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out) and a `request_supervisor` that starts/stops our own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request. With `DUOPIPE_AUTOSTART_REQUESTS=1` every request is started on connect. Everything is torn down when `conn.closed()` resolves.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs two concurrent halves over the one connection: an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out) and a `request_supervisor` that starts/stops our own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request. In test mode, `DUOPIPE_AUTOSTART_REQUESTS=1` starts every request on connect. Everything is torn down when `conn.closed()` resolves.
 
 ---
 
