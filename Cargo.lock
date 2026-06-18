@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "duopipe"
-version = "0.0.3-alpha1"
+version = "0.0.3-alpha2"
 dependencies = [
  "age",
  "anyhow",

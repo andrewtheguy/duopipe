@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use crate::app_state::Role;
+use crate::app_state::{AppState, Role};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::peer_params::ResolvedPeer;
 use crate::tui::TuiLaunch;
@@ -29,8 +29,8 @@ use crate::tui::TuiLaunch;
 const LOG_CAPACITY: usize = 2000;
 
 use crate::config::{
-    expand_tilde, load_peer_config, validate_forward_specs, validate_transport_tuning,
-    ConfigSource, PeerConfig,
+    expand_tilde, load_peer_config, validate_allowed_sources, validate_request_specs,
+    validate_transport_tuning, ConfigSource, PeerConfig,
 };
 use crate::iroh_mode::endpoint::validate_relay_only;
 
@@ -142,15 +142,15 @@ fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
     Ok(token)
 }
 
-/// Detect a non-interactive (test) preset from environment variables.
+/// Detect a test-mode preset from environment variables.
 ///
-/// Requires `DUOPIPE_NONINTERACTIVE` to be truthy. Role is inferred from
-/// `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial (parse the id), absent ⇒ Listen. The
-/// auth token comes from `config_auth_token` (already resolved/validated), or is
-/// generated for Listen. Evaluated before the TUI starts so failures print
-/// plainly and exit.
+/// Requires `DUOPIPE_TEST_MODE` to be truthy (the single gate for all test-only
+/// env vars). Role is inferred from `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial (parse
+/// the id), absent ⇒ Listen. The auth token comes from `config_auth_token`
+/// (already resolved/validated), or is generated for Listen. Evaluated before the
+/// peer starts so failures print plainly and exit.
 fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<ResolvedPeer>> {
-    if !env_truthy("DUOPIPE_NONINTERACTIVE") {
+    if !env_truthy("DUOPIPE_TEST_MODE") {
         return Ok(None);
     }
 
@@ -207,6 +207,46 @@ fn resolve_peer_config(
     }
 }
 
+/// Run a peer headless (no TUI) for non-interactive test mode. Logs go to stderr
+/// via the env logger; the in-memory `AppState` is still created (the runtime
+/// writes status into it) but nothing renders it. Ctrl-C triggers a clean shutdown.
+async fn run_peer_headless(
+    resolved: ResolvedPeer,
+    cfg: &PeerConfig,
+    relay_urls: Vec<String>,
+    relay_only: bool,
+    autostart_requests: bool,
+) -> Result<()> {
+    let logs = logging::LogBuffer::new(LOG_CAPACITY);
+    let state = AppState::new(resolved.role, resolved.token_generated, logs);
+    let peer_cfg = iroh_mode::PeerConfig {
+        role: resolved.role,
+        peer_node_id: resolved.peer_node_id,
+        requests: cfg.request.clone(),
+        allowed_sources: cfg.allowed_sources.clone(),
+        autostart_requests,
+        auth_token: resolved.auth_token,
+        relay_urls,
+        relay_only,
+        dns_server: cfg.dns_server.clone(),
+        max_sessions: cfg.max_sessions,
+        transport: cfg.transport.clone(),
+        announce_endpoint: true,
+        status: state.clone(),
+    };
+
+    let mut runtime = tokio::spawn(iroh_mode::run_peer(peer_cfg));
+    tokio::select! {
+        r = &mut runtime => r.map_err(|e| anyhow::anyhow!("peer task failed: {e}"))?,
+        _ = tokio::signal::ctrl_c() => {
+            log::info!("Shutting down (Ctrl-C)…");
+            state.shutdown.cancel();
+            let _ = runtime.await;
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     std::process::exit(run().await);
@@ -235,12 +275,16 @@ async fn run_inner() -> Result<()> {
     let args = Args::parse();
     let command = args.command;
 
-    // The `peer` command renders a TUI and captures logs into a ring buffer;
-    // every other command logs to the console as usual.
-    let log_buffer = if matches!(&command, Command::Peer { .. }) {
+    // The interactive `peer` command renders a TUI and captures logs into a ring
+    // buffer. In test mode — `DUOPIPE_TEST_MODE=1` — the peer runs headless with
+    // no TUI, logging to stderr, so it needs no terminal. `DUOPIPE_TEST_MODE` is
+    // the single gate for all test-only env vars. Every other command logs to the
+    // console as usual.
+    let test_mode = env_truthy("DUOPIPE_TEST_MODE");
+    let log_buffer = if matches!(&command, Command::Peer { .. }) && !test_mode {
         if !std::io::stdout().is_terminal() {
             return Err(TunnelError::config(anyhow::anyhow!(
-                "duopipe peer requires an interactive terminal."
+                "duopipe peer requires an interactive terminal (set DUOPIPE_TEST_MODE=1 for headless test mode)."
             ))
             .into());
         }
@@ -270,9 +314,9 @@ async fn run_inner() -> Result<()> {
                 .map(|p| expand_tilde(&p));
             cfg.decrypt_secrets(enc_key.as_deref())?;
 
-            // Forwards, relays, and transport now come from config only.
-            validate_forward_specs(&cfg.local_forward, &cfg.remote_forward)
-                .map_err(TunnelError::config)?;
+            // Requests, allowlist, relays, and transport now come from config only.
+            validate_request_specs(&cfg.request).map_err(TunnelError::config)?;
+            validate_allowed_sources(&cfg.allowed_sources).map_err(TunnelError::config)?;
             validate_transport_tuning(&cfg.transport, "transport")
                 .map_err(TunnelError::config)?;
 
@@ -281,17 +325,27 @@ async fn run_inner() -> Result<()> {
             validate_relay_only(relay_only, &relay_urls).map_err(TunnelError::config)?;
 
             // Resolve the shared auth token (env > config) and any non-interactive
-            // preset, both before the TUI starts so failures print plainly.
+            // preset, both before startup so failures print plainly.
             let config_auth_token =
                 resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
             let preset =
                 detect_env_preset(config_auth_token.clone()).map_err(TunnelError::config)?;
+            // Autostart is a test-only convenience, gated by test mode.
+            let autostart_requests = test_mode && env_truthy("DUOPIPE_AUTOSTART_REQUESTS");
+
+            // Test mode: run headless with the resolved preset, no TUI.
+            // Interactive mode: hand off to the TUI lifecycle.
+            if let (true, Some(resolved)) = (test_mode, preset.clone()) {
+                return run_peer_headless(resolved, &cfg, relay_urls, relay_only, autostart_requests)
+                    .await;
+            }
 
             let log_buffer = log_buffer.expect("peer command initializes the TUI log buffer");
             let launch = TuiLaunch {
                 logs: log_buffer,
-                local_forwards: cfg.local_forward.clone(),
-                remote_forwards: cfg.remote_forward.clone(),
+                requests: cfg.request.clone(),
+                allowed_sources: cfg.allowed_sources.clone(),
+                autostart_requests,
                 relay_urls,
                 relay_only,
                 dns_server: cfg.dns_server.clone(),

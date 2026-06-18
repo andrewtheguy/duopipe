@@ -160,7 +160,7 @@ The CRC16 checksum detects all single-byte errors in the token payload.
 Generate auth tokens with: `duopipe generate-auth-token`
 
 > [!IMPORTANT]
-> **Full trust after auth.** Once the connection-level auth token passes, the peer is **fully trusted**. There are no per-destination allowlists — a trusted peer may declare forwards to any destination either side can reach. Only share the token with peers you trust.
+> **Trust after auth, gated by the source allowlist.** Once the connection-level auth token passes, the peer may *request* tunnels, but when it asks us to connect out to one of our sources we only honor addresses inside our `[allowed_sources]` CIDR lists. This is **fail-closed**: an empty or absent allowlist rejects every incoming request. Requests are also activated interactively — nothing forwards until you start it. Only share the token with peers you trust, and keep `[allowed_sources]` as narrow as possible.
 
 ### Token Management
 
@@ -181,16 +181,22 @@ The same token is used by **both** sides: the listener accepts it, and the diale
 
 > **Security:** A plaintext `auth_token` is **not allowed** in TOML config files. Use `auth_token_file`, set the `DUOPIPE_AUTH_TOKEN` environment variable, or embed the token directly with an [age-encrypted inline value](#encrypted-config-values).
 
-A minimal config is essentially just forwards plus an optional shared token (`peer.toml`):
+A minimal config is essentially the requests you can make, the sources you'll expose, plus an optional shared token (`peer.toml`):
 ```toml
 auth_token_file = "/etc/duopipe/auth_token.txt"
 
-[[local_forward]]
+# A tunnel we can request: bind locally, ask the peer to reach its source.
+[[request]]
+name = "db"
+source = "tcp://127.0.0.1:5678"
 listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
+
+# What the peer is allowed to request of us (fail-closed if omitted).
+[allowed_sources]
+tcp = ["127.0.0.0/8"]
 ```
 
-The connection role (listen vs dial) and the dialer's target node id are chosen **interactively** in the TUI, not in the config file.
+The connection role (listen vs dial) and the dialer's target node id are chosen **interactively** in the TUI, not in the config file. Requests are started/stopped from the TUI too — nothing forwards automatically.
 
 ---
 
@@ -198,17 +204,17 @@ The connection role (listen vs dial) and the dialer's target node id are chosen 
 
 ## Architecture
 
-A single iroh connection carries forwards in both directions. For example, an SSH local forward (`-L`) declared by the dialing peer:
+A single iroh connection carries requested tunnels. Each side *requests* a tunnel: it binds a local listener and asks the peer to connect out to a remote `source`. For example, a request for the peer's SSH server:
 
 ```
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
-| SSH Client      |  TCP   | dialing peer    |  iroh  | listening peer  |  TCP   | SSH Server      |
-|                 |<------>| -L (local:2222) |<======>|                 |<------>| (peer connects) |
+| SSH Client      |  TCP   | requesting peer |  iroh  | serving peer    |  TCP   | SSH Server      |
+|                 |<------>| listen :2222    |<======>| (allowlist gate)|<------>| source :22      |
 |                 |        |                 |  QUIC  |                 |        |                 |
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-The same connection may simultaneously carry a remote forward (`-R`) running the opposite direction, plus any number of additional TCP/UDP forwards declared by either side.
+The same connection may simultaneously carry requests in the opposite direction (the peer requesting our sources, gated by our `[allowed_sources]`), plus any number of additional TCP/UDP requests from either side.
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -238,60 +244,54 @@ duopipe peer -c ./peer.toml
 
 When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. It prompts for the listener's **node id**, and for the **auth token** if one isn't already in config or the `DUOPIPE_AUTH_TOKEN` env var. Both are validated before connecting.
 
-Once connected, all `-L`/`-R` forwards from either config flow over the single connection. For example, a config with:
+Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
 
 ```toml
-[[local_forward]]
+[[request]]
+name = "db"
+source = "tcp://127.0.0.1:5678"
 listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
-
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
 ```
 
-- The `local_forward` makes **this** peer listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678` reached by the **other** peer.
-- The `remote_forward` makes the **other** peer bind `tcp://0.0.0.0:6574`; connections there are forwarded back to `127.0.0.1:6574` on **this** peer.
+- This request makes **this** peer listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **other** peer connects out to (subject to its `[allowed_sources]`).
+- To expose a service running on **this** peer instead, the **other** peer adds the matching `[[request]]` and you list that source in **your** `[allowed_sources]`.
 
-Either peer may declare its own local and remote forwards; they all share the one connection.
+Either peer may declare its own requests; they all share the one connection and are started/stopped independently in the TUI.
 
-### 3. SSH over a local forward
+### 3. SSH over a requested tunnel
 
-With a `local_forward` of `listen = "127.0.0.1:2222"`, `dest = "tcp://127.0.0.1:22"` (the other peer reaches the SSH server):
+With a `[[request]]` of `source = "tcp://127.0.0.1:22"`, `listen = "127.0.0.1:2222"` (the other peer reaches the SSH server, and allows `127.0.0.0/8` in `[allowed_sources]`):
 
 ```bash
 ssh -p 2222 user@127.0.0.1
 ```
 
-### 4. UDP forward (e.g., WireGuard/Game/DNS)
+### 4. UDP request (e.g., WireGuard/Game/DNS)
 
-UDP works in both directions; the scheme on the destination (`local_forward`) or bind (`remote_forward`) selects the protocol:
+UDP works too; the `source` scheme selects the protocol, and the address is gated by the peer's `allowed_sources.udp` list:
 
 ```toml
-# Local forward: this peer listens on UDP 51820, the other peer reaches the UDP service
-[[local_forward]]
+# This peer listens on UDP 51820; the other peer connects out to the UDP service.
+[[request]]
+name = "wg"
+source = "udp://127.0.0.1:51820"
 listen = "0.0.0.0:51820"
-dest = "udp://127.0.0.1:51820"
-
-# Remote forward: the other peer binds UDP, forwards back to this peer's local service
-[[remote_forward]]
-bind = "udp://0.0.0.0:51820"
-dest = "127.0.0.1:51820"
 ```
 
-> **Note:** UDP `-R` uses a single-peer-address reply model — suitable for single-client UDP services.
+> **Note:** UDP requests use a single-peer-address reply model — suitable for single-client UDP services.
 
-### Non-interactive (testing only)
+### Test mode (testing only)
 
-duopipe is meant for interactive use. For automated tests, the interactive prompts can be bypassed with environment variables:
+duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1` runs the peer **headless** (no TUI, logs to stderr, needs no terminal) and is the single gate that enables all test-only env vars:
 
 | Env Var | Purpose |
 |---------|---------|
-| `DUOPIPE_NONINTERACTIVE=1` | Skip the TUI prompts entirely. |
+| `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (see env table below). |
+| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start every configured `[[request]]` once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
 
-In non-interactive mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
+In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
 
 ## CLI Options
 
@@ -304,7 +304,7 @@ In non-interactive mode the listener prints `node_id: <id>` and `auth_token: <to
 | `--config`, `-c` | - | Path to TOML config file |
 | `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` |
 
-The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Non-interactive (testing only)](#non-interactive-testing-only)).
+The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
 
 **Environment variables:**
 
@@ -312,8 +312,9 @@ The connection role (listen/dial) and the dialer's target node id are chosen int
 |---------|-------------|
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (highest precedence over config `auth_token` / `auth_token_file`). |
 | `DUOPIPE_ENCRYPTION_KEY_FILE` | Path to age identity file for decrypting age-encrypted config values. |
-| `DUOPIPE_NONINTERACTIVE` | Testing only: set to `1` to skip the interactive prompts. |
-| `DUOPIPE_PEER_NODE_ID` | Testing only: when set ⇒ dial that node id; when unset ⇒ listen. |
+| `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
+| `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
+| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
 
 ## Configuration Files
 
@@ -385,15 +386,15 @@ auth_token_file = "~/.config/duopipe/auth_token.txt"
 dns_server = "https://dns.example.com/pkarr"
 max_sessions = 100
 
-# Local forwards (-L): this peer listens locally, the peer connects to dest.
-[[local_forward]]
+# Tunnel requests: bind locally, ask the peer to connect out to source.
+[[request]]
+name = "db"
+source = "tcp://127.0.0.1:5678"
 listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
 
-# Remote forwards (-R): the peer binds, forwarding back to our local dest.
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
+# Sources the peer may request of us (fail-closed if omitted).
+[allowed_sources]
+tcp = ["127.0.0.0/8"]
 ```
 
 > [!NOTE]
@@ -464,7 +465,7 @@ Output is a single-line `ageenc:` string ready to paste into TOML config values.
 - The node id is a public key that identifies the listening peer. Because the identity is ephemeral, it changes every run.
 - **Fixed ALPN:** The QUIC protocol identifier is a fixed constant (`mf/2`). It is not used for access control.
 - **Token Authentication:** The dialing peer authenticates immediately after the QUIC connection via a dedicated auth stream, presenting the shared auth token. An invalid token is rejected with an `AuthResponse` and the connection is closed with an error code. See [Architecture: Token Authentication](docs/ARCHITECTURE.md#token-authentication-iroh-mode).
-- **Full trust after auth:** Once the auth token passes, the peer is fully trusted and there are no per-destination allowlists. Only share the token with peers you trust.
+- **Source allowlist (fail-closed):** After auth the peer may *request* tunnels, but each requested source is checked against our `[allowed_sources]` CIDR lists before we connect out. An empty or absent allowlist rejects every incoming request. Requests are also activated interactively — nothing forwards until started. Only share the token with peers you trust, and keep the allowlist narrow.
 - Treat the auth token like a password
 
 ## Exit Codes

@@ -40,11 +40,12 @@ Each peer can declare:
 
 #### Non-interactive mode (testing)
 
-The project is meant for interactive use, but the TUI prompts can be bypassed for automated tests:
+The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_MODE=1` runs the peer headless (no TUI) and gates all other test-only env vars:
 
-- `DUOPIPE_NONINTERACTIVE=1` — skip the interactive prompts.
+- `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
-- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token.
+- `DUOPIPE_AUTOSTART_REQUESTS=1` — start every configured `[[request]]` on connect.
+- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
 
@@ -246,96 +247,64 @@ sequenceDiagram
     end
 
     Note over D,L: After auth, BOTH sides run symmetrically
-    par Dial peer's tunnels
-        D->>L: open_bi() + StreamHello (-L / -R)
-    and Listen peer's tunnels
-        L->>D: open_bi() + StreamHello (-L / -R)
+    par Dial peer's requests
+        D->>L: open_bi() + StreamHello::LocalForward{source}
+    and Listen peer's requests
+        L->>D: open_bi() + StreamHello::LocalForward{source}
     end
-    Note over D,L: Tunnels flow in both directions
+    Note over D,L: Either side may request tunnels of the other
 ```
 
 ### Stream Dispatch (StreamHello)
 
-The **auth stream is the only stream that does not carry a hello** — it is positional (the first bi-stream the dialer opens). Every *other* bidirectional stream begins with a self-describing [`StreamHello`] frame written by the stream **opener**, so the **acceptor** can route it without positional assumptions. This is what makes a symmetric peer possible: the side that accepts a stream doesn't need to know in advance whether it is a local-forward data stream, a remote-forward data stream, or a remote-forward control stream.
+The **auth stream is the only stream that does not carry a hello** — it is positional (the first bi-stream the dialer opens). Every *other* bidirectional stream begins with a self-describing [`StreamHello`] frame written by the stream **opener**, so the **acceptor** can route it without positional assumptions. There is now a single non-auth stream kind: `StreamHello::LocalForward { source }`, a tunnel request.
 
 ```mermaid
 graph TB
     A[accept_bi: new stream] --> B[Read StreamHello<br/>HELLO_TIMEOUT 10s]
-    B --> C{kind?}
+    B --> C{LocalForward source}
 
-    C -->|LocalForward dest| D[Acquire session permit]
-    D --> E[Connect out to dest<br/>tcp:// or udp://]
+    C --> S{source in allowed_sources?<br/>fail-closed}
+    S -->|no| R[Reply StreamAck rejected]
+    S -->|yes| D[Acquire session permit]
+    D --> E[Connect out to source<br/>tcp:// or udp://]
     E --> F[Reply StreamAck, bridge]
-
-    C -->|RemoteForwardData tunnel_id| G[Look up tunnel_id -> local dest]
-    G --> H[Acquire session permit]
-    H --> I[Connect out to local dest]
-    I --> F
-
-    C -->|RemoteForwardControl| J[Read RemoteForwardRequest per -R]
-    J --> K[Bind requested listener<br/>full trust]
-    K --> L[Reply RemoteForwardResponse<br/>with bound_addr]
 
     style B fill:#FFF9C4
     style F fill:#C8E6C9
-    style L fill:#C8E6C9
+    style R fill:#FFCCBC
 ```
 
-A per-connection `Semaphore` (default `max_sessions = 100`) bounds concurrent **data** streams in both directions. Auth and remote-forward *control* streams do not consume permits. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
+A per-connection `Semaphore` (default `max_sessions = 100`) bounds concurrent **data** streams in both directions. The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. The CIDR allowlist check runs **before** a permit is acquired, so rejected sources never consume one; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
 
-### Local Forward (-L) Data Flow
+### Request Data Flow
 
-The declaring peer binds a local listener. Per connection it opens a stream tagged `StreamHello::LocalForward { dest }`; the peer connects out to `dest` (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. This is the generalization of the old "one side opens a stream, the other connects out" path.
+A peer activates a request: it binds the local `listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1`); stopping one cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
     participant App as Local App
-    participant O as Opener (declares -L)
+    participant O as Requester (binds listen)
     participant P as Peer (acceptor)
-    participant T as Target Service
+    participant T as Source Service
 
     App->>O: connect to local listener
-    O->>P: open_bi() + StreamHello::LocalForward{dest}
-    P->>T: connect out to dest
-    alt connect ok
+    O->>P: open_bi() + StreamHello::LocalForward{source}
+    P->>P: check source against allowed_sources (fail-closed)
+    alt allowed & connect ok
+        P->>T: connect out to source
         P-->>O: StreamAck{accepted: true}
         Note over O,P: bridge_streams() copies both directions
-    else connect failed
+    else rejected or connect failed
         P-->>O: StreamAck{accepted: false, reason}
     end
 ```
 
-### Remote Forward (-R) Data Flow
-
-The requester opens **one** control stream (`StreamHello::RemoteForwardControl`) and sends a `RemoteForwardRequest { tunnel_id, bind }` per `-R`. The host binds the requested listener (**full trust — no allowlist**), then replies `RemoteForwardResponse { accepted, bound_addr, ... }`. On each accepted connection, the host opens a fresh `StreamHello::RemoteForwardData { tunnel_id }` stream back; the requester maps `tunnel_id` to its own local `dest` and connects out.
-
-```mermaid
-sequenceDiagram
-    participant R as Requester (declares -R)
-    participant H as Host (peer)
-    participant App as External Client
-    participant Local as Requester's local dest
-
-    R->>H: open_bi() + StreamHello::RemoteForwardControl
-    loop per -R forward
-        R->>H: RemoteForwardRequest{tunnel_id, bind}
-        H->>H: bind listener (full trust)
-        H-->>R: RemoteForwardResponse{accepted, bound_addr}
-    end
-
-    App->>H: connect to hosted listener (bound_addr)
-    H->>R: open_bi() + StreamHello::RemoteForwardData{tunnel_id}
-    R->>R: map tunnel_id -> local dest
-    R->>Local: connect out
-    R-->>H: StreamAck{accepted: true}
-    Note over R,H: bridge_streams() copies both directions
-```
-
-Tunnel ids are allocated by the requester via an `AtomicU64`. Hosted `-R` listeners self-terminate when the connection closes (a `tokio::select!` on `conn.closed()`), freeing the bound port.
+A request's listener is owned by a task with its own `CancellationToken`; a `Stop` command (or the connection closing) cancels it, dropping the `TcpListener`/`UdpSocket` and aborting in-flight bridged connections, which frees the bound port.
 
 ### TCP Tunnel Data Flow
 
-TCP bridging uses `bridge_streams()` (`iroh_mode/helpers.rs`) regardless of forward direction. The "opener" is whichever peer accepted the local connection; the "connect side" is whichever peer dials the target.
+TCP bridging uses `bridge_streams()` (`iroh_mode/helpers.rs`). The "opener" is the requesting peer that accepted the local connection; the "connect side" is the peer that dials the source.
 
 ```mermaid
 graph LR
@@ -461,7 +430,7 @@ graph TB
 
     subgraph "Options"
         E[auth_token* — single shared token<br/>both peers]
-        G[local_forward[] {listen, dest} -L<br/>remote_forward[] {bind, dest} -R]
+        G[request[] {name, source, listen}<br/>allowed_sources {tcp[], udp[]}]
         H[max_sessions]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
@@ -479,7 +448,7 @@ graph TB
     style S fill:#FFF9C4
 ```
 
-The role (listen vs dial) and the dialer's target node id are not config fields. They are resolved at startup from the TUI prompts, or — for tests — from `DUOPIPE_PEER_NODE_ID` (set ⇒ dial, unset ⇒ listen) under `DUOPIPE_NONINTERACTIVE=1`.
+The role (listen vs dial) and the dialer's target node id are not config fields. They are resolved at startup from the TUI prompts, or — for tests — from `DUOPIPE_PEER_NODE_ID` (set ⇒ dial, unset ⇒ listen) under `DUOPIPE_TEST_MODE=1`.
 
 ### iroh Credential Mapping
 
@@ -497,9 +466,10 @@ Example config usage (a plaintext `auth_token` is not allowed in TOML config fil
 # peer.toml — using the _file variant
 auth_token_file = "/etc/duopipe/auth_token.txt"
 
-[[local_forward]]
+[[request]]
+name = "ssh"
+source = "tcp://127.0.0.1:22"
 listen = "127.0.0.1:2222"
-dest = "tcp://127.0.0.1:22"
 ```
 
 ```toml
@@ -508,9 +478,8 @@ encryption_key_file = "~/.config/duopipe/age.key"
 
 auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
 
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
+[allowed_sources]
+tcp = ["127.0.0.0/8"]
 ```
 
 ### Configuration Loading Flow
@@ -627,7 +596,7 @@ graph TB
 
 ### Trust Model
 
-**Full trust after authentication.** Connection setup is asymmetric, but trust is symmetric: once the shared auth token passes, the peer is fully trusted. There are **no per-destination allowlists** and no CIDR gating. A `-L` forward connects out to whatever `dest` the opener names, and a `-R` forward binds whatever listener the requester asks for. Only grant a peer access via a token you would trust with that level of network reach.
+**Auth, then a fail-closed source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). The check is **fail-closed** — an empty or absent list rejects every requested source — so a peer can only reach addresses you explicitly allow. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
@@ -737,17 +706,13 @@ sequenceDiagram
 
 ### Signaling Protocol (signaling/codec.rs)
 
-The signaling protocol is `IROH_MULTI_VERSION = 4`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
+The signaling protocol is `IROH_MULTI_VERSION = 5`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
 
 | Message | Direction | Carried On | Purpose |
 |---------|-----------|------------|---------|
 | `AuthRequest` / `AuthResponse` | dialer → listener / reply | first bi-stream (positional, no hello) | Connection-level token auth. |
-| `StreamHello::LocalForward { dest }` | opener → acceptor | first frame of a `-L` data stream | Asks the acceptor to connect out to `dest` and bridge. |
-| `StreamHello::RemoteForwardData { tunnel_id }` | host → requester | first frame of a `-R` data stream | A connection arrived on a hosted listener; requester maps `tunnel_id` to its local dest. |
-| `StreamHello::RemoteForwardControl` | requester → host | first frame of the `-R` control stream | Opens remote-forward negotiation. |
-| `RemoteForwardRequest { tunnel_id, bind }` | requester → host | `-R` control stream | One per `-R`: asks the host to bind `bind`. |
-| `RemoteForwardResponse { tunnel_id, accepted, reason, bound_addr }` | host → requester | `-R` control stream | Result of a bind, including the actual `bound_addr`. |
-| `StreamAck { accepted, reason }` | acceptor → opener | per data stream | Acceptance reply once the acceptor has connected out (or failed). |
+| `StreamHello::LocalForward { source }` | requester → acceptor | first frame of a request data stream | Asks the acceptor to connect out to `source` (after the acceptor's `allowed_sources` check) and bridge. |
+| `StreamAck { accepted, reason }` | acceptor → requester | per data stream | Acceptance reply once the acceptor passes the allowlist and connects out (or rejects/fails). |
 
 ### TCP Tunneling Architecture
 
@@ -885,7 +850,7 @@ The `iroh::Endpoint` provides:
 - `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`. When `announce_endpoint` is set (non-interactive mode) it prints `node_id:` and `auth_token:` to stderr.
 - `run_dial` — `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs three concurrent halves over the one connection: an `accept_loop` (incoming streams), one task per local-forward listener (`run_local_forward`), and a remote-forward requester task (`request_remote_forwards`). Everything is torn down when `conn.closed()` resolves.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs two concurrent halves over the one connection: an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out) and a `request_supervisor` that starts/stops our own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request. With `DUOPIPE_AUTOSTART_REQUESTS=1` every request is started on connect. Everything is torn down when `conn.closed()` resolves.
 
 ---
 

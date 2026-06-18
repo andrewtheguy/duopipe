@@ -290,6 +290,77 @@ pub fn extract_addr_from_source(source: &str) -> Option<String> {
     Some(format!("{}:{}", host, port))
 }
 
+/// Extract host (bare IP or hostname) from a source URL (protocol://host:port).
+/// For IPv6, strips the brackets that `host_str()` includes so the result can be
+/// parsed directly with `IpAddr::parse`.
+pub fn extract_host_from_source(source: &str) -> Option<String> {
+    let url = url::Url::parse(source).ok()?;
+    url.host_str()
+        .map(|s| s.trim_start_matches('[').trim_end_matches(']').to_string())
+}
+
+/// Extract port from a source URL (protocol://host:port).
+pub fn extract_port_from_source(source: &str) -> Option<u16> {
+    url::Url::parse(source).ok()?.port()
+}
+
+// ============================================================================
+// Source allowlist (CIDR) check
+// ============================================================================
+
+/// Whether `source` (a `tcp://host:port` / `udp://host:port` URL) is permitted by
+/// the CIDR `allowed_networks` list. **Fail-closed:** an empty list rejects
+/// everything. On rejection the `Err` carries a human-readable reason (sent back
+/// to the requester in a `StreamAck`).
+///
+/// Literal IPs are checked directly; hostnames are resolved and *all* resolved
+/// addresses must fall within an allowed network (any match accepts).
+pub async fn check_source_allowed(source: &str, allowed_networks: &[String]) -> Result<()> {
+    if allowed_networks.is_empty() {
+        anyhow::bail!("source '{}' rejected: no allowed_sources configured", source);
+    }
+
+    let host = extract_host_from_source(source)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse source URL '{}'", source))?;
+
+    let source_ips: Vec<std::net::IpAddr> = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => {
+            let port = extract_port_from_source(source)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse port from source '{}'", source))?;
+            let addrs = lookup_host(format!("{}:{}", host, port))
+                .await
+                .with_context(|| format!("DNS resolution failed for source '{}'", source))?;
+            let ips: Vec<_> = addrs.map(|a| a.ip()).collect();
+            if ips.is_empty() {
+                anyhow::bail!("DNS resolution returned no IPs for source '{}'", source);
+            }
+            ips
+        }
+    };
+
+    let networks: Vec<ipnet::IpNet> = allowed_networks
+        .iter()
+        .filter_map(|n| n.parse::<ipnet::IpNet>().ok())
+        .collect();
+
+    let allowed = source_ips
+        .iter()
+        .any(|ip| networks.iter().any(|net| net.contains(ip)));
+
+    if allowed {
+        Ok(())
+    } else {
+        let ips: Vec<String> = source_ips.iter().map(|ip| ip.to_string()).collect();
+        anyhow::bail!(
+            "source '{}' (resolved to {}) not in allowed networks {:?}",
+            source,
+            ips.join(", "),
+            allowed_networks
+        )
+    }
+}
+
 // ============================================================================
 // Exponential backoff helper
 // ============================================================================
@@ -535,6 +606,36 @@ mod tests {
         );
         // Must be parseable as a SocketAddr
         result.unwrap().parse::<SocketAddr>().unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_source_empty_list_rejects() {
+        // Fail-closed: with no configured networks, everything is rejected.
+        assert!(check_source_allowed("tcp://127.0.0.1:22", &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_source_in_range_allowed() {
+        let nets = vec!["127.0.0.0/8".to_string()];
+        assert!(check_source_allowed("tcp://127.0.0.1:22", &nets).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_source_out_of_range_rejected() {
+        let nets = vec!["192.168.0.0/16".to_string()];
+        assert!(check_source_allowed("tcp://10.0.0.1:22", &nets).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_source_ipv6_loopback_allowed() {
+        let nets = vec!["::1/128".to_string()];
+        assert!(check_source_allowed("tcp://[::1]:22", &nets).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_source_malformed_url_rejected() {
+        let nets = vec!["127.0.0.0/8".to_string()];
+        assert!(check_source_allowed("not-a-url", &nets).await.is_err());
     }
 
     #[test]

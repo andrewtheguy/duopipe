@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Version 4: symmetric peer protocol (StreamHello dispatch + remote-forward negotiation)
-pub const IROH_MULTI_VERSION: u16 = 4;
+/// Version 5: request-based protocol (single LocalForward stream kind, no remote forwards)
+pub const IROH_MULTI_VERSION: u16 = 5;
 
 /// Maximum length for rejection reason to prevent excessively large messages.
 pub const MAX_REJECT_REASON_LENGTH: usize = 512;
@@ -73,47 +73,24 @@ impl std::ops::Deref for AuthToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum StreamHello {
-    /// Local-forward (-L) data stream. The opener listens locally and wants the
-    /// acceptor to connect out to `dest` (e.g. "tcp://127.0.0.1:22"). The acceptor
-    /// replies with a [`StreamAck`] and then bridges traffic.
-    LocalForward { version: u16, dest: String },
-    /// Remote-forward (-R) data stream. A connection arrived on a listener the
-    /// opener is hosting on the requester's behalf; `tunnel_id` identifies which
-    /// remote-forward it belongs to. The acceptor (the original requester) maps
-    /// `tunnel_id` to its own local destination, replies with a [`StreamAck`], and bridges.
-    RemoteForwardData { version: u16, tunnel_id: u64 },
-    /// Remote-forward (-R) control stream. The opener (requester) then sends one
-    /// [`RemoteForwardRequest`] per remote forward and reads a [`RemoteForwardResponse`]
-    /// for each. No `StreamAck` is used on this stream.
-    RemoteForwardControl { version: u16 },
+    /// Request data stream. The opener listens locally and wants the acceptor to
+    /// connect out to `source` (e.g. "tcp://127.0.0.1:22"). The acceptor checks
+    /// `source` against its `allowed_sources` allowlist, replies with a
+    /// [`StreamAck`], and (if accepted) bridges traffic.
+    LocalForward { version: u16, source: String },
 }
 
 impl StreamHello {
-    pub fn local_forward(dest: impl Into<String>) -> Self {
+    pub fn local_forward(source: impl Into<String>) -> Self {
         StreamHello::LocalForward {
             version: IROH_MULTI_VERSION,
-            dest: dest.into(),
-        }
-    }
-
-    pub fn remote_forward_data(tunnel_id: u64) -> Self {
-        StreamHello::RemoteForwardData {
-            version: IROH_MULTI_VERSION,
-            tunnel_id,
-        }
-    }
-
-    pub fn remote_forward_control() -> Self {
-        StreamHello::RemoteForwardControl {
-            version: IROH_MULTI_VERSION,
+            source: source.into(),
         }
     }
 
     fn version(&self) -> u16 {
         match self {
             StreamHello::LocalForward { version, .. } => *version,
-            StreamHello::RemoteForwardData { version, .. } => *version,
-            StreamHello::RemoteForwardControl { version } => *version,
         }
     }
 }
@@ -144,65 +121,6 @@ impl StreamAck {
             version: IROH_MULTI_VERSION,
             accepted: false,
             reason: Some(truncate_reason(reason.into(), MAX_REJECT_REASON_LENGTH)),
-        }
-    }
-}
-
-/// A single remote-forward (-R) request sent by the requester on the control stream.
-/// Asks the peer to bind a listener and forward incoming connections back as
-/// [`StreamHello::RemoteForwardData`] streams tagged with `tunnel_id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteForwardRequest {
-    pub version: u16,
-    /// Identifier chosen by the requester; echoed on each data stream.
-    pub tunnel_id: u64,
-    /// Address the peer should bind, e.g. "tcp://0.0.0.0:6574" or "udp://127.0.0.1:5447".
-    pub bind: String,
-}
-
-impl RemoteForwardRequest {
-    pub fn new(tunnel_id: u64, bind: impl Into<String>) -> Self {
-        Self {
-            version: IROH_MULTI_VERSION,
-            tunnel_id,
-            bind: bind.into(),
-        }
-    }
-}
-
-/// Response to a [`RemoteForwardRequest`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteForwardResponse {
-    pub version: u16,
-    pub tunnel_id: u64,
-    pub accepted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// Actual bound address (useful when the requester asked for port 0).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bound_addr: Option<String>,
-}
-
-impl RemoteForwardResponse {
-    pub fn accepted(tunnel_id: u64, bound_addr: Option<String>) -> Self {
-        Self {
-            version: IROH_MULTI_VERSION,
-            tunnel_id,
-            accepted: true,
-            reason: None,
-            bound_addr,
-        }
-    }
-
-    /// Create a rejection response with the given reason.
-    /// The reason will be truncated if it exceeds [`MAX_REJECT_REASON_LENGTH`].
-    pub fn rejected(tunnel_id: u64, reason: impl Into<String>) -> Self {
-        Self {
-            version: IROH_MULTI_VERSION,
-            tunnel_id,
-            accepted: false,
-            reason: Some(truncate_reason(reason.into(), MAX_REJECT_REASON_LENGTH)),
-            bound_addr: None,
         }
     }
 }
@@ -348,36 +266,6 @@ pub fn decode_stream_ack(data: &[u8]) -> Result<StreamAck> {
     )
 }
 
-/// Encode a RemoteForwardRequest as length-prefixed JSON bytes.
-pub fn encode_remote_forward_request(req: &RemoteForwardRequest) -> Result<Vec<u8>> {
-    encode_length_prefixed(req, "RemoteForwardRequest")
-}
-
-/// Decode a RemoteForwardRequest from length-prefixed JSON bytes.
-pub fn decode_remote_forward_request(data: &[u8]) -> Result<RemoteForwardRequest> {
-    decode_length_prefixed(
-        data,
-        IROH_MULTI_VERSION,
-        |r: &RemoteForwardRequest| r.version,
-        "RemoteForwardRequest",
-    )
-}
-
-/// Encode a RemoteForwardResponse as length-prefixed JSON bytes.
-pub fn encode_remote_forward_response(resp: &RemoteForwardResponse) -> Result<Vec<u8>> {
-    encode_length_prefixed(resp, "RemoteForwardResponse")
-}
-
-/// Decode a RemoteForwardResponse from length-prefixed JSON bytes.
-pub fn decode_remote_forward_response(data: &[u8]) -> Result<RemoteForwardResponse> {
-    decode_length_prefixed(
-        data,
-        IROH_MULTI_VERSION,
-        |r: &RemoteForwardResponse| r.version,
-        "RemoteForwardResponse",
-    )
-}
-
 /// Encode an AuthRequest as length-prefixed JSON bytes.
 pub fn encode_auth_request(req: &AuthRequest) -> Result<Vec<u8>> {
     encode_length_prefixed(req, "AuthRequest")
@@ -469,39 +357,11 @@ mod tests {
         let encoded = encode_stream_hello(&hello).unwrap();
         let decoded = decode_stream_hello(&encoded).unwrap();
         match decoded {
-            StreamHello::LocalForward { version, dest } => {
+            StreamHello::LocalForward { version, source } => {
                 assert_eq!(version, IROH_MULTI_VERSION);
-                assert_eq!(dest, "tcp://127.0.0.1:22");
+                assert_eq!(source, "tcp://127.0.0.1:22");
             }
-            other => panic!("expected LocalForward, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_stream_hello_remote_forward_data_roundtrip() {
-        let hello = StreamHello::remote_forward_data(42);
-        let encoded = encode_stream_hello(&hello).unwrap();
-        let decoded = decode_stream_hello(&encoded).unwrap();
-        match decoded {
-            StreamHello::RemoteForwardData { version, tunnel_id } => {
-                assert_eq!(version, IROH_MULTI_VERSION);
-                assert_eq!(tunnel_id, 42);
-            }
-            other => panic!("expected RemoteForwardData, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_stream_hello_remote_forward_control_roundtrip() {
-        let hello = StreamHello::remote_forward_control();
-        let encoded = encode_stream_hello(&hello).unwrap();
-        let decoded = decode_stream_hello(&encoded).unwrap();
-        assert!(matches!(
-            decoded,
-            StreamHello::RemoteForwardControl {
-                version: IROH_MULTI_VERSION
-            }
-        ));
     }
 
     #[test]
@@ -515,33 +375,6 @@ mod tests {
         let decoded = decode_stream_ack(&encode_stream_ack(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
         assert_eq!(decoded.reason.as_deref(), Some("connect failed"));
-    }
-
-    #[test]
-    fn test_remote_forward_request_roundtrip() {
-        let req = RemoteForwardRequest::new(7, "tcp://0.0.0.0:6574");
-        let decoded =
-            decode_remote_forward_request(&encode_remote_forward_request(&req).unwrap()).unwrap();
-        assert_eq!(decoded.version, IROH_MULTI_VERSION);
-        assert_eq!(decoded.tunnel_id, 7);
-        assert_eq!(decoded.bind, "tcp://0.0.0.0:6574");
-    }
-
-    #[test]
-    fn test_remote_forward_response_roundtrip() {
-        let ok = RemoteForwardResponse::accepted(7, Some("0.0.0.0:6574".to_string()));
-        let decoded =
-            decode_remote_forward_response(&encode_remote_forward_response(&ok).unwrap()).unwrap();
-        assert!(decoded.accepted);
-        assert_eq!(decoded.tunnel_id, 7);
-        assert_eq!(decoded.bound_addr.as_deref(), Some("0.0.0.0:6574"));
-
-        let rej = RemoteForwardResponse::rejected(8, "port in use");
-        let decoded =
-            decode_remote_forward_response(&encode_remote_forward_response(&rej).unwrap()).unwrap();
-        assert!(!decoded.accepted);
-        assert_eq!(decoded.tunnel_id, 8);
-        assert_eq!(decoded.reason.as_deref(), Some("port in use"));
     }
 
     #[test]
@@ -663,7 +496,7 @@ mod tests {
     fn test_decode_stream_hello_wrong_version() {
         let bad = StreamHello::LocalForward {
             version: IROH_MULTI_VERSION + 1,
-            dest: "tcp://127.0.0.1:22".into(),
+            source: "tcp://127.0.0.1:22".into(),
         };
         let json = serde_json::to_vec(&bad).unwrap();
         let len = (json.len() as u32).to_be_bytes();

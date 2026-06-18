@@ -3,10 +3,14 @@
 //! A single symmetric peer config with all keys at the top level.
 //!
 //! The connection role is chosen interactively at startup (or via env vars for
-//! tests), not in the config. Over one established connection a peer can run
-//! many tunnels in both directions: local forwards (`-L`, `[[local_forward]]`)
-//! and remote forwards (`-R`, `[[remote_forward]]`). `validate()` checks
-//! address formats at parse time. The single `auth_token` is the shared secret
+//! tests), not in the config. Over one established connection a peer always
+//! *requests* tunnels from the other party: each `[[request]]` names a remote
+//! `source` on the peer to connect out to and a local `listen` address where
+//! the traffic is delivered. Requests are activated interactively (nothing
+//! starts automatically). When the peer requests one of *our* sources, the
+//! `[allowed_sources]` CIDR lists gate what we are willing to expose — an empty
+//! or absent list rejects everything (fail-closed). `validate()` checks address
+//! and CIDR formats at parse time. The single `auth_token` is the shared secret
 //! used by both sides.
 
 use anyhow::{Context, Result};
@@ -21,12 +25,15 @@ use std::path::{Path, PathBuf};
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
-    /// Local forwards (-L): this peer listens locally and forwards to the peer's `dest`.
+    /// Tunnel requests this peer can make of the other party. Each entry asks the
+    /// peer to connect out to a remote `source`; traffic is delivered to a local
+    /// `listen` address. Activated interactively — nothing starts automatically.
     #[serde(default)]
-    pub local_forward: Vec<LocalForward>,
-    /// Remote forwards (-R): ask the peer to bind `bind` and forward back to our `dest`.
+    pub request: Vec<RequestEntry>,
+    /// Source networks (CIDR) this peer is willing to expose when the other party
+    /// requests one of *our* sources. Fail-closed: empty/absent rejects everything.
     #[serde(default)]
-    pub remote_forward: Vec<RemoteForward>,
+    pub allowed_sources: AllowedSources,
     pub relay_urls: Option<Vec<String>>,
     /// Force all traffic through the relay server (disables direct P2P).
     /// Requires at least one entry in `relay_urls`.
@@ -104,26 +111,38 @@ impl PeerConfig {
     }
 }
 
-/// Local forward (-L): this peer binds `listen` locally and the peer connects to `dest`.
+/// A tunnel request: ask the peer to connect out to `source` and deliver the
+/// traffic to a local listener bound at `listen`.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct LocalForward {
-    /// Local address to listen on (host:port).
-    pub listen: String,
-    /// Destination the peer connects to (tcp://host:port or udp://host:port).
+pub struct RequestEntry {
+    /// Display label shown in the TUI tunnel list.
+    pub name: String,
+    /// Remote origin on the peer to connect to (tcp://host:port or udp://host:port).
     /// The scheme selects the protocol of the local listener.
-    pub dest: String,
+    pub source: String,
+    /// Local address to listen on (host:port) where traffic is delivered.
+    pub listen: String,
 }
 
-/// Remote forward (-R): ask the peer to bind `bind`, forwarding back to our local `dest`.
+/// Source networks (CIDR) we will expose when the peer requests one of our
+/// sources. Separate lists for TCP and UDP. Empty list ⇒ reject all (fail-closed).
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct RemoteForward {
-    /// Address the peer should bind (tcp://host:port or udp://host:port).
-    /// The scheme selects the protocol.
-    pub bind: String,
-    /// Our local destination to connect to (host:port).
-    pub dest: String,
+pub struct AllowedSources {
+    /// Allowed TCP source networks (CIDR notation, e.g. "127.0.0.0/8", "::1/128").
+    #[serde(default)]
+    pub tcp: Vec<String>,
+    /// Allowed UDP source networks (CIDR notation).
+    #[serde(default)]
+    pub udp: Vec<String>,
+}
+
+impl AllowedSources {
+    /// True when no networks are configured for either protocol.
+    pub fn is_empty(&self) -> bool {
+        self.tcp.is_empty() && self.udp.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,19 +283,33 @@ fn validate_host_port(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate local- and remote-forward address formats.
-/// Used for both config-file forwards and CLI `-L`/`-R` specs.
-pub fn validate_forward_specs(
-    local: &[LocalForward],
-    remote: &[RemoteForward],
-) -> Result<()> {
-    for lf in local {
-        validate_host_port(&lf.listen, "local_forward.listen")?;
-        validate_tcp_udp_url(&lf.dest, "local_forward.dest")?;
+/// Validate tunnel-request address formats (`source` URL + `listen` host:port).
+pub fn validate_request_specs(requests: &[RequestEntry]) -> Result<()> {
+    for r in requests {
+        validate_tcp_udp_url(&r.source, "request.source")?;
+        validate_host_port(&r.listen, "request.listen")?;
     }
-    for rf in remote {
-        validate_tcp_udp_url(&rf.bind, "remote_forward.bind")?;
-        validate_host_port(&rf.dest, "remote_forward.dest")?;
+    Ok(())
+}
+
+/// Validate that a string is valid CIDR notation (IPv4 or IPv6).
+fn validate_cidr(cidr: &str) -> Result<()> {
+    cidr.parse::<ipnet::IpNet>().with_context(|| {
+        format!(
+            "Invalid CIDR network '{}'. Expected format: 192.168.0.0/16 or ::1/128",
+            cidr
+        )
+    })?;
+    Ok(())
+}
+
+/// Validate the CIDR entries in both allowed-source lists.
+pub fn validate_allowed_sources(allowed: &AllowedSources) -> Result<()> {
+    for cidr in &allowed.tcp {
+        validate_cidr(cidr).context("Invalid TCP allowed_sources")?;
+    }
+    for cidr in &allowed.udp {
+        validate_cidr(cidr).context("Invalid UDP allowed_sources")?;
     }
     Ok(())
 }
@@ -352,7 +385,8 @@ impl PeerConfig {
         if iroh.auth_token.is_some() && iroh.auth_token_file.is_some() {
             anyhow::bail!("Use only one of 'auth_token' or 'auth_token_file'.");
         }
-        validate_forward_specs(&iroh.local_forward, &iroh.remote_forward)?;
+        validate_request_specs(&iroh.request)?;
+        validate_allowed_sources(&iroh.allowed_sources)?;
         validate_transport_tuning(&iroh.transport, "transport")?;
 
         Ok(())
@@ -425,13 +459,14 @@ mod tests {
         let toml = r#"
 max_sessions = 100
 
-[[local_forward]]
+[[request]]
+name = "db"
+source = "tcp://127.0.0.1:5678"
 listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
 
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
+[allowed_sources]
+tcp = ["127.0.0.0/8", "::1/128"]
+udp = ["10.0.0.0/8"]
 
 [transport]
 congestion_controller = "bbr"
@@ -439,14 +474,27 @@ receive_window = 67108864
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
         assert_eq!(cfg.max_sessions, Some(100));
-        assert_eq!(cfg.local_forward.len(), 1);
-        assert_eq!(cfg.remote_forward.len(), 1);
+        assert_eq!(cfg.request.len(), 1);
+        assert_eq!(cfg.request[0].name, "db");
+        assert_eq!(cfg.allowed_sources.tcp.len(), 2);
+        assert_eq!(cfg.allowed_sources.udp.len(), 1);
         assert_eq!(
             cfg.transport.congestion_controller,
             CongestionController::Bbr
         );
         assert_eq!(cfg.transport.receive_window, Some(67108864));
         cfg.validate(ConfigSource::File).expect("config should validate");
+    }
+
+    #[test]
+    fn rejects_invalid_cidr() {
+        let toml = r#"
+[allowed_sources]
+tcp = ["not-a-cidr"]
+"#;
+        let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
+        let err = cfg.validate(ConfigSource::File).unwrap_err();
+        assert!(err.to_string().contains("allowed_sources"), "error was: {err}");
     }
 
     #[test]
@@ -493,37 +541,36 @@ receive_window = 67108864
     }
 
     #[test]
-    fn validates_forward_address_formats() {
+    fn validates_request_address_formats() {
         let cfg = peer_config(PeerConfig {
-            local_forward: vec![LocalForward {
+            request: vec![RequestEntry {
+                name: "ok".into(),
+                source: "tcp://127.0.0.1:5678".into(),
                 listen: "127.0.0.1:15678".into(),
-                dest: "tcp://127.0.0.1:5678".into(),
-            }],
-            remote_forward: vec![RemoteForward {
-                bind: "tcp://0.0.0.0:6574".into(),
-                dest: "127.0.0.1:6574".into(),
             }],
             ..Default::default()
         });
         assert!(cfg.validate(ConfigSource::File).is_ok());
 
         let bad_listen = peer_config(PeerConfig {
-            local_forward: vec![LocalForward {
+            request: vec![RequestEntry {
+                name: "bad-listen".into(),
+                source: "tcp://127.0.0.1:5678".into(),
                 listen: "127.0.0.1".into(), // missing port
-                dest: "tcp://127.0.0.1:5678".into(),
             }],
             ..Default::default()
         });
         assert!(bad_listen.validate(ConfigSource::File).is_err());
 
-        let bad_dest = peer_config(PeerConfig {
-            local_forward: vec![LocalForward {
+        let bad_source = peer_config(PeerConfig {
+            request: vec![RequestEntry {
+                name: "bad-source".into(),
+                source: "127.0.0.1:5678".into(), // missing scheme
                 listen: "127.0.0.1:15678".into(),
-                dest: "127.0.0.1:5678".into(), // missing scheme
             }],
             ..Default::default()
         });
-        assert!(bad_dest.validate(ConfigSource::File).is_err());
+        assert!(bad_source.validate(ConfigSource::File).is_err());
     }
 
     #[test]
