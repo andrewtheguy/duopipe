@@ -166,7 +166,6 @@ duopipe peer \
 
 **Config file** (`peer.toml`):
 ```toml
-[iroh]
 connect = "listen"
 secret_file = "./peer.key"
 ```
@@ -238,7 +237,6 @@ iYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY
 
 **Listening peer** (`peer.toml`):
 ```toml
-[iroh]
 connect = "listen"
 secret_file = "./peer.key"
 auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
@@ -247,7 +245,6 @@ alpn_token_file = "/etc/duopipe/alpn_token.txt"
 
 **Dialing peer** (`peer.toml`):
 ```toml
-[iroh]
 connect = "dial"
 peer_node_id = "<ENDPOINT_ID>"
 auth_token_file = "~/.config/duopipe/token.txt"
@@ -394,7 +391,7 @@ duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
 
 ## Configuration Files
 
-Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). For normal usage, prefer config files so your settings are saved and reusable. The `--config-stdin` flag is intended for automation and IPC — it accepts JSON (self-delimiting, so the caller does not need to close stdin). Only one of these may be used at a time. Configuration uses the `[iroh]` section.
+Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). For normal usage, prefer config files so your settings are saved and reusable. The `--config-stdin` flag is intended for automation and IPC — it accepts JSON (self-delimiting, so the caller does not need to close stdin). Only one of these may be used at a time. All config keys live at the top level.
 
 > **Security:** TOML config files **reject plaintext sensitive fields** (`auth_token`, `auth_tokens`, `alpn_token`, `secret`). You have three options: use the corresponding `_file` variants (recommended), use environment variables (`DUOPIPE_*`) for containers/automation, or use [age-encrypted inline values](#encrypted-config-values). Plaintext values are also accepted via `--config-stdin` (JSON) for IPC.
 
@@ -436,7 +433,6 @@ echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --recipient age1
 **Use in config:**
 
 ```toml
-[iroh]
 connect = "dial"
 peer_node_id = "<ENDPOINT_ID>"
 encryption_key_file = "~/.config/duopipe/age.key"
@@ -450,10 +446,10 @@ Each encrypted value is a single-line `ageenc:` prefixed string (base64-encoded 
 
 ### Transport Tuning
 
-QUIC transport parameters can be tuned via an optional `[iroh.transport]` section in the config file. These are **config-only** (no CLI flags) and all have sensible defaults — only set them if you need to.
+QUIC transport parameters can be tuned via an optional `[transport]` section in the config file. These are **config-only** (no CLI flags) and all have sensible defaults — only set them if you need to.
 
 ```toml
-[iroh.transport]
+[transport]
 # Congestion controller: "cubic" (default), "bbr", or "newreno"
 congestion_controller = "cubic"
 # QUIC per-stream receive window in bytes (default: 67108864 = 64MB; range 1024-67108864)
@@ -467,10 +463,7 @@ The connection-level receive window uses iroh's default. If `send_window` is omi
 ### Peer Config Example
 
 ```toml
-# Example peer configuration (iroh mode)
-mode = "iroh"
-
-[iroh]
+# Example peer configuration
 # Connection role: "dial" or "listen"
 connect = "dial"
 
@@ -490,12 +483,12 @@ dns_server = "https://dns.example.com/pkarr"
 max_sessions = 100
 
 # Local forwards (-L): this peer listens locally, the peer connects to dest.
-[[iroh.local_forward]]
+[[local_forward]]
 listen = "127.0.0.1:15678"
 dest = "tcp://127.0.0.1:5678"
 
 # Remote forwards (-R): the peer binds, forwarding back to our local dest.
-[[iroh.remote_forward]]
+[[remote_forward]]
 bind = "tcp://0.0.0.0:6574"
 dest = "127.0.0.1:6574"
 ```
@@ -517,16 +510,13 @@ Example: spawning a dialing peer with `--config-stdin` from Python:
 import json, socket, subprocess, time
 
 config = {
-    "mode": "iroh",
-    "iroh": {
-        "connect": "dial",
-        "peer_node_id": "<ENDPOINT_ID>",
-        "auth_token": "<AUTH_TOKEN>",
-        "alpn_token": "<ALPN_TOKEN>",
-        "local_forward": [
-            {"listen": "127.0.0.1:2222", "dest": "tcp://127.0.0.1:22"}
-        ],
-    }
+    "connect": "dial",
+    "peer_node_id": "<ENDPOINT_ID>",
+    "auth_token": "<AUTH_TOKEN>",
+    "alpn_token": "<ALPN_TOKEN>",
+    "local_forward": [
+        {"listen": "127.0.0.1:2222", "dest": "tcp://127.0.0.1:22"}
+    ],
 }
 
 proc = subprocess.Popen(

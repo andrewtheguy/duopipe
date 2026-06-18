@@ -258,7 +258,7 @@ fn parse_remote_forward(spec: &str) -> Result<RemoteForward> {
 /// Env vars take precedence over config for sensitive fields.
 fn resolve_peer_iroh_params(
     cli: &Command,
-    iroh_cfg: Option<&crate::config::IrohConfig>,
+    iroh_cfg: Option<&crate::config::PeerConfig>,
 ) -> Result<PeerIrohParams> {
     let cfg = iroh_cfg.cloned().unwrap_or_default();
 
@@ -478,17 +478,11 @@ async fn run_inner() -> Result<()> {
             let enc_key = encryption_key_file
                 .clone()
                 .or_else(|| env_var_opt("DUOPIPE_ENCRYPTION_KEY_FILE").map(PathBuf::from))
-                .or_else(|| {
-                    cfg.iroh
-                        .as_ref()
-                        .and_then(|i| i.encryption_key_file.clone())
-                })
+                .or_else(|| cfg.encryption_key_file.clone())
                 .map(|p| expand_tilde(&p));
-            if let Some(ref mut iroh) = cfg.iroh {
-                iroh.decrypt_secrets(enc_key.as_deref())?;
-            }
+            cfg.decrypt_secrets(enc_key.as_deref())?;
 
-            let params = resolve_peer_iroh_params(&command, cfg.iroh())
+            let params = resolve_peer_iroh_params(&command, Some(&cfg))
                 .map_err(TunnelError::config)?;
 
             // Validate forward address formats (covers CLI-supplied -L/-R too).
@@ -497,7 +491,7 @@ async fn run_inner() -> Result<()> {
 
             let connect = params.connect.ok_or_else(|| {
                 TunnelError::config(anyhow::anyhow!(
-                    "Connection role is required. Pass --connect dial|listen or set [iroh].connect."
+                    "Connection role is required. Pass --connect dial|listen or set connect in the config."
                 ))
             })?;
 
@@ -562,7 +556,7 @@ async fn run_inner() -> Result<()> {
                 ConnectRole::Dial => {
                     if params.peer_node_id.is_none() {
                         return Err(TunnelError::config(anyhow::anyhow!(
-                            "--connect dial requires --peer-node-id (or [iroh].peer_node_id)."
+                            "--connect dial requires --peer-node-id (or peer_node_id in the config)."
                         )).into());
                     }
                     if auth_token.is_none() {
@@ -576,7 +570,7 @@ async fn run_inner() -> Result<()> {
                         return Err(TunnelError::config(anyhow::anyhow!(
                             "--connect listen requires a secret identity. Generate one with:\n  \
                              duopipe generate-key --output ./peer.key\n\
-                             then pass --secret-file ./peer.key or set [iroh].secret_file."
+                             then pass --secret-file ./peer.key or set secret_file in the config."
                         )).into());
                     }
                     if auth_tokens.is_empty() {
@@ -657,10 +651,6 @@ async fn run_inner() -> Result<()> {
 
                         #[derive(serde::Deserialize)]
                         struct MinimalConfig {
-                            iroh: Option<MinimalIroh>,
-                        }
-                        #[derive(serde::Deserialize)]
-                        struct MinimalIroh {
                             encryption_recipient: Option<String>,
                         }
 
@@ -668,14 +658,12 @@ async fn run_inner() -> Result<()> {
                             toml::from_str(&content).with_context(|| {
                                 format!("Failed to parse config: {}", expanded.display())
                             })?;
-                        cfg.iroh
-                            .and_then(|i| i.encryption_recipient)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "No [iroh].encryption_recipient found in {}",
-                                    expanded.display()
-                                )
-                            })?
+                        cfg.encryption_recipient.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "No encryption_recipient found in {}",
+                                expanded.display()
+                            )
+                        })?
                     }
                     (None, None) => {
                         anyhow::bail!(
