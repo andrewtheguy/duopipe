@@ -337,7 +337,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
             lines.push(Line::from("Allowed TCP sources the peer may request (CIDR):"));
             lines.push(input_line(&state.buffer));
             lines.push(Line::from(Span::styled(
-                "  space/comma-separated, e.g. 127.0.0.0/8 ::1/128 — blank = none (rejects all)",
+                "  space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
                 Style::default().fg(Color::DarkGray),
             )));
         }

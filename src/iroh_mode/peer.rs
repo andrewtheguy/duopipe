@@ -122,13 +122,17 @@ impl std::fmt::Debug for PeerConfig {
 }
 
 /// Run a symmetric peer: dial or listen, then serve tunnels in both directions.
-pub async fn run_peer(config: PeerConfig) -> Result<()> {
+pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
     validate_relay_only(config.relay_only, &config.relay_urls)?;
 
-    if config.allowed_sources.is_empty() {
+    // An empty TCP allowlist defaults to dual-stack localhost (an empty list would
+    // otherwise reject everything, which is useless for the common loopback case).
+    config.allowed_sources = config.allowed_sources.with_localhost_tcp_default();
+
+    if config.allowed_sources.udp.is_empty() {
         log::warn!(
-            "No allowed_sources configured; all incoming source requests from the peer \
-             will be rejected (fail-closed)."
+            "No UDP allowed_sources configured; all incoming UDP source requests from \
+             the peer will be rejected (fail-closed)."
         );
     }
 

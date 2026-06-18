@@ -62,8 +62,9 @@ local_listen = "127.0.0.1:15679"
 
 # ============================================================================
 # Allowed source networks the peer may request of US (CIDR notation).
-# Separate lists for TCP and UDP. Supports IPv4 and IPv6. Fail-closed: if a list
-# is empty, every incoming request for that protocol is rejected.
+# Separate lists for TCP and UDP. Supports IPv4 and IPv6.
+# An empty/omitted `tcp` list defaults to dual-stack localhost (127.0.0.0/8, ::1/128).
+# An empty/omitted `udp` list is fail-closed: every incoming UDP request is rejected.
 # ============================================================================
 [allowed_sources]
 tcp = [
