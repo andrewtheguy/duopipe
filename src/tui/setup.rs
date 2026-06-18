@@ -13,7 +13,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use tui_input::Input;
 
+use super::textinput::{handle_edit, render_spans};
 use crate::app_state::Role;
 use crate::auth;
 use crate::config::{validate_cidr, AllowedSources};
@@ -69,7 +71,7 @@ pub struct SetupState {
     /// completes the allowlist (only used when `config_allowed_sources` empty).
     allowed_tcp: Vec<String>,
     /// Current text field contents (node id / token / CIDR entry).
-    buffer: String,
+    buffer: Input,
     /// Inline error from the last failed validation; cleared on the next keypress.
     error: Option<String>,
 }
@@ -84,7 +86,7 @@ impl SetupState {
             auth_token: None,
             token_generated: false,
             allowed_tcp: Vec::new(),
-            buffer: String::new(),
+            buffer: Input::default(),
             error: None,
         }
     }
@@ -110,7 +112,7 @@ fn after_credentials(state: &mut SetupState) -> Step {
         Step::Done(build_resolved(state, state.config_allowed_sources.clone()))
     } else {
         state.phase = SetupPhase::AllowedTcp;
-        state.buffer.clear();
+        state.buffer.reset();
         Step::Continue
     }
 }
@@ -144,6 +146,7 @@ fn parse_cidr_list(buffer: &str) -> Result<Vec<String>, String> {
 
 /// Handle a key press, advancing the state machine.
 pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
+    // Ctrl-C quits from any phase.
     let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl_c {
         return Step::Quit;
@@ -155,7 +158,7 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
         SetupPhase::ConnectExisting => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 state.phase = SetupPhase::NodeId;
-                state.buffer.clear();
+                state.buffer.reset();
                 Step::Continue
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
@@ -165,30 +168,29 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                     finalize_listen(state)
                 } else {
                     state.phase = SetupPhase::ConfirmGenerateToken;
-                    state.buffer.clear();
+                    state.buffer.reset();
                     Step::Continue
                 }
             }
-            KeyCode::Char('q') | KeyCode::Esc => Step::Quit,
+            KeyCode::Esc => Step::Quit,
             _ => Step::Continue,
         },
         SetupPhase::ConfirmGenerateToken => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => finalize_listen(state),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 state.phase = SetupPhase::ConnectExisting;
-                state.buffer.clear();
+                state.buffer.reset();
                 Step::Continue
             }
-            KeyCode::Char('q') => Step::Quit,
             _ => Step::Continue,
         },
         SetupPhase::NodeId => match key.code {
             KeyCode::Esc => {
                 state.phase = SetupPhase::ConnectExisting;
-                state.buffer.clear();
+                state.buffer.reset();
                 Step::Continue
             }
-            KeyCode::Enter => match state.buffer.trim().parse::<EndpointId>() {
+            KeyCode::Enter => match state.buffer.value().trim().parse::<EndpointId>() {
                 Ok(id) => {
                     state.node_id = Some(id);
                     match state.config_auth_token.clone() {
@@ -199,7 +201,7 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                         }
                         None => {
                             state.phase = SetupPhase::AuthToken;
-                            state.buffer.clear();
+                            state.buffer.reset();
                             Step::Continue
                         }
                     }
@@ -209,24 +211,19 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                     Step::Continue
                 }
             },
-            KeyCode::Backspace => {
-                state.buffer.pop();
+            _ => {
+                handle_edit(&mut state.buffer, key, is_input_char);
                 Step::Continue
             }
-            KeyCode::Char(c) if is_input_char(c) => {
-                state.buffer.push(c);
-                Step::Continue
-            }
-            _ => Step::Continue,
         },
         SetupPhase::AuthToken => match key.code {
             KeyCode::Esc => {
                 state.phase = SetupPhase::NodeId;
-                state.buffer.clear();
+                state.buffer.reset();
                 Step::Continue
             }
             KeyCode::Enter => {
-                let token = state.buffer.trim().to_string();
+                let token = state.buffer.value().trim().to_string();
                 match auth::validate_token(&token) {
                     Ok(()) => {
                         state.auth_token = Some(token);
@@ -239,27 +236,22 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                state.buffer.pop();
+            _ => {
+                handle_edit(&mut state.buffer, key, is_input_char);
                 Step::Continue
             }
-            KeyCode::Char(c) if is_input_char(c) => {
-                state.buffer.push(c);
-                Step::Continue
-            }
-            _ => Step::Continue,
         },
         SetupPhase::AllowedTcp => match key.code {
             KeyCode::Esc => {
                 state.phase = SetupPhase::ConnectExisting;
-                state.buffer.clear();
+                state.buffer.reset();
                 Step::Continue
             }
-            KeyCode::Enter => match parse_cidr_list(&state.buffer) {
+            KeyCode::Enter => match parse_cidr_list(state.buffer.value()) {
                 Ok(list) => {
                     state.allowed_tcp = list;
                     state.phase = SetupPhase::AllowedUdp;
-                    state.buffer.clear();
+                    state.buffer.reset();
                     Step::Continue
                 }
                 Err(e) => {
@@ -267,23 +259,18 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                     Step::Continue
                 }
             },
-            KeyCode::Backspace => {
-                state.buffer.pop();
+            _ => {
+                handle_edit(&mut state.buffer, key, is_cidr_char);
                 Step::Continue
             }
-            KeyCode::Char(c) if is_cidr_char(c) => {
-                state.buffer.push(c);
-                Step::Continue
-            }
-            _ => Step::Continue,
         },
         SetupPhase::AllowedUdp => match key.code {
             KeyCode::Esc => {
                 state.phase = SetupPhase::AllowedTcp;
-                state.buffer.clear();
+                state.buffer.reset();
                 Step::Continue
             }
-            KeyCode::Enter => match parse_cidr_list(&state.buffer) {
+            KeyCode::Enter => match parse_cidr_list(state.buffer.value()) {
                 Ok(list) => {
                     let allowed = AllowedSources {
                         tcp: state.allowed_tcp.clone(),
@@ -296,15 +283,10 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                     Step::Continue
                 }
             },
-            KeyCode::Backspace => {
-                state.buffer.pop();
+            _ => {
+                handle_edit(&mut state.buffer, key, is_cidr_char);
                 Step::Continue
             }
-            KeyCode::Char(c) if is_cidr_char(c) => {
-                state.buffer.push(c);
-                Step::Continue
-            }
-            _ => Step::Continue,
         },
     }
 }
@@ -391,10 +373,9 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     }
 
     lines.push(Line::raw(""));
-    // `q` quits only at the y/n prompt; in the text fields it's literal input,
-    // so don't advertise it there.
     let footer = match state.phase {
-        SetupPhase::ConnectExisting | SetupPhase::ConfirmGenerateToken => "Ctrl-C / q quit",
+        SetupPhase::ConnectExisting => "Esc / Ctrl-C quit",
+        SetupPhase::ConfirmGenerateToken => "Esc back · Ctrl-C quit",
         SetupPhase::NodeId
         | SetupPhase::AuthToken
         | SetupPhase::AllowedTcp
@@ -413,16 +394,11 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     frame.render_widget(para, area);
 }
 
-/// A text-input line with a trailing block cursor.
-fn input_line(buffer: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(buffer.to_string(), Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "█",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ])
+/// A text-input line with a block cursor at the current edit position.
+fn input_line(buffer: &Input) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(render_spans(buffer, Style::default().fg(Color::Cyan)));
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -541,6 +517,22 @@ mod tests {
             }
             _ => panic!("expected Done(Dial)"),
         }
+    }
+
+    #[test]
+    fn node_id_field_supports_cursor_editing() {
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config());
+        handle_key(key(KeyCode::Char('y')), &mut s); // -> NodeId
+        type_str(&mut s, "abcd");
+        // Move left twice and insert in the middle.
+        handle_key(key(KeyCode::Left), &mut s);
+        handle_key(key(KeyCode::Left), &mut s);
+        type_str(&mut s, "XY");
+        assert_eq!(s.buffer.value(), "abXYcd");
+        // Home, then delete-forward removes the first char.
+        handle_key(key(KeyCode::Home), &mut s);
+        handle_key(key(KeyCode::Delete), &mut s);
+        assert_eq!(s.buffer.value(), "bXYcd");
     }
 
     #[test]

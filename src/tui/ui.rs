@@ -5,7 +5,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+use tui_input::Input;
 
+use super::textinput::render_spans;
 use crate::app_state::{
     AppSnapshot, ConnStatus, PeerRow, Role, TunnelRow, TunnelStatus,
 };
@@ -23,6 +25,9 @@ pub struct UiState {
     /// Set once the user presses `h`, or once a peer has connected: hides the
     /// generated-token banner in the header for the rest of the session.
     pub token_banner_hidden: bool,
+    /// First Esc of a double-Esc quit has been seen; the next Esc quits. Cleared
+    /// by any other key. Drives the "press Esc again" hint.
+    pub quit_armed: bool,
 }
 
 /// Which field the "add request" modal is currently editing.
@@ -38,11 +43,22 @@ pub enum AddField {
 #[derive(Default)]
 pub struct AddRequestForm {
     pub field: AddField,
-    pub name: String,
-    pub remote_source: String,
-    pub local_listen: String,
+    pub name: Input,
+    pub remote_source: Input,
+    pub local_listen: Input,
     /// Inline validation error from the last failed submit; cleared on next keypress.
     pub error: Option<String>,
+}
+
+impl AddRequestForm {
+    /// The input for the field currently being edited.
+    pub fn active_mut(&mut self) -> &mut Input {
+        match self.field {
+            AddField::Name => &mut self.name,
+            AddField::RemoteSource => &mut self.remote_source,
+            AddField::LocalListen => &mut self.local_listen,
+        }
+    }
 }
 
 pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
@@ -133,16 +149,13 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
 /// Modal for adding a tunnel request at runtime. Three labeled fields; the active
 /// one carries a blinking block cursor. Mirrors the setup-screen input style.
 pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
-    let field_line = |label: &str, value: &str, active: bool| -> Line<'static> {
+    let field_line = |label: &str, input: &Input, active: bool| -> Line<'static> {
         let mut spans = vec![Span::raw(format!("{label:<14}"))];
-        spans.push(Span::styled(value.to_string(), Style::default().fg(Color::Cyan)));
+        let style = Style::default().fg(Color::Cyan);
         if active {
-            spans.push(Span::styled(
-                "█",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
+            spans.extend(render_spans(input, style));
+        } else {
+            spans.push(Span::styled(input.value().to_string(), style));
         }
         Line::from(spans)
     };
@@ -317,8 +330,10 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
     let start = end.saturating_sub(body);
     let lines: Vec<Line> = logs[start..end].iter().map(log_line).collect();
 
-    let title = if scroll == 0 {
-        format!(" Logs ({total})  [q quit · [/] or PgUp/PgDn scroll · g/G top/bottom · d dump] ")
+    let title = if ui.quit_armed {
+        format!(" Logs ({total})  [press Esc again to quit] ")
+    } else if scroll == 0 {
+        format!(" Logs ({total})  [Esc Esc quit · [/] or PgUp/PgDn scroll · g/G top/bottom · d dump] ")
     } else {
         format!(" Logs ({total})  [scrolled +{scroll}] ")
     };

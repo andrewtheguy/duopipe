@@ -7,6 +7,7 @@
 //! ends this loop and stops the runtime.
 
 mod setup;
+mod textinput;
 mod ui;
 
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use crate::config::{
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use setup::{SetupOutcome, SetupState, Step};
+use textinput::handle_edit;
 use ui::{AddField, AddRequestForm, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
@@ -196,25 +198,34 @@ async fn run_setup(
 /// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
 /// stop the selected tunnel; `a` opens the add-request modal; `h` hides the
 /// generated-token banner. Logs scroll with `PageUp`/`PageDown` and `[`/`]`.
+/// A double `Esc` quits (or `Ctrl-C`).
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
-    // Ctrl-C always quits, even with the add-request modal open.
+    // Ctrl-C is an always-available emergency quit, even with the modal open.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         state.shutdown.cancel();
         return true;
     }
-    // While the modal is open it captures all other keys (so `q`/`j`/`k` are text).
+    // While the modal is open it captures all other keys (so `j`/`k`/`q` are text).
     if ui.add_form.is_some() {
         handle_add_form(key, ui, state);
         return false;
     }
 
-    let total = state.logs.len();
-    let tunnels = state.tunnel_count();
-    match key.code {
-        KeyCode::Char('q') => {
+    // Quit on a double Esc: the first Esc arms it, a second (with no other key in
+    // between) confirms. Any other key disarms it.
+    if key.code == KeyCode::Esc {
+        if ui.quit_armed {
             state.shutdown.cancel();
             return true;
         }
+        ui.quit_armed = true;
+        return false;
+    }
+    ui.quit_armed = false;
+
+    let total = state.logs.len();
+    let tunnels = state.tunnel_count();
+    match key.code {
         KeyCode::Char('a') => {
             ui.add_form = Some(AddRequestForm::default());
         }
@@ -287,23 +298,10 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
             AddField::RemoteSource => form.field = AddField::LocalListen,
             AddField::LocalListen => submit_add_form(ui, state),
         },
-        KeyCode::Backspace => match form.field {
-            AddField::Name => {
-                form.name.pop();
-            }
-            AddField::RemoteSource => {
-                form.remote_source.pop();
-            }
-            AddField::LocalListen => {
-                form.local_listen.pop();
-            }
-        },
-        KeyCode::Char(c) if is_field_char(c, form.field) => match form.field {
-            AddField::Name => form.name.push(c),
-            AddField::RemoteSource => form.remote_source.push(c),
-            AddField::LocalListen => form.local_listen.push(c),
-        },
-        _ => {}
+        _ => {
+            let field = form.field;
+            handle_edit(form.active_mut(), key, |c| is_field_char(c, field));
+        }
     }
 }
 
@@ -318,16 +316,16 @@ fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
     };
-    let remote_source = form.remote_source.trim().to_string();
-    let name = if form.name.trim().is_empty() {
+    let remote_source = form.remote_source.value().trim().to_string();
+    let name = if form.name.value().trim().is_empty() {
         remote_source.clone()
     } else {
-        form.name.trim().to_string()
+        form.name.value().trim().to_string()
     };
     let req = RequestEntry {
         name,
         remote_source,
-        local_listen: form.local_listen.trim().to_string(),
+        local_listen: form.local_listen.value().trim().to_string(),
     };
     match validate_request_specs(std::slice::from_ref(&req)) {
         Ok(()) => {
@@ -468,6 +466,48 @@ mod tests {
         let form = ui.add_form.as_ref().expect("form stays open on error");
         assert!(form.error.is_some());
         assert_eq!(st.request_count(), 0, "no request added on invalid input");
+    }
+
+    #[test]
+    fn double_esc_quits_but_single_esc_does_not() {
+        let st = state();
+        let mut ui = UiState::default();
+        // First Esc only arms the quit; it does not exit.
+        assert!(!handle_key(key(KeyCode::Esc), &mut ui, &st));
+        assert!(ui.quit_armed);
+        // Second consecutive Esc quits.
+        assert!(handle_key(key(KeyCode::Esc), &mut ui, &st));
+    }
+
+    #[test]
+    fn any_key_between_disarms_double_esc() {
+        let st = state();
+        let mut ui = UiState::default();
+        handle_key(key(KeyCode::Esc), &mut ui, &st);
+        assert!(ui.quit_armed);
+        // A non-Esc key cancels the pending quit.
+        handle_key(key(KeyCode::Char('j')), &mut ui, &st);
+        assert!(!ui.quit_armed);
+        // So the next single Esc only re-arms rather than quitting.
+        assert!(!handle_key(key(KeyCode::Esc), &mut ui, &st));
+    }
+
+    #[test]
+    fn add_form_field_supports_cursor_editing() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddRequestForm::default()),
+            ..Default::default()
+        };
+        type_str(&mut ui, &st, "ace");
+        // Cursor is at end; step left once and insert between 'c' and 'e'.
+        handle_add_form(key(KeyCode::Left), &mut ui, &st);
+        type_str(&mut ui, &st, "d");
+        // Step left twice more and insert between 'a' and 'c'.
+        handle_add_form(key(KeyCode::Left), &mut ui, &st);
+        handle_add_form(key(KeyCode::Left), &mut ui, &st);
+        type_str(&mut ui, &st, "b");
+        assert_eq!(ui.add_form.as_ref().unwrap().name.value(), "abcde");
     }
 
     #[test]
