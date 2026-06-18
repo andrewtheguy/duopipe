@@ -47,11 +47,11 @@ struct Args {
 enum Command {
     /// Start a peer (interactive TUI): one connection, many tunnels both ways.
     ///
-    /// On startup the TUI asks whether to connect to an existing instance.
-    /// Choosing "no" starts a listening instance (generating an auth token if
-    /// none is configured); choosing "yes" prompts for the existing instance's
-    /// node id and, if not configured, its auth token. Forwards, relays, and
-    /// other options come from the config file.
+    /// On startup the TUI offers a choice between starting a new (listening)
+    /// instance and connecting to an existing one. Listening generates an auth
+    /// token if none is configured; connecting prompts for the existing
+    /// instance's node id and, if not configured, its auth token. Forwards,
+    /// relays, and other options come from the config file.
     Start {
         /// Path to config file
         #[arg(short, long)]

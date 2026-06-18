@@ -24,7 +24,7 @@ use crate::peer_params::ResolvedPeer;
 /// Which question the setup screen is currently asking.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SetupPhase {
-    /// "Connect to an existing instance? (y/N)"
+    /// Selection list: start a new (listening) instance, or dial an existing one.
     ConnectExisting,
     /// Listen only, when no config token: confirm a fresh token will be
     /// generated for this run before generating it.
@@ -40,6 +40,15 @@ enum SetupPhase {
     /// allowlist.
     AllowedUdp,
 }
+
+/// The two roles offered on the `ConnectExisting` selection screen, in display
+/// order. Index 0 (listen) is the default highlight.
+const CONNECT_OPTIONS: [&str; 2] = [
+    "Start a new instance (listen for a connection)",
+    "Connect to an existing instance (dial)",
+];
+/// Index of the "dial" option within [`CONNECT_OPTIONS`].
+const CONNECT_DIAL: usize = 1;
 
 /// Result of running the setup screen to completion.
 pub enum SetupOutcome {
@@ -63,6 +72,8 @@ pub struct SetupState {
     /// Allowlist supplied by config. When non-empty the interactive allowlist
     /// prompts are skipped (config wins); when empty they are shown.
     config_allowed_sources: AllowedSources,
+    /// Highlighted option on the `ConnectExisting` selection screen.
+    connect_choice: usize,
     node_id: Option<EndpointId>,
     /// Resolved credential, carried across the allowlist phases before `Done`.
     auth_token: Option<String>,
@@ -82,6 +93,7 @@ impl SetupState {
             phase: SetupPhase::ConnectExisting,
             config_auth_token,
             config_allowed_sources,
+            connect_choice: 0,
             node_id: None,
             auth_token: None,
             token_generated: false,
@@ -156,14 +168,23 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
 
     match state.phase {
         SetupPhase::ConnectExisting => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.connect_choice = state.connect_choice.saturating_sub(1);
+                Step::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.connect_choice = (state.connect_choice + 1).min(CONNECT_OPTIONS.len() - 1);
+                Step::Continue
+            }
+            KeyCode::Enter if state.connect_choice == CONNECT_DIAL => {
                 state.phase = SetupPhase::NodeId;
                 state.buffer.reset();
                 Step::Continue
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
-                // A config/env token is used as-is (no confirmation). Without one,
-                // confirm before generating a fresh ephemeral token.
+            KeyCode::Enter => {
+                // Listen selected. A config/env token is used as-is (no
+                // confirmation); without one, confirm before generating a fresh
+                // ephemeral token.
                 if state.config_auth_token.is_some() {
                     finalize_listen(state)
                 } else {
@@ -324,11 +345,20 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
 
     match state.phase {
         SetupPhase::ConnectExisting => {
-            lines.push(Line::from("Connect to an existing instance?"));
-            lines.push(Line::from(Span::styled(
-                "  y = dial an existing instance     n / Enter = start a new (listening) instance",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from("How do you want to start?"));
+            lines.push(Line::raw(""));
+            for (i, label) in CONNECT_OPTIONS.iter().enumerate() {
+                if i == state.connect_choice {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ▶ {label}"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                } else {
+                    lines.push(Line::from(format!("    {label}")));
+                }
+            }
         }
         SetupPhase::ConfirmGenerateToken => {
             lines.push(Line::from("No auth token configured."));
@@ -374,7 +404,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
 
     lines.push(Line::raw(""));
     let footer = match state.phase {
-        SetupPhase::ConnectExisting => "Esc / Ctrl-C quit",
+        SetupPhase::ConnectExisting => "↑/↓ select · Enter confirm · Esc / Ctrl-C quit",
         SetupPhase::ConfirmGenerateToken => "Esc back · Ctrl-C quit",
         SetupPhase::NodeId
         | SetupPhase::AuthToken
@@ -415,6 +445,17 @@ mod tests {
         }
     }
 
+    /// Move the ConnectExisting selection to the dial option and confirm it.
+    fn choose_dial(state: &mut SetupState) -> Step {
+        handle_key(key(KeyCode::Down), state);
+        handle_key(key(KeyCode::Enter), state)
+    }
+
+    /// Confirm the default (listen) ConnectExisting option.
+    fn choose_listen(state: &mut SetupState) -> Step {
+        handle_key(key(KeyCode::Enter), state)
+    }
+
     /// A non-empty allowlist so setup finishes in one step (the interactive
     /// allowlist prompts are only shown when config supplies none).
     fn from_config() -> AllowedSources {
@@ -428,7 +469,7 @@ mod tests {
     fn listen_generates_token_when_none() {
         let mut s = SetupState::new(None, from_config());
         // Without a config token, choosing listen first asks for confirmation.
-        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert!(matches!(choose_listen(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
         // Confirming generates a fresh token and finishes (config supplies the allowlist).
         match handle_key(key(KeyCode::Char('y')), &mut s) {
@@ -446,7 +487,7 @@ mod tests {
     #[test]
     fn listen_no_token_confirm_back_returns_to_connect_existing() {
         let mut s = SetupState::new(None, from_config());
-        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert!(matches!(choose_listen(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
         // Declining the confirmation returns to the initial prompt.
         assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
@@ -469,7 +510,8 @@ mod tests {
     #[test]
     fn dial_rejects_bad_node_id_and_keeps_editing() {
         let mut s = SetupState::new(Some(auth::generate_token()), from_config());
-        assert!(matches!(handle_key(key(KeyCode::Char('y')), &mut s), Step::Continue));
+        assert!(matches!(choose_dial(&mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::NodeId);
         type_str(&mut s, "not-a-node-id");
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert!(s.error.is_some());
@@ -480,7 +522,7 @@ mod tests {
         let token = auth::generate_token();
         let node_id = iroh::SecretKey::generate().public().to_string();
         let mut s = SetupState::new(Some(token.clone()), from_config());
-        handle_key(key(KeyCode::Char('y')), &mut s);
+        choose_dial(&mut s);
         type_str(&mut s, &node_id);
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
@@ -497,7 +539,7 @@ mod tests {
         let node_id = iroh::SecretKey::generate().public().to_string();
         let token = auth::generate_token();
         let mut s = SetupState::new(None, from_config());
-        handle_key(key(KeyCode::Char('y')), &mut s);
+        choose_dial(&mut s);
         type_str(&mut s, &node_id);
         // Valid node id with no config token -> advance to the token prompt.
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
@@ -522,7 +564,7 @@ mod tests {
     #[test]
     fn node_id_field_supports_cursor_editing() {
         let mut s = SetupState::new(Some(auth::generate_token()), from_config());
-        handle_key(key(KeyCode::Char('y')), &mut s); // -> NodeId
+        choose_dial(&mut s); // -> NodeId
         type_str(&mut s, "abcd");
         // Move left twice and insert in the middle.
         handle_key(key(KeyCode::Left), &mut s);
@@ -533,6 +575,24 @@ mod tests {
         handle_key(key(KeyCode::Home), &mut s);
         handle_key(key(KeyCode::Delete), &mut s);
         assert_eq!(s.buffer.value(), "bXYcd");
+    }
+
+    #[test]
+    fn connect_existing_selection_navigates_and_clamps() {
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config());
+        // Default highlight is the listen option.
+        assert_eq!(s.connect_choice, 0);
+        // Up at the top clamps.
+        handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.connect_choice, 0);
+        // Down moves to the dial option and clamps at the bottom.
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.connect_choice, CONNECT_DIAL);
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.connect_choice, CONNECT_DIAL);
+        // Enter on the dial option advances to the node id prompt.
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::NodeId);
     }
 
     #[test]
@@ -547,7 +607,7 @@ mod tests {
         // Empty config allowlist -> the two CIDR prompts appear before Done.
         let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default());
         // Choose listen; advances to the TCP allowlist prompt rather than finishing.
-        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert!(matches!(choose_listen(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::AllowedTcp);
         type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
@@ -569,7 +629,7 @@ mod tests {
     #[test]
     fn allowlist_rejects_invalid_cidr_inline() {
         let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default());
-        handle_key(key(KeyCode::Char('n')), &mut s);
+        choose_listen(&mut s);
         assert_eq!(s.phase, SetupPhase::AllowedTcp);
         type_str(&mut s, "not-a-cidr");
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
@@ -580,7 +640,7 @@ mod tests {
     #[test]
     fn allowlist_blank_entries_yield_empty_lists() {
         let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default());
-        handle_key(key(KeyCode::Char('n')), &mut s);
+        choose_listen(&mut s);
         // Blank TCP -> advance; blank UDP -> Done with empty (fail-closed) lists.
         handle_key(key(KeyCode::Enter), &mut s);
         assert_eq!(s.phase, SetupPhase::AllowedUdp);
