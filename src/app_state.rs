@@ -313,11 +313,15 @@ impl AppState {
     /// the new index. Appends only, so existing indices never shift.
     pub fn add_request(&self, req: RequestEntry) -> usize {
         let row = tunnel_row_for(&req);
+        // Hold both locks for the duration so `requests` and `tunnels` are never
+        // observed out of sync (e.g. request_count() vs tunnel_count()). Lock order
+        // is requests-then-tunnels, matching `seed_tunnels_from_requests`; no site
+        // takes them the other way, so this can't deadlock.
         let mut requests = self.requests.write();
+        let mut tunnels = self.tunnels.write();
         let idx = requests.len();
         requests.push(req);
-        drop(requests);
-        self.tunnels.write().push(row);
+        tunnels.push(row);
         idx
     }
 
