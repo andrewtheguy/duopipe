@@ -278,9 +278,12 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
                 match handle_connection(conn, config.clone(), true).await {
                     Ok(()) => log::info!("Connection closed; will reconnect"),
                     Err(e) => {
-                        // Auth failures (bad token) and rejections (peer already has
-                        // an active peer) are fatal — reconnecting can't succeed, and
-                        // for a rejection it would only race for the slot.
+                        // Auth failures (bad token) and rejections (the listener's
+                        // session is bound to a different node id) are fatal —
+                        // reconnecting can't succeed: a bad token stays bad, and a
+                        // wrong-peer rejection won't change until the listener
+                        // unbinds or restarts. (A transient peer-busy close is NOT
+                        // surfaced as an error, so it falls through to a retry.)
                         if e.downcast_ref::<TunnelError>().is_some_and(|te| {
                             matches!(
                                 te.category,
