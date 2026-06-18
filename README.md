@@ -47,6 +47,12 @@ On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the 
 
 Once the connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. iroh provides NAT traversal with relay fallback and automatic discovery.
 
+> [!IMPORTANT]
+> **Intended use — a coordinated link between two trusted endpoints.** duopipe assumes the two peers are operated by **two parties who trust each other**, or by **one person across their own devices** (e.g. laptop ↔ homelab box). It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
+> - **Out-of-band coordination.** The ephemeral node id and auth token change every run and must be shared over a side channel you already have (chat, SSH session, password manager, a second device you control) before connecting.
+> - **Live, interactive operation.** Both ends run the TUI and watch shared status — connection state, the active peer, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; the two ends coordinate *what* to expose and *when*.
+> - **Mutual trust, narrowly scoped.** Either peer may *request* tunnels of the other, so only pair with someone (or a device) you trust, and keep each side's `[allowed_sources]` allowlist as tight as the task needs.
+
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
 
 ### Tunnel requests at a glance
@@ -147,7 +153,7 @@ The iroh identity is **ephemeral** — duopipe generates a fresh identity on eve
 
 ## Authentication
 
-A peer connection is gated by a single pre-shared **auth token**, shared by **both** peers. The dialing peer presents it; the listening peer accepts exactly that one token.
+A peer connection is gated by a single pre-shared **auth token**, shared by **both** peers. The dialing peer presents it; the listening peer accepts exactly that one token. Sharing it presumes a coordinated link between two trusted endpoints (or your own devices) with an out-of-band channel to pass it over — see [Intended use](#overview).
 
 > **Note:** The QUIC ALPN identifier is a fixed constant (`mf/2`). It is no longer used for access control — authentication is solely via the shared auth token.
 

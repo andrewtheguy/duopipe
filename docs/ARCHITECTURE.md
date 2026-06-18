@@ -596,6 +596,12 @@ graph TB
 
 ### Trust Model
 
+**Two trusted endpoints, coordinated out-of-band.** duopipe is built for a link between **two parties who trust each other** or **one person across their own devices** — not a public service or multi-tenant gateway. Several design choices follow directly from this assumption:
+
+- **Out-of-band credential exchange.** The ephemeral node id and the shared auth token change every run and carry no directory or discovery-by-name; the two operators pass them over a side channel they already share (chat, an existing SSH session, a password manager, a second device under their control) before connecting.
+- **Interactive, co-operated runtime.** Both ends run the TUI and watch shared status — connection state, the single active peer slot, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* happens between the two humans (or the one human on two screens), not automatically.
+- **Symmetric mutual trust.** Because either peer may *request* tunnels of the other once authenticated, the token should only ever be shared with an endpoint you trust; the `[allowed_sources]` allowlist then bounds what that trusted peer can actually reach.
+
 **Auth, then a fail-closed source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). The check is **fail-closed** — an empty or absent list rejects every requested source — so a peer can only reach addresses you explicitly allow. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
