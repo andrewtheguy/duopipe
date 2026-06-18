@@ -26,7 +26,7 @@ Binary: `duopipe`
 
 > **Design Goal:** The project's primary goal is to provide a convenient way to connect to different networks for development or homelab purposes without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale.
 
-duopipe runs as a single, **symmetric peer**: `duopipe peer`, which launches an interactive ratatui TUI. There is no separate "server" and "client" binary mode. Connection *setup* is asymmetric — QUIC needs one side to dial and the other to accept — but once a connection exists, **either side can open streams**, so tunnels flow in **both directions** over the one connection.
+duopipe runs as a single, **symmetric peer**: `duopipe start`, which launches an interactive ratatui TUI. There is no separate "server" and "client" binary mode. Connection *setup* is asymmetric — QUIC needs one side to dial and the other to accept — but once a connection exists, **either side can open streams**, so tunnels flow in **both directions** over the one connection.
 
 The role is chosen **at startup**: the TUI asks "Connect to an existing instance?" (or, for tests, the role is derived from environment variables — see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated on every run, so the listener's node id changes each run.
 
@@ -159,12 +159,12 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same `duopipe peer` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own request listeners, so tunnel requests (`[[request]]`) activated on either side all multiplex over the single connection.
+Both ends run the same `duopipe start` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own request listeners, so tunnel requests (`[[request]]`) activated on either side all multiplex over the single connection.
 
 ```mermaid
 graph TB
     subgraph "Listen Peer"
-        A[duopipe peer<br/>answered no]
+        A[duopipe start<br/>answered no]
         B[iroh Endpoint<br/>ephemeral node id]
         C[Accept Loop +<br/>Request Listeners]
         D[Discovery<br/>Pkarr/DNS]
@@ -172,7 +172,7 @@ graph TB
     end
 
     subgraph "Dial Peer"
-        F[duopipe peer<br/>answered yes]
+        F[duopipe start<br/>answered yes]
         G[iroh Endpoint<br/>ephemeral node id]
         H[Accept Loop +<br/>Request Listeners]
         I[Discovery<br/>Pkarr/DNS]
@@ -707,7 +707,7 @@ sequenceDiagram
     participant EP as iroh Endpoint
 
     Note over EP: No key file — fresh identity each run
-    User->>TUI: duopipe peer  (answer "no" → listen)
+    User->>TUI: duopipe start  (answer "no" → listen)
     TUI->>EP: Create endpoint (ephemeral identity)
     EP->>EP: Derive node id from fresh keypair
     EP-->>TUI: node id

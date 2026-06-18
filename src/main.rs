@@ -45,14 +45,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a peer (interactive TUI): one connection, many tunnels both ways.
+    /// Start a peer (interactive TUI): one connection, many tunnels both ways.
     ///
     /// On startup the TUI asks whether to connect to an existing instance.
     /// Choosing "no" starts a listening instance (generating an auth token if
     /// none is configured); choosing "yes" prompts for the existing instance's
     /// node id and, if not configured, its auth token. Forwards, relays, and
     /// other options come from the config file.
-    Peer {
+    Start {
         /// Path to config file
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -285,16 +285,16 @@ async fn run_inner() -> Result<()> {
     let args = Args::parse();
     let command = args.command;
 
-    // The interactive `peer` command renders a TUI and captures logs into a ring
+    // The interactive `start` command renders a TUI and captures logs into a ring
     // buffer. In test mode — `DUOPIPE_TEST_MODE=1` — the peer runs headless with
     // no TUI, logging to stderr, so it needs no terminal. `DUOPIPE_TEST_MODE` is
     // the single gate for all test-only env vars. Every other command logs to the
     // console as usual.
     let test_mode = env_truthy("DUOPIPE_TEST_MODE");
-    let log_buffer = if matches!(&command, Command::Peer { .. }) && !test_mode {
+    let log_buffer = if matches!(&command, Command::Start { .. }) && !test_mode {
         if !std::io::stdout().is_terminal() {
             return Err(TunnelError::config(anyhow::anyhow!(
-                "duopipe peer requires an interactive terminal (set DUOPIPE_TEST_MODE=1 for headless test mode)."
+                "duopipe start requires an interactive terminal (set DUOPIPE_TEST_MODE=1 for headless test mode)."
             ))
             .into());
         }
@@ -307,7 +307,7 @@ async fn run_inner() -> Result<()> {
     };
 
     match &command {
-        Command::Peer {
+        Command::Start {
             config,
             default_config,
         } => {
@@ -351,7 +351,7 @@ async fn run_inner() -> Result<()> {
                     .await;
             }
 
-            let log_buffer = log_buffer.expect("peer command initializes the TUI log buffer");
+            let log_buffer = log_buffer.expect("start command initializes the TUI log buffer");
             let launch = TuiLaunch {
                 logs: log_buffer,
                 requests: cfg.request.clone(),
