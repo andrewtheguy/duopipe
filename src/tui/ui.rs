@@ -35,8 +35,37 @@ pub struct UiState {
 pub enum AddField {
     #[default]
     Name,
+    /// Protocol selector (tcp/udp) for `remote_source`; not a text field.
+    Protocol,
     RemoteSource,
     LocalListen,
+}
+
+/// Transport protocol chosen on the add-request form. Becomes the `remote_source`
+/// URL scheme, so the user types only `host:port`.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    /// URL scheme for this protocol (`tcp` / `udp`).
+    pub fn scheme(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+
+    /// Toggle between the two protocols.
+    pub fn toggled(self) -> Self {
+        match self {
+            Protocol::Tcp => Protocol::Udp,
+            Protocol::Udp => Protocol::Tcp,
+        }
+    }
 }
 
 /// In-progress entry for a runtime-added tunnel request (modal state).
@@ -44,6 +73,8 @@ pub enum AddField {
 pub struct AddRequestForm {
     pub field: AddField,
     pub name: Input,
+    /// Protocol for `remote_source`; defaults to TCP.
+    pub protocol: Protocol,
     pub remote_source: Input,
     pub local_listen: Input,
     /// Inline validation error from the last failed submit; cleared on next keypress.
@@ -51,12 +82,14 @@ pub struct AddRequestForm {
 }
 
 impl AddRequestForm {
-    /// The input for the field currently being edited.
-    pub fn active_mut(&mut self) -> &mut Input {
+    /// The text input for the field currently being edited, or `None` for the
+    /// non-text [`AddField::Protocol`] selector.
+    pub fn active_mut(&mut self) -> Option<&mut Input> {
         match self.field {
-            AddField::Name => &mut self.name,
-            AddField::RemoteSource => &mut self.remote_source,
-            AddField::LocalListen => &mut self.local_listen,
+            AddField::Name => Some(&mut self.name),
+            AddField::RemoteSource => Some(&mut self.remote_source),
+            AddField::LocalListen => Some(&mut self.local_listen),
+            AddField::Protocol => None,
         }
     }
 }
@@ -160,6 +193,32 @@ pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
         Line::from(spans)
     };
 
+    let protocol_active = form.field == AddField::Protocol;
+    let protocol_line = {
+        let mut spans = vec![Span::raw(format!("{:<14}", "protocol:"))];
+        for p in [Protocol::Tcp, Protocol::Udp] {
+            let selected = form.protocol == p;
+            let mut style = Style::default();
+            if selected {
+                style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                if protocol_active {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+            } else {
+                style = style.fg(Color::DarkGray);
+            }
+            spans.push(Span::styled(format!(" {} ", p.scheme()), style));
+            spans.push(Span::raw(" "));
+        }
+        if protocol_active {
+            spans.push(Span::styled(
+                "←/→ to switch",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Line::from(spans)
+    };
+
     let mut lines = vec![
         Line::from(Span::styled(
             "Add tunnel request",
@@ -169,6 +228,7 @@ pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
         )),
         Line::raw(""),
         field_line("name:", &form.name, form.field == AddField::Name),
+        protocol_line,
         field_line(
             "remote_source:",
             &form.remote_source,
@@ -181,7 +241,7 @@ pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
         ),
         Line::raw(""),
         Line::from(Span::styled(
-            "remote_source: tcp:// or udp://host:port   local_listen: host:port   (name optional)",
+            "remote_source: host:port (protocol prepended)   local_listen: host:port   (name optional)",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -196,7 +256,7 @@ pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "Tab/Enter next field · Enter on local_listen adds & starts · Esc cancel",
+        "Tab/Enter next field · ←/→ switch protocol · Enter on local_listen adds & starts · Esc cancel",
         Style::default().fg(Color::DarkGray),
     )));
 
