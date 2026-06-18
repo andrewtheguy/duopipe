@@ -313,8 +313,9 @@ pub fn extract_port_from_source(source: &str) -> Option<u16> {
 /// everything. On rejection the `Err` carries a human-readable reason (sent back
 /// to the requester in a `StreamAck`).
 ///
-/// Literal IPs are checked directly; hostnames are resolved and *all* resolved
-/// addresses must fall within an allowed network (any match accepts).
+/// Literal IPs are checked directly; hostnames are resolved and **every** resolved
+/// address must fall within an allowed network (fail-closed: one disallowed IP
+/// rejects the source, since the outbound connection may pick any of them).
 pub async fn check_source_allowed(source: &str, allowed_networks: &[String]) -> Result<()> {
     if allowed_networks.is_empty() {
         anyhow::bail!("source '{}' rejected: no allowed_sources configured", source);
@@ -346,7 +347,7 @@ pub async fn check_source_allowed(source: &str, allowed_networks: &[String]) -> 
 
     let allowed = source_ips
         .iter()
-        .any(|ip| networks.iter().any(|net| net.contains(ip)));
+        .all(|ip| networks.iter().any(|net| net.contains(ip)));
 
     if allowed {
         Ok(())
@@ -636,6 +637,45 @@ mod tests {
     async fn check_source_malformed_url_rejected() {
         let nets = vec!["127.0.0.0/8".to_string()];
         assert!(check_source_allowed("not-a-url", &nets).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_source_multi_ip_hostname_requires_all_allowed() {
+        // `localhost` commonly resolves to multiple IPs (127.0.0.1 and ::1), which
+        // exercises the multi-IP path. The check uses `all()` semantics: every
+        // resolved IP must be allowed, so one disallowed IP rejects the source
+        // (the outbound connection could pick any of them). This guards against a
+        // regression back to `any()`. Resilient to single-stack environments: the
+        // discriminating assertion only runs when localhost yields >=2 distinct IPs.
+        let helper = |ip: std::net::IpAddr| match ip {
+            std::net::IpAddr::V4(_) => format!("{ip}/32"),
+            std::net::IpAddr::V6(_) => format!("{ip}/128"),
+        };
+
+        let resolved: Vec<std::net::IpAddr> = lookup_host("localhost:22")
+            .await
+            .expect("localhost should resolve")
+            .map(|a| a.ip())
+            .collect();
+        assert!(!resolved.is_empty(), "localhost should resolve to >=1 IP");
+
+        // An allowlist covering every resolved IP must accept.
+        let all_nets: Vec<String> = resolved.iter().copied().map(helper).collect();
+        assert!(
+            check_source_allowed("tcp://localhost:22", &all_nets).await.is_ok(),
+            "every resolved IP allowed -> accept"
+        );
+
+        // If localhost resolves to >=2 distinct IPs, an allowlist that omits one of
+        // them must reject under `all()` (it would wrongly pass under `any()`).
+        let distinct: std::collections::BTreeSet<_> = resolved.iter().collect();
+        if distinct.len() >= 2 {
+            let partial = vec![helper(resolved[0])]; // allow only the first IP
+            assert!(
+                check_source_allowed("tcp://localhost:22", &partial).await.is_err(),
+                "one disallowed resolved IP must reject (all(), not any())"
+            );
+        }
     }
 
     #[test]

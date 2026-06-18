@@ -33,10 +33,10 @@ The role is chosen **at startup**: the TUI asks "Connect to an existing instance
 - The **listen peer** (answers "no") generates an ephemeral identity and calls `endpoint.accept()` in a loop. The TUI shows its node id and the shared auth token.
 - The **dial peer** (answers "yes") is given the listener's node id and connects to it, with an automatic reconnect loop (exponential backoff, capped).
 
-Each peer can declare:
+Each peer declares **tunnel requests** in config (the connection role is chosen at startup, not here):
 
-- **Local forwards** (`-L LISTEN=DEST`): this peer binds a local listener; each accepted connection is forwarded to a destination the *other* peer connects out to.
-- **Remote forwards** (`-R BIND=DEST`): this peer asks the *other* peer to bind a listener and forward connections back to a destination *this* peer connects out to.
+- **`[[request]]`** (`name`, `remote_source`, `local_listen`): this peer binds a local listener at `local_listen`; each accepted connection asks the *other* peer to connect out to `remote_source`, then bridges the two. Requests are activated on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
+- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Fail-closed — an empty or absent list rejects every request.
 
 #### Non-interactive mode (testing)
 
@@ -159,7 +159,7 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same `duopipe peer` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own outbound listeners, so local forwards (`-L`) and remote forwards (`-R`) declared on either side all multiplex over the single connection.
+Both ends run the same `duopipe peer` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own request listeners, so tunnel requests (`[[request]]`) activated on either side all multiplex over the single connection.
 
 ```mermaid
 graph TB
@@ -430,7 +430,7 @@ graph TB
 
     subgraph "Options"
         E[auth_token* — single shared token<br/>both peers]
-        G[request[] {name, source, listen}<br/>allowed_sources {tcp[], udp[]}]
+        G[request[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
         H[max_sessions]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
