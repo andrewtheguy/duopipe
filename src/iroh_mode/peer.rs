@@ -26,6 +26,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::app_state::{AppState, ConnStatus, TunnelDir, TunnelRow, TunnelStatus};
 use crate::auth::is_token_valid;
 use crate::config::{ConnectRole, LocalForward, RemoteForward, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
@@ -107,6 +108,8 @@ pub struct PeerConfig {
     pub max_sessions: Option<usize>,
     /// Transport layer tuning.
     pub transport: TransportTuning,
+    /// Shared state surfaced by the TUI.
+    pub status: Arc<AppState>,
 }
 
 impl std::fmt::Debug for PeerConfig {
@@ -125,6 +128,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("dns_server", &self.dns_server)
             .field("max_sessions", &self.max_sessions)
             .field("transport", &self.transport)
+            .field("status", &"<present>")
             .finish()
     }
 }
@@ -164,6 +168,11 @@ async fn run_listen(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
     .await?;
 
     let endpoint_id = endpoint.id();
+    config.status.set_endpoint_id(endpoint_id.to_string());
+    config.status.set_dial_hint(format!(
+        "duopipe peer --connect dial --peer-node-id {}",
+        endpoint_id
+    ));
     log::info!("EndpointId: {}", endpoint_id);
     log::info!(
         "Dial this peer with: duopipe peer --connect dial --peer-node-id {}",
@@ -171,18 +180,22 @@ async fn run_listen(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
     );
     log::info!("Waiting for peers to connect...");
 
+    let shutdown = config.status.shutdown.clone();
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
     loop {
         while connection_tasks.try_join_next().is_some() {}
 
-        let incoming = match endpoint.accept().await {
-            Some(incoming) => incoming,
-            None => {
-                log::info!("Endpoint closed");
-                break;
-            }
+        let incoming = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => {
+                    log::info!("Endpoint closed");
+                    break;
+                }
+            },
         };
 
         let conn = match incoming.await {
@@ -235,21 +248,29 @@ async fn run_dial(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
     )
     .await?;
 
+    config.status.set_endpoint_id(endpoint.id().to_string());
+
+    let shutdown = config.status.shutdown.clone();
     let config = Arc::new(config);
     let mut backoff = Duration::from_secs(1);
 
     loop {
-        match connect_to_server(
-            &endpoint,
-            peer_id,
-            &config.relay_urls,
-            config.relay_only,
-            &alpn,
-        )
-        .await
-        {
+        config.status.set_conn_status(ConnStatus::Connecting);
+        let connect = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            connect = connect_to_server(
+                &endpoint,
+                peer_id,
+                &config.relay_urls,
+                config.relay_only,
+                &alpn,
+            ) => connect,
+        };
+
+        match connect {
             Ok(conn) => {
                 backoff = Duration::from_secs(1);
+                config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
                 match handle_connection(conn, config.clone(), true).await {
                     Ok(()) => log::info!("Connection closed; will reconnect"),
@@ -269,10 +290,19 @@ async fn run_dial(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
             Err(e) => log::warn!("Failed to connect to peer: {}", e),
         }
 
+        config
+            .status
+            .set_conn_status(ConnStatus::Reconnecting { backoff_secs: backoff.as_secs() });
         log::info!("Reconnecting in {:?}...", backoff);
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
+
+    endpoint.close().await;
+    Ok(())
 }
 
 // ============================================================================
@@ -292,18 +322,24 @@ async fn handle_connection(
             .auth_token
             .as_deref()
             .context("dial role requires an auth token")?;
+        config.status.set_conn_status(ConnStatus::Authenticating);
         auth_as_dialer(&conn, token).await?;
+        config.status.set_conn_status(ConnStatus::Connected);
     } else {
         auth_as_listener(&conn, &config.auth_tokens).await?;
+        config.status.add_peer(remote_id.to_string());
         log::info!("Peer {} authenticated successfully", remote_id);
     }
 
-    let _path_watcher = watch_connection_paths(&conn);
+    seed_tunnel_rows(&config);
+
+    let _path_watcher =
+        watch_connection_paths(&conn, config.status.clone(), remote_id.to_string());
 
     let conn = Arc::new(conn);
-    let semaphore = Arc::new(Semaphore::new(
-        config.max_sessions.unwrap_or(DEFAULT_MAX_SESSIONS),
-    ));
+    let max_sessions = config.max_sessions.unwrap_or(DEFAULT_MAX_SESSIONS);
+    let semaphore = Arc::new(Semaphore::new(max_sessions));
+    config.status.set_semaphore(semaphore.clone(), max_sessions);
     let rf_map: RemoteForwardMap = Arc::new(Mutex::new(HashMap::new()));
 
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -326,8 +362,10 @@ async fn handle_connection(
         let conn = conn.clone();
         let semaphore = semaphore.clone();
         let lf = lf.clone();
+        let status = config.status.clone();
         tasks.spawn(async move {
-            if let Err(e) = run_local_forward(conn, lf.clone(), semaphore).await {
+            if let Err(e) = run_local_forward(conn, lf.clone(), semaphore, status.clone()).await {
+                status.update_tunnel(&lf.listen, TunnelStatus::Error, e.to_string());
                 log::warn!("Local forward {} ended: {}", lf.listen, e);
             }
         });
@@ -338,8 +376,9 @@ async fn handle_connection(
         let conn = conn.clone();
         let forwards = config.remote_forwards.clone();
         let rf_map = rf_map.clone();
+        let status = config.status.clone();
         tasks.spawn(async move {
-            if let Err(e) = request_remote_forwards(conn, forwards, rf_map).await {
+            if let Err(e) = request_remote_forwards(conn, forwards, rf_map, status).await {
                 log::warn!("Remote forward negotiation ended: {}", e);
             }
         });
@@ -348,8 +387,37 @@ async fn handle_connection(
     // Run until the connection closes, then tear everything down.
     let reason = conn.closed().await;
     log::info!("Connection to {} closed: {}", remote_id, reason);
+    if is_dialer {
+        config.status.set_conn_status(ConnStatus::Closed);
+    } else {
+        config.status.remove_peer(&remote_id.to_string());
+    }
     tasks.shutdown().await;
     Ok(())
+}
+
+/// Seed the TUI tunnel table from this peer's configured forwards.
+fn seed_tunnel_rows(config: &PeerConfig) {
+    let mut rows = Vec::new();
+    for lf in &config.local_forwards {
+        rows.push(TunnelRow {
+            dir: TunnelDir::Local,
+            key: lf.listen.clone(),
+            spec: format!("{} -> {}", lf.listen, lf.dest),
+            status: TunnelStatus::Pending,
+            detail: String::new(),
+        });
+    }
+    for rf in &config.remote_forwards {
+        rows.push(TunnelRow {
+            dir: TunnelDir::Remote,
+            key: rf.bind.clone(),
+            spec: format!("{} -> {}", rf.bind, rf.dest),
+            status: TunnelStatus::Pending,
+            detail: String::new(),
+        });
+    }
+    config.status.set_tunnels(rows);
 }
 
 // ============================================================================
@@ -577,6 +645,7 @@ async fn run_local_forward(
     conn: Arc<iroh::endpoint::Connection>,
     lf: LocalForward,
     semaphore: Arc<Semaphore>,
+    status: Arc<AppState>,
 ) -> Result<()> {
     let hello = StreamHello::local_forward(&lf.dest);
     let listen_addrs = resolve_listen_addrs(&lf.listen)
@@ -593,9 +662,11 @@ async fn run_local_forward(
                 .with_context(|| format!("Failed to bind UDP listener on {}", listen_addr))?,
         );
         log::info!("Listening on UDP {} -> {}", listen_addr, lf.dest);
+        status.update_tunnel(&lf.listen, TunnelStatus::Listening, listen_addr.to_string());
         udp_listen_side(&conn, hello, udp_socket).await
     } else {
         let listeners = bind_tcp_listeners(&listen_addrs, &lf.dest).await?;
+        status.update_tunnel(&lf.listen, TunnelStatus::Listening, String::new());
         tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
     }
 }
@@ -608,6 +679,7 @@ async fn request_remote_forwards(
     conn: Arc<iroh::endpoint::Connection>,
     forwards: Vec<RemoteForward>,
     rf_map: RemoteForwardMap,
+    status: Arc<AppState>,
 ) -> Result<()> {
     let (mut send, mut recv) = open_bi_with_retry(&conn).await?;
     send.write_all(&encode_stream_hello(&StreamHello::remote_forward_control())?)
@@ -634,19 +706,19 @@ async fn request_remote_forwards(
             .context("Invalid remote forward response")?;
 
         if resp.accepted {
+            let bound = resp.bound_addr.as_deref().unwrap_or("?");
+            status.update_tunnel(&rf.bind, TunnelStatus::Bound, bound.to_string());
             log::info!(
                 "Remote forward established: peer binds {} -> our {} ({})",
                 rf.bind,
                 rf.dest,
-                resp.bound_addr.as_deref().unwrap_or("?")
+                bound
             );
         } else {
             rf_map.lock().await.remove(&tunnel_id);
-            log::warn!(
-                "Remote forward rejected for {}: {}",
-                rf.bind,
-                resp.reason.as_deref().unwrap_or("Unknown")
-            );
+            let reason = resp.reason.as_deref().unwrap_or("Unknown");
+            status.update_tunnel(&rf.bind, TunnelStatus::Rejected, reason.to_string());
+            log::warn!("Remote forward rejected for {}: {}", rf.bind, reason);
         }
     }
 

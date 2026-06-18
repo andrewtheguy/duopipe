@@ -1,0 +1,234 @@
+//! Rendering for the duopipe TUI. Pure functions over an [`AppSnapshot`].
+
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::Frame;
+
+use crate::app_state::{
+    AppSnapshot, ConnStatus, PeerRow, Role, TunnelRow, TunnelStatus,
+};
+use crate::logging::LogLine;
+
+/// View state owned by the TUI loop (not shared with the runtime).
+#[derive(Default)]
+pub struct UiState {
+    /// Lines scrolled up from the bottom of the log pane. 0 = follow tail.
+    pub log_scroll: usize,
+}
+
+pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
+    let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
+    let peer_rows = snap.peers.len().max(1) as u16 + 2;
+    let [header_area, tunnels_area, peers_area, logs_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(tunnel_rows.clamp(4, 10)),
+        Constraint::Length(peer_rows.clamp(3, 8)),
+        Constraint::Min(3),
+    ])
+    .areas(frame.area());
+
+    render_header(frame, header_area, snap);
+    render_tunnels(frame, tunnels_area, snap);
+    render_peers(frame, peers_area, snap);
+    render_logs(frame, logs_area, logs, ui);
+}
+
+fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
+    let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
+    let status_label = snap.conn_status.label();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("duopipe", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  role: "),
+            Span::styled(
+                snap.role.label(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  sessions: "),
+            Span::raw(format!("{}/{}", snap.sessions_used, snap.sessions_max)),
+        ]),
+        Line::from(vec![Span::raw("EndpointId: "), Span::raw(endpoint)]),
+    ];
+
+    if snap.role == Role::Dial {
+        lines.push(Line::from(vec![
+            Span::raw("status: "),
+            Span::styled(status_label, Style::default().fg(conn_color(&snap.conn_status))),
+            Span::raw("   path: "),
+            Span::raw(snap.path.describe()),
+        ]));
+    } else if let Some(hint) = &snap.dial_hint {
+        lines.push(Line::from(vec![
+            Span::raw("dial with: "),
+            Span::styled(hint.clone(), Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(para, area);
+}
+
+fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
+    let header = Row::new(["DIR", "SPEC", "STATUS", "DETAIL"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = if snap.tunnels.is_empty() {
+        vec![Row::new(["", "(no tunnels configured)", "", ""])]
+    } else {
+        snap.tunnels.iter().map(tunnel_row).collect()
+    };
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Percentage(45),
+        Constraint::Length(10),
+        Constraint::Percentage(30),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(" Tunnels "));
+    frame.render_widget(table, area);
+}
+
+fn tunnel_row(t: &TunnelRow) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(t.dir.label()),
+        Cell::from(t.spec.clone()),
+        Cell::from(Span::styled(
+            t.status.label(),
+            Style::default().fg(tunnel_color(t.status)),
+        )),
+        Cell::from(t.detail.clone()),
+    ])
+}
+
+fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
+    let title = match snap.role {
+        Role::Listen => " Connected peers ",
+        Role::Dial => " Connection ",
+    };
+    let header = Row::new(["REMOTE ID", "SINCE", "PATH"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = match snap.role {
+        Role::Listen => {
+            if snap.peers.is_empty() {
+                vec![Row::new(["", "(waiting for peers)", ""])]
+            } else {
+                snap.peers.iter().map(peer_row).collect()
+            }
+        }
+        Role::Dial => {
+            let remote = snap
+                .peers
+                .first()
+                .map(|p| short_id(&p.remote_id))
+                .unwrap_or_else(|| "-".to_string());
+            vec![Row::new(vec![
+                Cell::from(remote),
+                Cell::from(snap.conn_status.label()),
+                Cell::from(snap.path.describe()),
+            ])]
+        }
+    };
+
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(16),
+        Constraint::Min(20),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(table, area);
+}
+
+fn peer_row(p: &PeerRow) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(short_id(&p.remote_id)),
+        Cell::from(fmt_elapsed(p.connected_since.elapsed())),
+        Cell::from(p.path.describe()),
+    ])
+}
+
+fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
+    // Visible body height inside the border.
+    let body = area.height.saturating_sub(2) as usize;
+    let total = logs.len();
+    // Clamp the scroll so at least a full body of lines stays visible.
+    let max_scroll = total.saturating_sub(body);
+    let scroll = ui.log_scroll.min(max_scroll);
+    let end = total - scroll;
+    let start = end.saturating_sub(body);
+    let lines: Vec<Line> = logs[start..end].iter().map(log_line).collect();
+
+    let title = if scroll == 0 {
+        format!(" Logs ({total})  [q quit · ↑/↓ scroll · g/G top/bottom] ")
+    } else {
+        format!(" Logs ({total})  [scrolled +{scroll}] ")
+    };
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+fn log_line(l: &LogLine) -> Line<'static> {
+    let time = l.ts.strftime("%H:%M:%S").to_string();
+    let level = l.level.as_str();
+    Line::from(vec![
+        Span::styled(time, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(
+            format!("{level:<5}"),
+            Style::default().fg(level_color(l.level)),
+        ),
+        Span::raw(" "),
+        Span::raw(l.msg.clone()),
+    ])
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() > 12 {
+        format!("{}…", &id[..11])
+    } else {
+        id.to_string()
+    }
+}
+
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+fn conn_color(status: &ConnStatus) -> Color {
+    match status {
+        ConnStatus::Connected => Color::Green,
+        ConnStatus::Connecting
+        | ConnStatus::Authenticating
+        | ConnStatus::Reconnecting { .. } => Color::Yellow,
+        ConnStatus::Closed => Color::Red,
+    }
+}
+
+fn tunnel_color(status: TunnelStatus) -> Color {
+    match status {
+        TunnelStatus::Listening | TunnelStatus::Bound => Color::Green,
+        TunnelStatus::Pending => Color::Yellow,
+        TunnelStatus::Rejected | TunnelStatus::Error => Color::Red,
+    }
+}
+
+fn level_color(level: log::Level) -> Color {
+    match level {
+        log::Level::Error => Color::Red,
+        log::Level::Warn => Color::Yellow,
+        log::Level::Info => Color::Green,
+        log::Level::Debug | log::Level::Trace => Color::DarkGray,
+    }
+}

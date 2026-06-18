@@ -162,7 +162,7 @@ duopipe peer \
   --alpn-token-file ./alpn_token.txt
 ```
 
-> **Tip:** For containers and automation scripts, use environment variables (`DUOPIPE_AUTH_TOKENS`, `DUOPIPE_ALPN_TOKEN`) instead of files. See the environment variable table below.
+> **Tip:** Secrets can also be supplied via environment variables (`DUOPIPE_AUTH_TOKENS`, `DUOPIPE_ALPN_TOKEN`) instead of files. See the environment variable table below.
 
 **Config file** (`peer.toml`):
 ```toml
@@ -217,7 +217,7 @@ duopipe peer --connect listen \
   --auth-tokens-file /etc/duopipe/auth_tokens.txt \
   --alpn-token-file ./alpn_token.txt
 
-# Or comma-separated via environment variable (for containers/automation)
+# Or comma-separated via environment variable
 export DUOPIPE_AUTH_TOKENS="token-for-alice,token-for-bob"
 duopipe peer --connect listen --secret-file ./peer.key
 ```
@@ -233,7 +233,7 @@ iYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY
 
 ### Configuration File
 
-> **Security:** Plaintext tokens and secrets are **not allowed** in TOML config files. Use the `_file` variants (e.g., `auth_tokens_file`, `auth_token_file`, `alpn_token_file`, `secret_file`) in config files. For non-containerized deployments, `_file` variants are the recommended approach. Environment variables (`DUOPIPE_*`) are best suited for containers and automation scripts where secrets are injected dynamically. Plaintext values are also accepted via `--config-stdin` (JSON) for IPC.
+> **Security:** Plaintext tokens and secrets are **not allowed** in TOML config files. Use the `_file` variants (e.g., `auth_tokens_file`, `auth_token_file`, `alpn_token_file`, `secret_file`) in config files — this is the recommended approach. Environment variables (`DUOPIPE_*`) are also accepted, or embed secrets directly with [age-encrypted inline values](#encrypted-config-values).
 
 **Listening peer** (`peer.toml`):
 ```toml
@@ -323,7 +323,7 @@ In this example:
 
 Either peer may declare its own `-L`/`-R` forwards; they all share the one connection.
 
-> **Tip:** For containers and automation scripts, use environment variables (`DUOPIPE_AUTH_TOKEN`, `DUOPIPE_AUTH_TOKENS`, `DUOPIPE_ALPN_TOKEN`, etc.) instead of files. See the environment variable tables below.
+> **Tip:** Secrets can also be supplied via environment variables (`DUOPIPE_AUTH_TOKEN`, `DUOPIPE_AUTH_TOKENS`, `DUOPIPE_ALPN_TOKEN`, etc.) instead of files. See the environment variable tables below.
 
 ### 3. SSH over a local forward
 
@@ -357,7 +357,6 @@ duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
 |--------|---------|-------------|
 | `--config`, `-c` | - | Path to TOML config file |
 | `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` |
-| `--config-stdin` | false | Read JSON config from stdin for automation/IPC (use `-c` for normal usage) |
 
 ### peer iroh
 
@@ -377,9 +376,9 @@ duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
 | `--dns-server` | public | Custom DNS server URL, or "none" to disable DNS discovery |
 | `--encryption-key-file` | - | Path to age identity file for decrypting age-encrypted config values |
 
-**Environment variables** (for containers and automation scripts):
+**Environment variables:**
 
-> Environment variables are primarily intended for containerized deployments and automation scripts. For regular use, prefer the `_file` CLI flags or config file equivalents.
+> For regular use, prefer the `_file` CLI flags or config file equivalents; environment variables are an alternative way to supply the same secrets.
 
 | Env Var | Role | Description |
 |---------|------|-------------|
@@ -391,9 +390,9 @@ duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
 
 ## Configuration Files
 
-Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). For normal usage, prefer config files so your settings are saved and reusable. The `--config-stdin` flag is intended for automation and IPC — it accepts JSON (self-delimiting, so the caller does not need to close stdin). Only one of these may be used at a time. All config keys live at the top level.
+Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). Prefer config files so your settings are saved and reusable. Only one of these may be used at a time. All config keys live at the top level.
 
-> **Security:** TOML config files **reject plaintext sensitive fields** (`auth_token`, `auth_tokens`, `alpn_token`, `secret`). You have three options: use the corresponding `_file` variants (recommended), use environment variables (`DUOPIPE_*`) for containers/automation, or use [age-encrypted inline values](#encrypted-config-values). Plaintext values are also accepted via `--config-stdin` (JSON) for IPC.
+> **Security:** TOML config files **reject plaintext sensitive fields** (`auth_token`, `auth_tokens`, `alpn_token`, `secret`). You have three options: use the corresponding `_file` variants (recommended), use environment variables (`DUOPIPE_*`), or use [age-encrypted inline values](#encrypted-config-values).
 
 **Default location:** `~/.config/duopipe/peer.toml`
 
@@ -502,43 +501,6 @@ duopipe peer --default-config
 
 # Load from custom path
 duopipe peer -c ./my-peer.toml
-```
-
-Example: spawning a dialing peer with `--config-stdin` from Python:
-
-```python
-import json, socket, subprocess, time
-
-config = {
-    "connect": "dial",
-    "peer_node_id": "<ENDPOINT_ID>",
-    "auth_token": "<AUTH_TOKEN>",
-    "alpn_token": "<ALPN_TOKEN>",
-    "local_forward": [
-        {"listen": "127.0.0.1:2222", "dest": "tcp://127.0.0.1:22"}
-    ],
-}
-
-proc = subprocess.Popen(
-    ["duopipe", "peer", "--config-stdin"],
-    stdin=subprocess.PIPE,
-)
-proc.stdin.write(json.dumps(config).encode())
-proc.stdin.flush()  # config is parsed immediately, no need to close stdin
-
-# wait for the forwarded port to be ready
-for attempt in range(10):
-    try:
-        with socket.create_connection(("127.0.0.1", 2222), timeout=2):
-            print("tunnel is up")
-            break
-    except OSError:
-        time.sleep(1)
-else:
-    raise RuntimeError("tunnel failed to start")
-
-input("press enter to quit..")
-proc.terminate()
 ```
 
 ---

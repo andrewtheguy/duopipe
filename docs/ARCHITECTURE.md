@@ -503,7 +503,7 @@ duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
   -L 127.0.0.1:8080=tcp://127.0.0.1:80
 ```
 
-Example usage with environment variables (for containers/automation):
+Example usage with environment variables:
 
 ```bash
 # Listen peer
@@ -555,14 +555,14 @@ alpn_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
 
 ### Configuration Loading Flow
 
-For normal usage, prefer file-based configs (`-c`, `--default-config`) which use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`. The `--config-stdin` flag is intended for automation and IPC only; it uses JSON because JSON is self-delimiting — `serde_json::Deserializer::from_reader` parses exactly one JSON object and returns without waiting for EOF, allowing the caller to keep stdin open. Config passed via stdin is not persisted.
+Configs are file-based (`-c`, `--default-config`) and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`. Without a config flag, configuration comes from CLI arguments and environment variables only.
 
 ```mermaid
 sequenceDiagram
     participant CLI as CLI Parser
     participant Main as Main
     participant Config as Config Module
-    participant Source as Config Source (file or stdin)
+    participant Source as Config Source (file)
 
     CLI->>Main: Parse arguments
     Main->>Main: Check config flags (only one allowed)
@@ -575,15 +575,12 @@ sequenceDiagram
         Main->>Config: Load from specified path
         Config->>Source: Read file
         Source-->>Config: TOML content
-    else --config-stdin
-        Main->>Config: Read from stdin
-        Source-->>Config: JSON content
     else No config flag
         Main->>Main: Use CLI arguments only
     end
 
     alt Config loaded
-        Config->>Config: Parse (TOML from file, JSON from stdin)
+        Config->>Config: Parse TOML
         Config->>Config: Validate mode + address formats
         Config-->>Main: Validated config
         Main->>Main: Merge with CLI/env args (CLI wins)

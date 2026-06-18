@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use crate::app_state::{AppState, PathInfo, PathKind, Role};
 use crate::config::{
     CongestionController, TransportTuning, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW,
 };
@@ -448,6 +449,23 @@ pub async fn connect_to_server(
     }
 }
 
+/// Classify the selected path into structured [`PathInfo`] for the TUI.
+fn classify_paths(paths: &PathList<'_>) -> PathInfo {
+    let selected = paths.iter().find(|p| p.is_selected());
+    match selected {
+        None => PathInfo::establishing(),
+        Some(path) => {
+            let rtt_ms = Some(path.rtt().as_secs_f64() * 1000.0);
+            let kind = match path.remote_addr() {
+                TransportAddr::Ip(addr) => PathKind::Direct(addr.to_string()),
+                TransportAddr::Relay(url) => PathKind::Relay(url.to_string()),
+                other => PathKind::Direct(format!("{:?}", other)),
+            };
+            PathInfo { kind, rtt_ms }
+        }
+    }
+}
+
 /// Format connection path info for display, showing selected paths with RTT.
 fn format_paths(paths: &PathList<'_>) -> String {
     if paths.is_empty() {
@@ -494,10 +512,16 @@ impl Drop for PathWatcherGuard {
 
 /// Log the current connection paths and spawn a background task that
 /// logs updates whenever the active path changes (e.g., relay -> direct).
+/// Each update is also written into [`AppState`] for the TUI: the dial role
+/// updates the single connection path, the listen role updates the matching peer.
 ///
 /// The returned [`PathWatcherGuard`] aborts the background task when dropped.
 /// Callers must keep the guard alive for the duration of the connection.
-pub fn watch_connection_paths(conn: &iroh::endpoint::Connection) -> PathWatcherGuard {
+pub fn watch_connection_paths(
+    conn: &iroh::endpoint::Connection,
+    state: Arc<AppState>,
+    remote_id: String,
+) -> PathWatcherGuard {
     let conn = conn.clone();
     PathWatcherGuard(tokio::spawn(async move {
         // The stream yields the current snapshot on the first poll, then a
@@ -506,6 +530,11 @@ pub fn watch_connection_paths(conn: &iroh::endpoint::Connection) -> PathWatcherG
         let mut stream = conn.paths_stream();
         let mut last_key = None;
         while let Some(paths) = stream.next().await {
+            let info = classify_paths(&paths);
+            match state.role {
+                Role::Dial => state.set_path(info),
+                Role::Listen => state.set_peer_path(&remote_id, info),
+            }
             let key = paths_key(&paths);
             if last_key.as_ref() != Some(&key) {
                 info!("Connection: {}", format_paths(&paths));

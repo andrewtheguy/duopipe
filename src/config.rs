@@ -216,8 +216,6 @@ pub struct RemoteForward {
 pub enum ConfigSource {
     /// TOML file on disk — plaintext secrets rejected
     File,
-    /// JSON from stdin — all values allowed
-    Stdin,
     /// No config, defaults only
     None,
 }
@@ -490,25 +488,6 @@ fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
 }
 
-/// Parse configuration as JSON from a reader (e.g. stdin).
-///
-/// Uses `serde_json::Deserializer::from_reader` to parse exactly one JSON value
-/// without calling `end()`, so it returns immediately after the closing `}`
-/// without waiting for EOF. This leaves the rest of the stream unconsumed.
-/// Times out after 30 seconds since this is intended for automation/IPC.
-pub async fn parse_config_from_reader<T: for<'de> Deserialize<'de> + Send + 'static, R: std::io::Read + Send + 'static>(reader: R) -> Result<T> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || {
-            let mut de = serde_json::Deserializer::from_reader(reader);
-            T::deserialize(&mut de).context("Failed to parse JSON config from stdin")
-        }),
-    )
-    .await
-    .context("Timed out waiting for JSON config from stdin (30s)")? // timeout
-    .context("Failed to read config from stdin")? // join error
-}
-
 /// Resolve the default peer config path (~/.config/duopipe/peer.toml).
 fn default_peer_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config").join("duopipe").join("peer.toml"))
@@ -601,15 +580,6 @@ receive_window = 67108864
     }
 
     #[test]
-    fn allows_plaintext_auth_token_from_stdin() {
-        let cfg = peer_config(PeerConfig {
-            auth_token: Some("secret123".into()),
-            ..Default::default()
-        });
-        assert!(cfg.validate(ConfigSource::Stdin).is_ok());
-    }
-
-    #[test]
     fn rejects_plaintext_auth_tokens_from_file() {
         let cfg = peer_config(PeerConfig {
             auth_tokens: Some(vec!["tok1".into()]),
@@ -637,17 +607,6 @@ receive_window = 67108864
         });
         let err = cfg.validate(ConfigSource::File).unwrap_err();
         assert!(err.to_string().contains("Plaintext 'secret'"));
-    }
-
-    #[test]
-    fn allows_plaintext_secrets_from_stdin() {
-        let cfg = peer_config(PeerConfig {
-            auth_tokens: Some(vec!["tok1".into()]),
-            alpn_token: Some("alpn123".into()),
-            secret: Some("base64secret".into()),
-            ..Default::default()
-        });
-        assert!(cfg.validate(ConfigSource::Stdin).is_ok());
     }
 
     const FAKE_AGE_ENCRYPTED: &str = "ageenc:YWdlLWVuY3J5cHRpb24=";
@@ -687,7 +646,7 @@ receive_window = 67108864
             }],
             ..Default::default()
         });
-        assert!(cfg.validate(ConfigSource::Stdin).is_ok());
+        assert!(cfg.validate(ConfigSource::File).is_ok());
 
         let bad_listen = peer_config(PeerConfig {
             local_forward: vec![LocalForward {
@@ -696,7 +655,7 @@ receive_window = 67108864
             }],
             ..Default::default()
         });
-        assert!(bad_listen.validate(ConfigSource::Stdin).is_err());
+        assert!(bad_listen.validate(ConfigSource::File).is_err());
 
         let bad_dest = peer_config(PeerConfig {
             local_forward: vec![LocalForward {
@@ -705,7 +664,7 @@ receive_window = 67108864
             }],
             ..Default::default()
         });
-        assert!(bad_dest.validate(ConfigSource::Stdin).is_err());
+        assert!(bad_dest.validate(ConfigSource::File).is_err());
     }
 
     #[test]

@@ -2,26 +2,34 @@
 //!
 //! Forwards TCP or UDP traffic through iroh P2P connections.
 
+mod app_state;
 mod auth;
 mod buffer;
 mod config;
 mod encryption;
 mod error;
 mod iroh_mode;
+mod logging;
 mod net;
 mod secret;
 mod signaling;
+mod tui;
 
 use ::iroh::SecretKey;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::Duration;
+use crate::app_state::{AppState, Role};
 use crate::error::{ErrorCategory, TunnelError};
 
+/// Capacity of the in-memory log ring buffer shown in the TUI.
+const LOG_CAPACITY: usize = 2000;
+
 use crate::config::{
-    expand_tilde, load_peer_config, parse_config_from_reader, validate_forward_specs,
-    validate_transport_tuning, ConfigSource, ConnectRole, LocalForward, PeerConfig, RemoteForward,
-    TransportTuning,
+    expand_tilde, load_peer_config, validate_forward_specs, validate_transport_tuning,
+    ConfigSource, ConnectRole, LocalForward, PeerConfig, RemoteForward, TransportTuning,
 };
 use crate::iroh_mode::endpoint::{
     load_secret, load_secret_from_string, secret_to_endpoint_id,
@@ -54,10 +62,6 @@ enum Command {
         /// Load config from default location (~/.config/duopipe/peer.toml)
         #[arg(long)]
         default_config: bool,
-
-        /// Read JSON config from stdin for automation/IPC (use -c for normal usage)
-        #[arg(long)]
-        config_stdin: bool,
 
         /// Connection role: "dial" (connect out) or "listen" (accept).
         #[arg(long)]
@@ -402,22 +406,15 @@ fn resolve_optional_secret(
 }
 
 /// Load peer config based on flags. Returns (config, source).
-async fn resolve_peer_config(
+fn resolve_peer_config(
     config: Option<PathBuf>,
     default_config: bool,
-    config_stdin: bool,
 ) -> Result<(PeerConfig, ConfigSource)> {
-    let source_count = config.is_some() as u8 + default_config as u8 + config_stdin as u8;
-    if source_count > 1 {
-        anyhow::bail!("Only one of -c/--config, --default-config, or --config-stdin may be used");
+    if config.is_some() && default_config {
+        anyhow::bail!("Only one of -c/--config or --default-config may be used");
     }
 
-    if config_stdin {
-        Ok((
-            parse_config_from_reader(std::io::stdin()).await?,
-            ConfigSource::Stdin,
-        ))
-    } else if let Some(path) = config {
+    if let Some(path) = config {
         Ok((load_peer_config(Some(&path))?, ConfigSource::File))
     } else if default_config {
         Ok((load_peer_config(None)?, ConfigSource::File))
@@ -451,24 +448,35 @@ async fn run() -> i32 {
 }
 
 async fn run_inner() -> Result<()> {
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .filter_module("duopipe", log::LevelFilter::Info)
-        .try_init();
-
     let args = Args::parse();
     let command = args.command;
+
+    // The `peer` command renders a TUI and captures logs into a ring buffer;
+    // every other command logs to the console as usual.
+    let log_buffer = if matches!(&command, Command::Peer { .. }) {
+        if !std::io::stdout().is_terminal() {
+            return Err(TunnelError::config(anyhow::anyhow!(
+                "duopipe peer requires an interactive terminal."
+            ))
+            .into());
+        }
+        Some(logging::init_tui_logger(LOG_CAPACITY).expect("logger not yet initialized"))
+    } else {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .filter_module("duopipe", log::LevelFilter::Info)
+            .try_init();
+        None
+    };
 
     match &command {
         Command::Peer {
             config,
             default_config,
-            config_stdin,
             relay_only,
             encryption_key_file,
             ..
         } => {
-            let (mut cfg, source) =
-                resolve_peer_config(config.clone(), *default_config, *config_stdin).await?;
+            let (mut cfg, source) = resolve_peer_config(config.clone(), *default_config)?;
 
             if source != ConfigSource::None {
                 cfg.validate(source).map_err(TunnelError::config)?;
@@ -586,7 +594,14 @@ async fn run_inner() -> Result<()> {
             validate_transport_tuning(&params.transport, "iroh.transport")
                 .map_err(TunnelError::config)?;
 
-            iroh_mode::run_peer(iroh_mode::PeerConfig {
+            let role = match connect {
+                ConnectRole::Dial => Role::Dial,
+                ConnectRole::Listen => Role::Listen,
+            };
+            let log_buffer = log_buffer.expect("peer command initializes the TUI log buffer");
+            let state = AppState::new(role, log_buffer);
+
+            let cfg = iroh_mode::PeerConfig {
                 connect,
                 peer_node_id: params.peer_node_id,
                 secret,
@@ -600,8 +615,32 @@ async fn run_inner() -> Result<()> {
                 dns_server: params.dns_server,
                 max_sessions: params.max_sessions,
                 transport: params.transport,
-            })
-            .await
+                status: state.clone(),
+            };
+
+            // Run the peer runtime alongside the TUI. The first to finish stops
+            // the other: a fatal runtime error tears down the TUI (restoring the
+            // terminal before the error prints); pressing `q` cancels the shared
+            // shutdown token so the runtime closes its endpoint cleanly.
+            let mut runtime = tokio::spawn(iroh_mode::run_peer(cfg));
+            let tui_fut = tui::run_tui(state.clone());
+            tokio::pin!(tui_fut);
+
+            tokio::select! {
+                r = &mut runtime => {
+                    state.shutdown.cancel();
+                    tui_fut.await;
+                    match r {
+                        Ok(inner) => inner,
+                        Err(e) => Err(anyhow::anyhow!("peer task failed: {e}")),
+                    }
+                }
+                _ = &mut tui_fut => {
+                    state.shutdown.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), runtime).await;
+                    Ok(())
+                }
+            }
         }
         Command::GenerateKey { output, force } => {
             secret::generate_secret(expand_tilde(output), *force)
