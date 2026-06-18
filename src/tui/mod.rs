@@ -17,7 +17,7 @@ use futures::StreamExt;
 use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, Role};
 use crate::config::{LocalForward, RemoteForward, TransportTuning};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
@@ -74,18 +74,36 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     // Phase 3: dashboard loop.
     let mut tick = tokio::time::interval(TICK);
     let mut ui_state = UiState::default();
+    // Listen + freshly generated token: show it once in a modal (with the node
+    // id) before the dashboard. For security the token is shown nowhere else.
+    let mut token_dialog = resolved.role == Role::Listen && resolved.token_generated;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 let snap = state.snapshot();
                 let logs = state.logs.snapshot();
-                let _ = terminal.draw(|f| ui::render(f, &snap, &logs, &ui_state));
+                let _ = terminal.draw(|f| {
+                    if token_dialog {
+                        ui::render_token_dialog(f, &snap);
+                    } else {
+                        ui::render(f, &snap, &logs, &ui_state);
+                    }
+                });
             }
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if handle_key(key, &mut ui_state, &state) {
+                        if token_dialog {
+                            // Any key dismisses the one-time token dialog; Ctrl-C quits.
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                state.shutdown.cancel();
+                                break;
+                            }
+                            token_dialog = false;
+                        } else if handle_key(key, &mut ui_state, &state) {
                             break;
                         }
                     }

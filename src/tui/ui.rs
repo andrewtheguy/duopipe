@@ -1,9 +1,9 @@
 //! Rendering for the duopipe TUI. Pure functions over an [`AppSnapshot`].
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::app_state::{
@@ -65,39 +65,86 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
             Span::raw(snap.path.describe()),
         ]));
     } else {
-        // Listen role: surface the ephemeral node id + token the dialer needs.
-        // Both change each run, so show the token plainly for copying. When the
-        // token was freshly generated (not from config), flag it so the user
-        // knows to copy it now along with the EndpointId above.
-        let token = snap.auth_token.as_deref().unwrap_or("(pending)");
-        let label = if snap.token_generated {
-            "token (generated — copy now): "
+        // Listen role: the node id (above) is ephemeral and stays visible so the
+        // dialer can copy it. The auth token is NOT shown here — for security it
+        // is displayed only once, in a startup dialog, when freshly generated.
+        let hint = if snap.token_generated {
+            "auth token was shown once at startup"
         } else {
-            "token: "
+            "auth token loaded from config"
         };
-        let token_color = if snap.token_generated {
-            Color::Yellow
-        } else {
-            Color::Cyan
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(token_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                token.to_string(),
-                Style::default()
-                    .fg(token_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
+}
+
+/// One-time startup modal showing the freshly generated auth token together with
+/// the node id to dial. Shown once for security — the token appears nowhere else.
+pub fn render_token_dialog(frame: &mut Frame, snap: &AppSnapshot) {
+    let node_id = snap.endpoint_id.as_deref().unwrap_or("(starting…)");
+    let token = snap.auth_token.as_deref().unwrap_or("(pending)");
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Generated auth token",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from("Copy both now — the token is shown only once, and both values change every run."),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("node id:  "),
+            Span::styled(node_id.to_string(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("token:    "),
+            Span::styled(
+                token.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Can't copy & paste here? Quit (Ctrl-C) and preconfigure auth_token in your config file.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Press any key to continue · Ctrl-C to quit",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let area = centered(frame.area(), 88, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" auth token (shown once) "),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Center a fixed-size area within `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [h] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [v] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(h);
+    v
 }
 
 fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
