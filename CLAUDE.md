@@ -8,7 +8,7 @@ on startup, whether to connect to an existing instance, then prompts for the nod
 id and (if not configured) the auth token.
 
 Non-interactive usage is supported only for testing purposes, driven by env vars:
-- `DUOPIPE_NONINTERACTIVE=1` skips the interactive prompts.
+- `DUOPIPE_NONINTERACTIVE=1` skips the interactive prompts (for testing only).
 - `DUOPIPE_PEER_NODE_ID=<id>` present ⇒ dial that node id; absent ⇒ listen.
 - `DUOPIPE_AUTH_TOKEN=<token>` is the shared auth token (required to dial; for
   listen it is used if set, otherwise one is generated).
