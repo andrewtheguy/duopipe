@@ -500,7 +500,7 @@ while true; do
     code=$?
     case $code in
         0)   echo "Clean exit"; break ;;
-        2|3) echo "Unrecoverable error (exit $code), not retrying"; exit $code ;;
+        2|3|4) echo "Unrecoverable error (exit $code), not retrying"; exit $code ;;
         10)
             if [ "$succeeded_before" = true ]; then
                 echo "Connection failed (previously connected), retrying in 5s..."
