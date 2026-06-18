@@ -25,7 +25,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::app_state::{AppState, ConnStatus, Role, TunnelCommand, TunnelRow, TunnelStatus};
+use crate::app_state::{AppState, ConnStatus, Role, TunnelCommand, TunnelStatus};
 use crate::auth::is_token_valid;
 use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
@@ -76,8 +76,6 @@ pub struct PeerConfig {
     pub role: Role,
     /// EndpointId of the peer to dial (required for `Dial`).
     pub peer_node_id: Option<EndpointId>,
-    /// Tunnel requests this peer can make of the peer (activated on demand).
-    pub requests: Vec<RequestEntry>,
     /// CIDR allowlist gating which of our sources the peer may request (fail-closed).
     pub allowed_sources: AllowedSources,
     /// When true, start every configured request as soon as a connection is up
@@ -109,7 +107,6 @@ impl std::fmt::Debug for PeerConfig {
         f.debug_struct("PeerConfig")
             .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
-            .field("requests", &self.requests)
             .field("allowed_sources", &self.allowed_sources)
             .field("autostart_requests", &self.autostart_requests)
             .field("auth_token", &"[REDACTED]")
@@ -316,7 +313,7 @@ async fn handle_connection(
         log::info!("Peer {} authenticated successfully", remote_id);
     }
 
-    seed_tunnel_rows(&config);
+    config.status.seed_tunnels_from_requests();
 
     let _path_watcher =
         watch_connection_paths(&conn, config.status.clone(), remote_id.to_string());
@@ -349,16 +346,15 @@ async fn handle_connection(
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
-        let requests = config.requests.clone();
         let status = config.status.clone();
         tasks.spawn(async move {
-            request_supervisor(conn, requests, semaphore, status, command_rx).await;
+            request_supervisor(conn, semaphore, status, command_rx).await;
         });
     }
 
     // Optionally autostart every configured request (non-interactive/test mode).
     if config.autostart_requests {
-        for i in 0..config.requests.len() {
+        for i in 0..config.status.request_count() {
             config.status.send_command(TunnelCommand::Start(i));
         }
     }
@@ -375,30 +371,13 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Seed the TUI tunnel table from this peer's configured requests. Rows are kept
-/// in config order so a row's position is its request index. All start Idle —
-/// nothing is active until started (by the user, or by autostart).
-fn seed_tunnel_rows(config: &PeerConfig) {
-    let rows = config
-        .requests
-        .iter()
-        .map(|r| TunnelRow {
-            name: r.name.clone(),
-            spec: format!("{} <- {}", r.local_listen, r.remote_source),
-            status: TunnelStatus::Idle,
-            detail: String::new(),
-        })
-        .collect();
-    config.status.set_tunnels(rows);
-}
-
 /// Supervise this peer's tunnel requests over one connection. Listens for
 /// [`TunnelCommand`]s and starts/stops each request, tracking a cancellation
 /// token per running request so a `Stop` (or the connection closing) frees the
-/// bound local port.
+/// bound local port. Requests are read live from [`AppState`] so runtime-added
+/// ones are visible without restarting the supervisor.
 async fn request_supervisor(
     conn: Arc<iroh::endpoint::Connection>,
-    requests: Vec<RequestEntry>,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
     mut command_rx: broadcast::Receiver<TunnelCommand>,
@@ -415,7 +394,7 @@ async fn request_supervisor(
                     if running.contains_key(&idx) {
                         continue; // already running
                     }
-                    let Some(req) = requests.get(idx).cloned() else { continue };
+                    let Some(req) = status.get_request(idx) else { continue };
                     let token = CancellationToken::new();
                     running.insert(idx, token.clone());
 

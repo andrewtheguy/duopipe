@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 use tokio::sync::{broadcast, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::RequestEntry;
 use crate::logging::LogBuffer;
 
 /// Capacity of the tunnel-command broadcast channel (commands are tiny; this
@@ -106,7 +107,7 @@ impl PathInfo {
 }
 
 /// Lifecycle status of a configured tunnel request.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TunnelStatus {
     /// Configured but not started (or stopped).
     Idle,
@@ -144,6 +145,17 @@ pub struct TunnelRow {
     pub detail: String,
 }
 
+/// Build the `Idle` tunnel row for a request (centralizes the spec format used by
+/// both seeding and runtime additions).
+fn tunnel_row_for(req: &RequestEntry) -> TunnelRow {
+    TunnelRow {
+        name: req.name.clone(),
+        spec: format!("{} <- {}", req.local_listen, req.remote_source),
+        status: TunnelStatus::Idle,
+        detail: String::new(),
+    }
+}
+
 /// A currently-connected, authenticated peer (listen role may have several).
 #[derive(Clone)]
 pub struct PeerRow {
@@ -167,6 +179,10 @@ pub struct AppState {
     conn_status: RwLock<ConnStatus>,
     path: RwLock<PathInfo>,
     peers: RwLock<Vec<PeerRow>>,
+    /// Authoritative tunnel-request list, seeded from config and appended to at
+    /// runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this, so a
+    /// row's position is its request index (used to start/stop it).
+    requests: RwLock<Vec<RequestEntry>>,
     tunnels: RwLock<Vec<TunnelRow>>,
     /// Live session limiter; `used = max - available_permits()`.
     semaphore: RwLock<Option<Arc<Semaphore>>>,
@@ -178,7 +194,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(role: Role, token_generated: bool, logs: Arc<LogBuffer>) -> Arc<Self> {
+    pub fn new(
+        role: Role,
+        token_generated: bool,
+        logs: Arc<LogBuffer>,
+        requests: Vec<RequestEntry>,
+    ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         Arc::new(Self {
             role,
@@ -189,6 +210,7 @@ impl AppState {
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
+            requests: RwLock::new(requests),
             tunnels: RwLock::new(Vec::new()),
             semaphore: RwLock::new(None),
             sessions_max: RwLock::new(0),
@@ -269,9 +291,34 @@ impl AppState {
         self.peers.write().retain(|p| p.remote_id != remote_id);
     }
 
-    /// Replace the tunnel table (called once per connection from its config).
-    pub fn set_tunnels(&self, tunnels: Vec<TunnelRow>) {
-        *self.tunnels.write() = tunnels;
+    /// Rebuild the tunnel table from the current request list (all `Idle`). Called
+    /// once per (re)connection; runtime additions persist because they live in
+    /// `requests`.
+    pub fn seed_tunnels_from_requests(&self) {
+        let rows = self.requests.read().iter().map(tunnel_row_for).collect();
+        *self.tunnels.write() = rows;
+    }
+
+    /// The request at `idx`, cloned (used by the connection supervisor on `Start`).
+    pub fn get_request(&self, idx: usize) -> Option<RequestEntry> {
+        self.requests.read().get(idx).cloned()
+    }
+
+    /// Number of tunnel requests (config + runtime-added).
+    pub fn request_count(&self) -> usize {
+        self.requests.read().len()
+    }
+
+    /// Append a new tunnel request at runtime and its matching `Idle` row. Returns
+    /// the new index. Appends only, so existing indices never shift.
+    pub fn add_request(&self, req: RequestEntry) -> usize {
+        let row = tunnel_row_for(&req);
+        let mut requests = self.requests.write();
+        let idx = requests.len();
+        requests.push(req);
+        drop(requests);
+        self.tunnels.write().push(row);
+        idx
     }
 
     /// Number of configured tunnel rows (used to clamp the TUI selection cursor).
@@ -326,4 +373,46 @@ pub struct AppSnapshot {
     pub tunnels: Vec<TunnelRow>,
     pub sessions_used: usize,
     pub sessions_max: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::LogBuffer;
+
+    fn req(name: &str, src: &str, listen: &str) -> RequestEntry {
+        RequestEntry {
+            name: name.into(),
+            remote_source: src.into(),
+            local_listen: listen.into(),
+        }
+    }
+
+    #[test]
+    fn add_request_appends_request_and_idle_row() {
+        let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed);
+        // Rows mirror the requests only after seeding.
+        state.seed_tunnels_from_requests();
+        assert_eq!(state.request_count(), 1);
+        assert_eq!(state.tunnel_count(), 1);
+
+        let idx = state.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
+        assert_eq!(idx, 1, "append returns the new index");
+        assert_eq!(state.request_count(), 2);
+        assert_eq!(state.tunnel_count(), 2);
+
+        // The request round-trips and the row is Idle with the right spec.
+        let got = state.get_request(idx).expect("request present");
+        assert_eq!(got.remote_source, "tcp://127.0.0.1:22");
+        let row = &state.snapshot().tunnels[idx];
+        assert_eq!(row.name, "ssh");
+        assert_eq!(row.spec, "127.0.0.1:2222 <- tcp://127.0.0.1:22");
+        assert_eq!(row.status, TunnelStatus::Idle);
+
+        // A second append keeps incrementing without shifting existing indices.
+        let idx2 = state.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
+        assert_eq!(idx2, 2);
+        assert_eq!(state.get_request(0).unwrap().name, "db");
+    }
 }

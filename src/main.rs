@@ -223,11 +223,15 @@ async fn run_peer_headless(
     autostart_requests: bool,
 ) -> Result<()> {
     let logs = logging::LogBuffer::new(LOG_CAPACITY);
-    let state = AppState::new(resolved.role, resolved.token_generated, logs);
+    let state = AppState::new(
+        resolved.role,
+        resolved.token_generated,
+        logs,
+        cfg.request.clone(),
+    );
     let peer_cfg = iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        requests: cfg.request.clone(),
         allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests,
         auth_token: resolved.auth_token,

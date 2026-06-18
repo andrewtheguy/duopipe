@@ -18,6 +18,28 @@ pub struct UiState {
     pub log_scroll: usize,
     /// Index of the highlighted tunnel row (toggled with Enter).
     pub selected: usize,
+    /// When `Some`, the "add request" modal is open and captures all keystrokes.
+    pub add_form: Option<AddRequestForm>,
+}
+
+/// Which field the "add request" modal is currently editing.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum AddField {
+    #[default]
+    Name,
+    RemoteSource,
+    LocalListen,
+}
+
+/// In-progress entry for a runtime-added tunnel request (modal state).
+#[derive(Default)]
+pub struct AddRequestForm {
+    pub field: AddField,
+    pub name: String,
+    pub remote_source: String,
+    pub local_listen: String,
+    /// Inline validation error from the last failed submit; cleared on next keypress.
+    pub error: Option<String>,
 }
 
 pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
@@ -138,6 +160,75 @@ pub fn render_token_dialog(frame: &mut Frame, snap: &AppSnapshot) {
     frame.render_widget(para, area);
 }
 
+/// Modal for adding a tunnel request at runtime. Three labeled fields; the active
+/// one carries a blinking block cursor. Mirrors the setup-screen input style.
+pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
+    let field_line = |label: &str, value: &str, active: bool| -> Line<'static> {
+        let mut spans = vec![Span::raw(format!("{label:<14}"))];
+        spans.push(Span::styled(value.to_string(), Style::default().fg(Color::Cyan)));
+        if active {
+            spans.push(Span::styled(
+                "█",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        Line::from(spans)
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Add tunnel request",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        field_line("name:", &form.name, form.field == AddField::Name),
+        field_line(
+            "remote_source:",
+            &form.remote_source,
+            form.field == AddField::RemoteSource,
+        ),
+        field_line(
+            "local_listen:",
+            &form.local_listen,
+            form.field == AddField::LocalListen,
+        ),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "remote_source: tcp:// or udp://host:port   local_listen: host:port   (name optional)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    if let Some(err) = &form.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Tab/Enter next field · Enter on local_listen adds & starts · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let area = centered(frame.area(), 88, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" add request "),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
 /// Center a fixed-size area within `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [h] = Layout::horizontal([Constraint::Length(width.min(area.width))])
@@ -171,7 +262,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
     let table = Table::new(rows, widths).header(header).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Tunnels  [↑/↓ select · Enter start/stop] "),
+            .title(" Tunnels  [↑/↓ select · Enter start/stop · a add] "),
     );
     frame.render_widget(table, area);
 }

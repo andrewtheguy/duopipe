@@ -17,12 +17,14 @@ use futures::StreamExt;
 use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::app_state::{AppSnapshot, AppState, Role};
-use crate::config::{AllowedSources, RequestEntry, TransportTuning};
+use crate::app_state::{AppSnapshot, AppState, Role, TunnelCommand};
+use crate::config::{
+    validate_request_specs, AllowedSources, RequestEntry, TransportTuning,
+};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use setup::{SetupOutcome, SetupState, Step};
-use ui::UiState;
+use ui::{AddField, AddRequestForm, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
@@ -75,7 +77,12 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     };
 
     // Phase 2: build state + spawn the runtime.
-    let state = AppState::new(resolved.role, resolved.token_generated, launch.logs.clone());
+    let state = AppState::new(
+        resolved.role,
+        resolved.token_generated,
+        launch.logs.clone(),
+        launch.requests.clone(),
+    );
     let cfg = build_peer_config(&resolved, &launch, state.clone());
     let mut runtime = tokio::spawn(crate::iroh_mode::run_peer(cfg));
 
@@ -96,6 +103,9 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                         ui::render_token_dialog(f, &snap);
                     } else {
                         ui::render(f, &snap, &logs, &ui_state);
+                        if let Some(form) = &ui_state.add_form {
+                            ui::render_add_request_dialog(f, form);
+                        }
                     }
                 });
             }
@@ -147,7 +157,6 @@ fn build_peer_config(
     crate::iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        requests: launch.requests.clone(),
         allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests: launch.autostart_requests,
         auth_token: resolved.auth_token.clone(),
@@ -196,8 +205,20 @@ async fn run_setup(
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
 ///
 /// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
-/// stop the selected tunnel. Logs scroll with `PageUp`/`PageDown` and `[`/`]`.
+/// stop the selected tunnel; `a` opens the add-request modal. Logs scroll with
+/// `PageUp`/`PageDown` and `[`/`]`.
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
+    // Ctrl-C always quits, even with the add-request modal open.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.shutdown.cancel();
+        return true;
+    }
+    // While the modal is open it captures all other keys (so `q`/`j`/`k` are text).
+    if ui.add_form.is_some() {
+        handle_add_form(key, ui, state);
+        return false;
+    }
+
     let total = state.logs.len();
     let tunnels = state.tunnel_count();
     match key.code {
@@ -205,9 +226,8 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
             state.shutdown.cancel();
             return true;
         }
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.shutdown.cancel();
-            return true;
+        KeyCode::Char('a') => {
+            ui.add_form = Some(AddRequestForm::default());
         }
         KeyCode::Up | KeyCode::Char('k') => {
             ui.selected = ui.selected.saturating_sub(1);
@@ -243,6 +263,91 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         _ => {}
     }
     false
+}
+
+/// Accept printable ASCII for the address fields (no spaces); `name` also allows
+/// spaces as a free-form label.
+fn is_field_char(c: char, field: AddField) -> bool {
+    c.is_ascii_graphic() || (c == ' ' && field == AddField::Name)
+}
+
+/// Handle a key while the add-request modal is open. Tab/Enter advance the field;
+/// Enter on the last field validates and (on success) adds + auto-starts the
+/// request. Esc cancels.
+fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
+    let Some(form) = ui.add_form.as_mut() else {
+        return;
+    };
+    form.error = None;
+    match key.code {
+        KeyCode::Esc => {
+            ui.add_form = None;
+        }
+        KeyCode::Tab => {
+            form.field = match form.field {
+                AddField::Name => AddField::RemoteSource,
+                AddField::RemoteSource => AddField::LocalListen,
+                AddField::LocalListen => AddField::Name,
+            };
+        }
+        KeyCode::Enter => match form.field {
+            AddField::Name => form.field = AddField::RemoteSource,
+            AddField::RemoteSource => form.field = AddField::LocalListen,
+            AddField::LocalListen => submit_add_form(ui, state),
+        },
+        KeyCode::Backspace => match form.field {
+            AddField::Name => {
+                form.name.pop();
+            }
+            AddField::RemoteSource => {
+                form.remote_source.pop();
+            }
+            AddField::LocalListen => {
+                form.local_listen.pop();
+            }
+        },
+        KeyCode::Char(c) if is_field_char(c, form.field) => match form.field {
+            AddField::Name => form.name.push(c),
+            AddField::RemoteSource => form.remote_source.push(c),
+            AddField::LocalListen => form.local_listen.push(c),
+        },
+        _ => {}
+    }
+}
+
+/// Validate the modal's fields and, on success, append the request to `AppState`
+/// and dispatch a `Start` so it auto-starts. A blank `name` falls back to the
+/// `remote_source` string as the row label.
+///
+/// `Start` is broadcast: if currently disconnected there's no supervisor to
+/// receive it, so the row stays Idle until started (consistent with config
+/// requests after a reconnect).
+fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
+    let Some(form) = ui.add_form.as_mut() else {
+        return;
+    };
+    let remote_source = form.remote_source.trim().to_string();
+    let name = if form.name.trim().is_empty() {
+        remote_source.clone()
+    } else {
+        form.name.trim().to_string()
+    };
+    let req = RequestEntry {
+        name,
+        remote_source,
+        local_listen: form.local_listen.trim().to_string(),
+    };
+    match validate_request_specs(std::slice::from_ref(&req)) {
+        Ok(()) => {
+            let idx = state.add_request(req);
+            state.send_command(TunnelCommand::Start(idx));
+            ui.selected = idx;
+            ui.add_form = None;
+        }
+        Err(e) => {
+            form.error = Some(e.to_string());
+        }
+    }
 }
 
 /// Write the current connection info to a timestamped file in the system temp
@@ -310,4 +415,79 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
 
     std::fs::write(&path, out)?;
     Ok(path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyCode;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn state() -> Arc<AppState> {
+        AppState::new(Role::Dial, false, LogBuffer::new(16), Vec::new())
+    }
+
+    fn type_str(ui: &mut UiState, st: &Arc<AppState>, s: &str) {
+        for c in s.chars() {
+            handle_add_form(key(KeyCode::Char(c)), ui, st);
+        }
+    }
+
+    #[test]
+    fn add_form_valid_submit_appends_and_closes() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddRequestForm::default()),
+            ..Default::default()
+        };
+        type_str(&mut ui, &st, "ssh");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> RemoteSource
+        type_str(&mut ui, &st, "tcp://127.0.0.1:22");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
+        type_str(&mut ui, &st, "127.0.0.1:2222");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
+
+        assert!(ui.add_form.is_none(), "form closes on successful submit");
+        assert_eq!(st.request_count(), 1);
+        assert_eq!(ui.selected, 0);
+        let req = st.get_request(0).unwrap();
+        assert_eq!(req.name, "ssh");
+        assert_eq!(req.remote_source, "tcp://127.0.0.1:22");
+        assert_eq!(req.local_listen, "127.0.0.1:2222");
+    }
+
+    #[test]
+    fn add_form_invalid_source_keeps_form_open_with_error() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddRequestForm::default()),
+            ..Default::default()
+        };
+        // Skip name; bad remote_source (missing scheme); any local_listen.
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // Name -> RemoteSource
+        type_str(&mut ui, &st, "127.0.0.1:22"); // no tcp:// scheme
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
+        type_str(&mut ui, &st, "127.0.0.1:2222");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit -> error
+
+        let form = ui.add_form.as_ref().expect("form stays open on error");
+        assert!(form.error.is_some());
+        assert_eq!(st.request_count(), 0, "no request added on invalid input");
+    }
+
+    #[test]
+    fn add_form_esc_cancels() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddRequestForm::default()),
+            ..Default::default()
+        };
+        type_str(&mut ui, &st, "x");
+        handle_add_form(key(KeyCode::Esc), &mut ui, &st);
+        assert!(ui.add_form.is_none());
+        assert_eq!(st.request_count(), 0);
+    }
 }
