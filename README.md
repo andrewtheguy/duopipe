@@ -36,7 +36,7 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 
 ## Overview
 
-duopipe runs as a single symmetric command: `duopipe peer`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
+duopipe runs as a single symmetric command: `duopipe start`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
@@ -228,14 +228,14 @@ For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe peer` on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
+duopipe is **interactive-first**: you run `duopipe start` on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
 
 ### 1. Start the listening instance
 
 On the first machine, point at a config that declares the requests (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
-duopipe peer -c ./peer.toml
+duopipe start -c ./peer.toml
 ```
 
 When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step.
@@ -247,7 +247,7 @@ When the TUI asks **"Connect to an existing instance?"**, answer **No**. This in
 On the second machine (also pointed at a config that declares its requests):
 
 ```bash
-duopipe peer -c ./peer.toml
+duopipe start -c ./peer.toml
 ```
 
 When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. It prompts for the listener's **node id**, and for the **auth token** if one isn't already in config or the `DUOPIPE_AUTH_TOKEN` env var. Both are validated before connecting.
@@ -303,9 +303,9 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ## CLI Options
 
-### peer
+### start
 
-`duopipe peer` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
+`duopipe start` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -410,10 +410,10 @@ tcp = ["127.0.0.0/8"]
 
 ```bash
 # Load from default location (~/.config/duopipe/peer.toml)
-duopipe peer --default-config
+duopipe start --default-config
 
 # Load from custom path
-duopipe peer -c ./my-peer.toml
+duopipe start -c ./my-peer.toml
 ```
 
 ---
@@ -489,34 +489,6 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 | 4 | Rejected: the listener's session is bound to a different node id | No — unbind/restart the listener, or dial from the bound node |
 | 10 | Connection establishment failed (timeout, relay failure, peer unreachable) | Only if it worked before |
 | 11 | Connection lost after tunnels were established | Yes — always retry |
-
-Example retry wrapper script (useful for the dialing peer):
-
-```bash
-#!/bin/bash
-succeeded_before=false
-while true; do
-    duopipe peer --default-config
-    code=$?
-    case $code in
-        0)   echo "Clean exit"; break ;;
-        2|3|4) echo "Unrecoverable error (exit $code), not retrying"; exit $code ;;
-        10)
-            if [ "$succeeded_before" = true ]; then
-                echo "Connection failed (previously connected), retrying in 5s..."
-                sleep 5
-            else
-                echo "Never connected successfully (exit 10), not retrying"
-                exit $code
-            fi
-            ;;
-        11)  succeeded_before=true
-             echo "Connection lost, retrying in 5s..."
-             sleep 5 ;;
-        *)   echo "Unexpected error (exit $code), retrying in 10s..."; sleep 10 ;;
-    esac
-done
-```
 
 ## How It Works
 

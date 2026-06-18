@@ -294,21 +294,35 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
             ui.add_form = None;
         }
         KeyCode::Tab => {
-            form.field = match form.field {
-                AddField::Name => AddField::RemoteSource,
-                AddField::RemoteSource => AddField::LocalListen,
-                AddField::LocalListen => AddField::Name,
-            };
+            form.field = next_field(form.field);
         }
         KeyCode::Enter => match form.field {
-            AddField::Name => form.field = AddField::RemoteSource,
-            AddField::RemoteSource => form.field = AddField::LocalListen,
             AddField::LocalListen => submit_add_form(ui, state),
+            other => form.field = next_field(other),
         },
+        // The protocol selector is a toggle, not a text field.
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            if form.field == AddField::Protocol =>
+        {
+            form.protocol = form.protocol.toggled();
+        }
         _ => {
             let field = form.field;
-            handle_edit(form.active_mut(), key, |c| is_field_char(c, field));
+            // Ignore text keystrokes while the protocol selector is focused.
+            if let Some(input) = form.active_mut() {
+                handle_edit(input, key, |c| is_field_char(c, field));
+            }
         }
+    }
+}
+
+/// The field reached by Tab / Enter from `field`, cycling back to the top.
+fn next_field(field: AddField) -> AddField {
+    match field {
+        AddField::Name => AddField::Protocol,
+        AddField::Protocol => AddField::RemoteSource,
+        AddField::RemoteSource => AddField::LocalListen,
+        AddField::LocalListen => AddField::Name,
     }
 }
 
@@ -323,7 +337,9 @@ fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
     };
-    let remote_source = form.remote_source.value().trim().to_string();
+    // The user types only `host:port`; the selected protocol supplies the scheme.
+    let host_port = form.remote_source.value().trim();
+    let remote_source = format!("{}://{host_port}", form.protocol.scheme());
     let name = if form.name.value().trim().is_empty() {
         remote_source.clone()
     } else {
@@ -437,8 +453,9 @@ mod tests {
             ..Default::default()
         };
         type_str(&mut ui, &st, "ssh");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> Protocol (defaults tcp)
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> RemoteSource
-        type_str(&mut ui, &st, "tcp://127.0.0.1:22");
+        type_str(&mut ui, &st, "127.0.0.1:22"); // host:port only, scheme is implicit
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
         type_str(&mut ui, &st, "127.0.0.1:2222");
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
@@ -453,15 +470,37 @@ mod tests {
     }
 
     #[test]
+    fn add_form_protocol_selection_sets_udp_scheme() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddRequestForm::default()),
+            ..Default::default()
+        };
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // Name -> Protocol
+        // Toggle the protocol selector from the default tcp to udp.
+        handle_add_form(key(KeyCode::Right), &mut ui, &st);
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> RemoteSource
+        type_str(&mut ui, &st, "127.0.0.1:53");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
+        type_str(&mut ui, &st, "127.0.0.1:5353");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
+
+        assert!(ui.add_form.is_none());
+        let req = st.get_request(0).unwrap();
+        assert_eq!(req.remote_source, "udp://127.0.0.1:53");
+    }
+
+    #[test]
     fn add_form_invalid_source_keeps_form_open_with_error() {
         let st = state();
         let mut ui = UiState {
             add_form: Some(AddRequestForm::default()),
             ..Default::default()
         };
-        // Skip name; bad remote_source (missing scheme); any local_listen.
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // Name -> RemoteSource
-        type_str(&mut ui, &st, "127.0.0.1:22"); // no tcp:// scheme
+        // Skip name; bad remote_source (host without a port); any local_listen.
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // Name -> Protocol
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> RemoteSource
+        type_str(&mut ui, &st, "127.0.0.1"); // missing :port
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
         type_str(&mut ui, &st, "127.0.0.1:2222");
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit -> error

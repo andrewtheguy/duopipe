@@ -3,7 +3,7 @@ run cargo clippy and cargo test -q after making changes.
 no cargo fmt
 
 # Usage model
-This project is meant for interactive usage: `duopipe peer` runs a TUI that asks,
+This project is meant for interactive usage: `duopipe start` runs a TUI that asks,
 on startup, whether to connect to an existing instance, then prompts for the node
 id and (if not configured) the auth token.
 
