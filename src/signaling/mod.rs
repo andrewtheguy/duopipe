@@ -8,10 +8,8 @@ pub use codec::{
     AuthRequest, AuthResponse,
 };
 
-// Per-stream dispatch and remote-forward negotiation.
+// Per-stream dispatch.
 pub use codec::{
-    decode_remote_forward_request, decode_remote_forward_response, decode_stream_ack,
-    decode_stream_hello, encode_remote_forward_request, encode_remote_forward_response,
-    encode_stream_ack, encode_stream_hello, read_length_prefixed, RemoteForwardRequest,
-    RemoteForwardResponse, StreamAck, StreamHello,
+    decode_stream_ack, decode_stream_hello, encode_stream_ack, encode_stream_hello,
+    read_length_prefixed, StreamAck, StreamHello,
 };

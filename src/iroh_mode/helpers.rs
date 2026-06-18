@@ -73,23 +73,36 @@ pub(super) async fn bridge_streams(
     tune_tcp_stream(&tcp_stream);
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
-    tokio::select! {
-        result = copy_quic_to_tcp(&mut quic_recv, &mut tcp_write) => {
-            if let Err(e) = result
-                && !e.to_string().contains("reset") {
-                    log::warn!("QUIC->TCP error: {}", e);
-                }
-        }
-        result = copy_tcp_to_quic(&mut tcp_read, &mut quic_send) => {
-            if let Err(e) = result
-                && !e.to_string().contains("reset") {
-                    log::warn!("TCP->QUIC error: {}", e);
-                }
+    // Bridge both directions to completion (not `select!`, which would cancel one
+    // direction the instant the other reaches EOF). With a half-close — e.g. a
+    // client that sends a request then shuts down its write half — the TCP->QUIC
+    // direction finishes first; cancelling QUIC->TCP there would drop the peer's
+    // response before it arrives. Each direction independently signals EOF on its
+    // output when its input ends, so half-open connections are preserved. The
+    // halves are disjoint (tcp_read+quic_send vs quic_recv+tcp_write), so the two
+    // futures never alias.
+    let tcp_to_quic = async {
+        let result = copy_tcp_to_quic(&mut tcp_read, &mut quic_send).await;
+        // Tell the peer we're done sending so it can observe EOF and finish its
+        // own response.
+        let _ = quic_send.finish();
+        result
+    };
+    let quic_to_tcp = async {
+        let result = copy_quic_to_tcp(&mut quic_recv, &mut tcp_write).await;
+        // Propagate EOF (FIN) to the local TCP peer once the QUIC side is done.
+        let _ = tcp_write.shutdown().await;
+        result
+    };
+
+    let (up, down) = tokio::join!(tcp_to_quic, quic_to_tcp);
+    for result in [up, down] {
+        if let Err(e) = result
+            && !e.to_string().contains("reset")
+        {
+            log::warn!("bridge error: {}", e);
         }
     }
-
-    // Signal EOF on the QUIC send stream for graceful shutdown
-    let _ = quic_send.finish();
 
     Ok(())
 }

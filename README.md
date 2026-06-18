@@ -8,12 +8,12 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 > **Project Goal:** This tool provides a convenient way to connect to different networks for **development or homelab purposes** without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale.
 
 > [!WARNING]
-> **No Backward Compatibility (Pre-1.0):** During initial development before version 1.0, no backward compatibility or migration path is provided between minor versions (e.g., 0.1.x to 0.2.x). Expect to regenerate peer keys and rebuild peer configurations when upgrading in between minor versions.
+> **No Backward Compatibility (Pre-1.0):** During initial development before version 1.0, no backward compatibility or migration path is provided between minor versions (e.g., 0.1.x to 0.2.x). Expect to regenerate tokens and rebuild peer configurations when upgrading in between minor versions.
 
 **Features:**
 - **No account or registration required** — Just download and run
 - **No publicly accessible IPs or port forwarding required** — Automatic NAT hole punching
-- **One connection, many tunnels in both directions** — A single P2P link carries any number of local (`-L`) and remote (`-R`) forwards at once
+- **One connection, many tunnels in both directions** — A single P2P link carries any number of requested tunnels at once, in either direction
 - **Full TCP and UDP support** — Seamlessly tunnel any TCP or UDP traffic
 - **Cross-platform** — Works on Linux, macOS, and Windows
 - **No root required** — Runs as unprivileged user
@@ -36,27 +36,31 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 
 ## Overview
 
-duopipe runs as a single symmetric command: `duopipe peer`. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once** — combining SSH's `-L` (local forward) and `-R` (remote forward).
+duopipe runs as a single symmetric command: `duopipe peer`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
 
-Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
+On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
-- One peer **listens** — it carries a stable identity key so it can be dialed, and accepts auth tokens.
-- One peer **dials** — it presents an auth token and may use an ephemeral identity.
+- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to the other side.
+- Answer **Yes** → this peer **dials**. The TUI prompts for the existing instance's node id, and for the auth token if one isn't already in config or the environment. Both are validated (node id parse, auth-token CRC16) before connecting.
 
-Once the connection is established and authenticated, tunnels flow both ways: **either** peer may declare local and remote forwards. iroh provides NAT traversal with relay fallback and automatic discovery.
+> **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
+
+Once the connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
 
-### Forwards at a glance
+### Tunnel requests at a glance
 
-| Type | SSH analog | CLI | Behavior |
-|------|-----------|-----|----------|
-| Local forward | `-L` | `-L LISTEN=DEST` | **This** peer listens locally; the **other** peer connects out to `DEST`. The `DEST` scheme (`tcp://` / `udp://`) selects the protocol. |
-| Remote forward | `-R` | `-R BIND=DEST` | The **other** peer binds `BIND` and forwards connections back to **our** local `DEST`. The `BIND` scheme (`tcp://` / `udp://`) selects the protocol. |
+Every tunnel is a **request** (SSH `-L`–style, pull direction): a peer declares `[[request]]` entries in config, and activating one binds a local listener and asks the other peer to connect out to a remote source.
 
-Both TCP and UDP are supported in both directions and may be freely mixed on the same connection. Forward flags are repeatable.
+| Field | Meaning |
+|-------|---------|
+| `remote_source` | Origin on the **other** peer to connect out to (`tcp://host:port` or `udp://host:port`; the scheme selects the protocol). |
+| `local_listen` | Local address on **this** peer where the tunnel is exposed (`host:port`). |
 
-> **Note:** UDP `-R` (remote forward) uses a single-peer-address reply model. This is fine for single-client UDP services.
+To expose one of **your** services, the **other** peer requests it from you — there is no separate "remote forward". The serving side gates every incoming request against its `[allowed_sources]` CIDR allowlist (separate `tcp` / `udp` lists), which is **fail-closed**: an empty or absent list rejects every request. Both TCP and UDP are supported and may be mixed on one connection. Nothing forwards until you start a request in the TUI.
+
+> **Note:** UDP requests use a single-peer-address reply model. This is fine for single-client UDP services.
 
 ## Installation
 
@@ -118,7 +122,7 @@ cargo install --path .
 
 ### Feature Flags
 
-Relay-only is a **CLI-only** flag that forces connections through relay servers instead of attempting direct connections. It is intended for testing or special scenarios and is **not supported in config files** to avoid accidental activation. See `duopipe --help` for usage.
+Relay-only (`relay_only`) is a **config bool** that forces connections through relay servers instead of attempting direct connections. It is intended for testing or special scenarios and requires at least one `relay_urls` entry. Set it in the config file (see [Configuration Files](#configuration-files)).
 
 ### Supported Platforms
 
@@ -137,49 +141,15 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The **listening** peer needs a stable identity so the dialing peer can reach it. Generate a persistent key and reference it via `--secret-file`:
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The consequence is that the **listening** peer's **node id changes every run**: the TUI displays the current node id in its header, and you must copy it to the dialing peer each time you start a session.
 
-```bash
-# Generate key and output EndpointId
-duopipe generate-key --output ./peer.key
-
-# Show EndpointId for existing key
-duopipe show-id --secret-file ./peer.key
-```
-
-Then reference the key when listening:
-
-**CLI** (tokens saved to files — recommended):
-```bash
-# Save tokens to files with restricted permissions
-echo "$AUTH_TOKEN" > auth_tokens.txt && chmod 600 auth_tokens.txt
-echo "$ALPN_TOKEN" > alpn_token.txt && chmod 600 alpn_token.txt
-
-duopipe peer \
-  --connect listen \
-  --secret-file ./peer.key \
-  --auth-tokens-file ./auth_tokens.txt \
-  --alpn-token-file ./alpn_token.txt
-```
-
-> **Tip:** For containers and automation scripts, use environment variables (`DUOPIPE_AUTH_TOKENS`, `DUOPIPE_ALPN_TOKEN`) instead of files. See the environment variable table below.
-
-**Config file** (`peer.toml`):
-```toml
-connect = "listen"
-secret_file = "./peer.key"
-```
-
-> **Note:** The dialing peer may use an ephemeral identity. Only the listening peer needs a persistent key to maintain a stable EndpointId that the dialer can connect to.
-
-> **Note:** The age encryption key (`config-encryption generate-key`) is different from the peer identity key (`generate-key`). The peer key establishes a stable EndpointId for P2P connections. The encryption key protects secrets stored in config files.
+> **Note:** There is no `config-encryption` overlap to worry about here. The age encryption key (`config-encryption generate-key`) only protects secrets stored in config files; it has nothing to do with the peer's network identity.
 
 ## Authentication
 
-A peer connection is gated by two pre-shared secrets:
+A peer connection is gated by a single pre-shared **auth token**, shared by **both** peers. The dialing peer presents it; the listening peer accepts exactly that one token.
 
-1. An **ALPN token**, shared by **both** peers, embedded in the QUIC ALPN identifier — a lightweight "port knock" rejected before any stream opens.
-2. An **auth token** that the **dialing** peer presents; the **listening** peer accepts a configured set of tokens.
+> **Note:** The QUIC ALPN identifier is a fixed constant (`mf/2`). It is no longer used for access control — authentication is solely via the shared auth token.
 
 **Auth Token Format:**
 - Exactly 47 characters
@@ -190,66 +160,45 @@ A peer connection is gated by two pre-shared secrets:
 The CRC16 checksum detects all single-byte errors in the token payload.
 
 Generate auth tokens with: `duopipe generate-auth-token`
-Generate the ALPN token with: `duopipe generate-alpn-token`
 
 > [!IMPORTANT]
-> **Full trust after auth.** Once the ALPN token (QUIC handshake "port knock") and the connection-level auth token both pass, the peer is **fully trusted**. There are no per-destination allowlists — a trusted peer may declare forwards to any destination either side can reach. Only share tokens with peers you trust.
+> **Trust after auth, gated by the source allowlist.** Once the connection-level auth token passes, the peer may *request* tunnels, but when it asks us to connect out to one of our sources we only honor addresses inside our `[allowed_sources]` CIDR lists. This is **fail-closed**: an empty or absent allowlist rejects every incoming request. Requests are also activated interactively — nothing forwards until you start it. Only share the token with peers you trust, and keep `[allowed_sources]` as narrow as possible.
 
 ### Token Management
+
+When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token
 AUTH_TOKEN=$(duopipe generate-auth-token)
-echo $AUTH_TOKEN  # Share this with the dialing peer
+echo $AUTH_TOKEN  # The shared token — both peers use this one value
 
 # Generate multiple tokens
 duopipe generate-auth-token -c 5
 ```
 
-### Multiple Tokens (Listening Peer)
-
-The listening peer can accept several tokens, one per authorized dialer:
-
-```bash
-# Use a file with one token per line (recommended)
-duopipe peer --connect listen \
-  --secret-file ./peer.key \
-  --auth-tokens-file /etc/duopipe/auth_tokens.txt \
-  --alpn-token-file ./alpn_token.txt
-
-# Or comma-separated via environment variable (for containers/automation)
-export DUOPIPE_AUTH_TOKENS="token-for-alice,token-for-bob"
-duopipe peer --connect listen --secret-file ./peer.key
-```
-
-**Example `auth_tokens.txt`:**
-```text
-# Alice's token (generate with: duopipe generate-auth-token)
-iXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-
-# Bob's token
-iYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY
-```
+The same token is used by **both** sides: the listener accepts it, and the dialer presents it.
 
 ### Configuration File
 
-> **Security:** Plaintext tokens and secrets are **not allowed** in TOML config files. Use the `_file` variants (e.g., `auth_tokens_file`, `auth_token_file`, `alpn_token_file`, `secret_file`) in config files. For non-containerized deployments, `_file` variants are the recommended approach. Environment variables (`DUOPIPE_*`) are best suited for containers and automation scripts where secrets are injected dynamically. Plaintext values are also accepted via `--config-stdin` (JSON) for IPC.
+> **Security:** A plaintext `auth_token` is **not allowed** in TOML config files. Use `auth_token_file`, set the `DUOPIPE_AUTH_TOKEN` environment variable, or embed the token directly with an [age-encrypted inline value](#encrypted-config-values).
 
-**Listening peer** (`peer.toml`):
+A minimal config is essentially the requests you can make, the sources you'll expose, plus an optional shared token (`peer.toml`):
 ```toml
-connect = "listen"
-secret_file = "./peer.key"
-auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
-alpn_token_file = "/etc/duopipe/alpn_token.txt"
+auth_token_file = "/etc/duopipe/auth_token.txt"
+
+# A tunnel we can request: bind locally, ask the peer to reach its source.
+[[request]]
+name = "db"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
+
+# What the peer is allowed to request of us (fail-closed if omitted).
+[allowed_sources]
+tcp = ["127.0.0.0/8"]
 ```
 
-**Dialing peer** (`peer.toml`):
-```toml
-connect = "dial"
-peer_node_id = "<ENDPOINT_ID>"
-auth_token_file = "~/.config/duopipe/token.txt"
-alpn_token_file = "~/.config/duopipe/alpn_token.txt"
-```
+The connection role (listen vs dial) and the dialer's target node id are chosen **interactively** in the TUI, not in the config file. Requests are started/stopped from the TUI too — nothing forwards automatically.
 
 ---
 
@@ -257,163 +206,129 @@ alpn_token_file = "~/.config/duopipe/alpn_token.txt"
 
 ## Architecture
 
-A single iroh connection carries forwards in both directions. For example, an SSH local forward (`-L`) declared by the dialing peer:
+A single iroh connection carries requested tunnels. Each side *requests* a tunnel: it binds a local listener and asks the peer to connect out to a remote source. For example, a request for the peer's SSH server:
 
 ```
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
-| SSH Client      |  TCP   | dialing peer    |  iroh  | listening peer  |  TCP   | SSH Server      |
-|                 |<------>| -L (local:2222) |<======>|                 |<------>| (peer connects) |
+| SSH Client      |  TCP   | requesting peer |  iroh  | serving peer    |  TCP   | SSH Server      |
+|                 |<------>| listen :2222    |<======>| (allowlist gate)|<------>| source :22      |
 |                 |        |                 |  QUIC  |                 |        |                 |
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-The same connection may simultaneously carry a remote forward (`-R`) running the opposite direction, plus any number of additional TCP/UDP forwards declared by either side.
+The same connection may simultaneously carry requests in the opposite direction (the peer requesting our sources, gated by our `[allowed_sources]`), plus any number of additional TCP/UDP requests from either side.
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick Start
 
-### 1. Setup (One-Time)
+duopipe is **interactive-first**: you run `duopipe peer` on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
 
-On the listening machine, generate an identity key. On either machine, create the shared tokens:
+### 1. Start the listening instance
+
+On the first machine, point at a config that declares the requests (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
-# On the listening machine - generate persistent identity
-duopipe generate-key --output ./peer.key
-# Output: EndpointId: 2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga
-
-# Create a shared authentication token (the dialing peer presents this)
-AUTH_TOKEN=$(duopipe generate-auth-token)
-echo $AUTH_TOKEN
-
-# Create an ALPN token (shared between both peers)
-ALPN_TOKEN=$(duopipe generate-alpn-token)
-echo $ALPN_TOKEN
+duopipe peer -c ./peer.toml
 ```
 
-### 2. Complete Example (one `-L` and one `-R`)
+When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step.
 
-**On the listening machine** (waits for the dialer to connect):
+> **Important:** The node id is regenerated on every run (the identity is ephemeral), so re-copy it each time you start the listener.
+
+### 2. Start the dialing instance
+
+On the second machine (also pointed at a config that declares its requests):
+
 ```bash
-duopipe generate-key --output peer.key
-duopipe show-id --secret-file peer.key        # prints <ENDPOINT_ID>
-
-DUOPIPE_AUTH_TOKENS=<token> DUOPIPE_ALPN_TOKEN=<alpn> \
-  duopipe peer --connect listen --secret-file peer.key
+duopipe peer -c ./peer.toml
 ```
 
-Output:
-```
-EndpointId: 2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga
-Auth tokens: 1 token(s) configured
-Waiting for a peer to connect...
-```
+When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. It prompts for the listener's **node id**, and for the **auth token** if one isn't already in config or the `DUOPIPE_AUTH_TOKEN` env var. Both are validated before connecting.
 
-**On the dialing machine** (declares the forwards):
-```bash
-DUOPIPE_AUTH_TOKEN=<token> DUOPIPE_ALPN_TOKEN=<alpn> \
-  duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
-  -L 127.0.0.1:15678=tcp://127.0.0.1:5678 \
-  -R tcp://0.0.0.0:6574=127.0.0.1:6574
+Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
+
+```toml
+[[request]]
+name = "db"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 ```
 
-In this example:
-- `-L 127.0.0.1:15678=tcp://127.0.0.1:5678` — the dialing peer listens on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678` reached by the **listening** peer.
-- `-R tcp://0.0.0.0:6574=127.0.0.1:6574` — the **listening** peer binds `tcp://0.0.0.0:6574`; connections there are forwarded back to `127.0.0.1:6574` on the **dialing** peer.
+- This request makes **this** peer listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **other** peer connects out to (subject to its `[allowed_sources]`).
+- To expose a service running on **this** peer instead, the **other** peer adds the matching `[[request]]` and you list that source in **your** `[allowed_sources]`.
 
-Either peer may declare its own `-L`/`-R` forwards; they all share the one connection.
+Either peer may declare its own requests; they all share the one connection and are started/stopped independently in the TUI.
 
-> **Tip:** For containers and automation scripts, use environment variables (`DUOPIPE_AUTH_TOKEN`, `DUOPIPE_AUTH_TOKENS`, `DUOPIPE_ALPN_TOKEN`, etc.) instead of files. See the environment variable tables below.
+### 3. SSH over a requested tunnel
 
-### 3. SSH over a local forward
-
-With the dialer's `-L 127.0.0.1:2222=tcp://127.0.0.1:22` (listening peer reaches the SSH server):
+With a `[[request]]` of `remote_source = "tcp://127.0.0.1:22"`, `local_listen = "127.0.0.1:2222"` (the other peer reaches the SSH server, and allows `127.0.0.0/8` in `[allowed_sources]`):
 
 ```bash
 ssh -p 2222 user@127.0.0.1
 ```
 
-### 4. UDP forward (e.g., WireGuard/Game/DNS)
+### 4. UDP request (e.g., WireGuard/Game/DNS)
 
-UDP works in both directions; the scheme on the destination (`-L`) or bind (`-R`) selects the protocol:
+UDP works too; the `remote_source` scheme selects the protocol, and the address is gated by the peer's `allowed_sources.udp` list:
 
-```bash
-# Local forward: dialer listens on UDP 51820, listening peer reaches the UDP service
-duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
-  -L 0.0.0.0:51820=udp://127.0.0.1:51820
-
-# Remote forward: listening peer binds UDP, forwards back to dialer's local service
-duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
-  -R udp://0.0.0.0:51820=127.0.0.1:51820
+```toml
+# This peer listens on UDP 51820; the other peer connects out to the UDP service.
+[[request]]
+name = "wg"
+remote_source = "udp://127.0.0.1:51820"
+local_listen = "0.0.0.0:51820"
 ```
 
-> **Note:** UDP `-R` uses a single-peer-address reply model — suitable for single-client UDP services.
+> **Note:** UDP requests use a single-peer-address reply model — suitable for single-client UDP services.
+
+### Test mode (testing only)
+
+duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1` runs the peer **headless** (no TUI, logs to stderr, needs no terminal) and is the single gate that enables all test-only env vars:
+
+| Env Var | Purpose |
+|---------|---------|
+| `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
+| `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
+| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start every configured `[[request]]` once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
+
+In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
 
 ## CLI Options
 
 ### peer
 
+`duopipe peer` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-sessions, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--config`, `-c` | - | Path to TOML config file |
 | `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` |
-| `--config-stdin` | false | Read JSON config from stdin for automation/IPC (use `-c` for normal usage) |
 
-### peer iroh
+The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--connect` | - | Connection role: `dial` (connect out) or `listen` (accept) |
-| `--peer-node-id`, `-n` | - | EndpointId of the peer to dial (required when `--connect dial`) |
-| `-L` | - | Local forward, repeatable: `LISTEN=DEST` (e.g. `127.0.0.1:15678=tcp://127.0.0.1:5678`). The `DEST` scheme selects TCP/UDP. |
-| `-R` | - | Remote forward, repeatable: `BIND=DEST` (e.g. `tcp://0.0.0.0:6574=127.0.0.1:6574`). The `BIND` scheme selects TCP/UDP. |
-| `--secret-file` | - | Path to secret key file for persistent identity (required when listening) |
-| `--auth-token-file` | - | Path to file containing the auth token presented when dialing |
-| `--auth-tokens-file` | - | Path to file containing accepted auth tokens when listening (one per line, # comments allowed) |
-| `--alpn-token-file` | - | Path to file containing ALPN token (required for both roles) |
-| `--max-sessions` | 100 | Maximum concurrent data streams per connection |
-| `--relay-url` | public | Custom relay server URL(s), repeatable |
-| `--relay-only` | false | Force all traffic through relay (CLI-only; not supported in config files) |
-| `--dns-server` | public | Custom DNS server URL, or "none" to disable DNS discovery |
-| `--encryption-key-file` | - | Path to age identity file for decrypting age-encrypted config values |
+**Environment variables:**
 
-**Environment variables** (for containers and automation scripts):
-
-> Environment variables are primarily intended for containerized deployments and automation scripts. For regular use, prefer the `_file` CLI flags or config file equivalents.
-
-| Env Var | Role | Description |
-|---------|------|-------------|
-| `DUOPIPE_ALPN_TOKEN` | both | ALPN token for QUIC handshake-level filtering (14-char Base64URL with CRC16 checksum). Required for both peers and must match. Generate with `generate-alpn-token`. |
-| `DUOPIPE_AUTH_TOKEN` | dial | Auth token presented to the listening peer (required when dialing unless provided via `--auth-token-file`) |
-| `DUOPIPE_AUTH_TOKENS` | listen | Accepted auth tokens (comma-separated). Required when listening unless provided via `--auth-tokens-file`. |
-| `DUOPIPE_SECRET` | listen | Base64-encoded secret key for persistent identity (use this or `--secret-file`) |
-| `DUOPIPE_ENCRYPTION_KEY_FILE` | both | Path to age identity file for decrypting age-encrypted config values |
+| Env Var | Description |
+|---------|-------------|
+| `DUOPIPE_AUTH_TOKEN` | The shared auth token (highest precedence over config `auth_token` / `auth_token_file`). |
+| `DUOPIPE_ENCRYPTION_KEY_FILE` | Path to age identity file for decrypting age-encrypted config values. |
+| `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
+| `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
+| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
 
 ## Configuration Files
 
-Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). For normal usage, prefer config files so your settings are saved and reusable. The `--config-stdin` flag is intended for automation and IPC — it accepts JSON (self-delimiting, so the caller does not need to close stdin). Only one of these may be used at a time. All config keys live at the top level.
+Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). Prefer config files so your settings are saved and reusable. Only one of these may be used at a time. All config keys live at the top level.
 
-> **Security:** TOML config files **reject plaintext sensitive fields** (`auth_token`, `auth_tokens`, `alpn_token`, `secret`). You have three options: use the corresponding `_file` variants (recommended), use environment variables (`DUOPIPE_*`) for containers/automation, or use [age-encrypted inline values](#encrypted-config-values). Plaintext values are also accepted via `--config-stdin` (JSON) for IPC.
+> **Security:** TOML config files **reject a plaintext `auth_token`**. You have three options: use `auth_token_file` (recommended), set the `DUOPIPE_AUTH_TOKEN` environment variable, or use an [age-encrypted inline value](#encrypted-config-values).
 
 **Default location:** `~/.config/duopipe/peer.toml`
 
-> **Note:** `--relay-only` is intentionally **CLI-only** and is not supported in config files to avoid accidental activation.
+> **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-### Overriding Config Values
-
-CLI arguments take precedence over config file values. Use `--default-config` with CLI arguments to override or extend specific fields:
-
-```bash
-# Use config but add an extra local forward on the command line
-duopipe peer --default-config \
-  -L 127.0.0.1:3000=tcp://127.0.0.1:8080
-
-# Use config but override the dial target
-duopipe peer --default-config \
-  --connect dial --peer-node-id <ENDPOINT_ID>
-```
-
-This lets you keep common settings (keys, relay URLs, ALPN token) in the config file while varying per-session options on the command line.
+The config file holds the tunnel requests, auth token, relays, DNS, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
 
 ### Encrypted Config Values
 
@@ -433,16 +348,13 @@ echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --recipient age1
 **Use in config:**
 
 ```toml
-connect = "dial"
-peer_node_id = "<ENDPOINT_ID>"
 encryption_key_file = "~/.config/duopipe/age.key"
 encryption_recipient = "age1ql3z7hjy..."
 
 auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
-alpn_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
 ```
 
-Each encrypted value is a single-line `ageenc:` prefixed string (base64-encoded age ciphertext). The `encryption_key_file` can also be specified via `--encryption-key-file` CLI flag or `DUOPIPE_ENCRYPTION_KEY_FILE` env var.
+Each encrypted value is a single-line `ageenc:` prefixed string (base64-encoded age ciphertext). Age encryption applies only to `auth_token`. The `encryption_key_file` can also be specified via the `DUOPIPE_ENCRYPTION_KEY_FILE` env var.
 
 ### Transport Tuning
 
@@ -462,35 +374,29 @@ The connection-level receive window uses iroh's default. If `send_window` is omi
 
 ### Peer Config Example
 
+The same config shape is used by both peers; the role is chosen interactively at startup.
+
 ```toml
-# Example peer configuration
-# Connection role: "dial" or "listen"
-connect = "dial"
+# Example peer configuration.
+# The connection role and dial target node id are chosen interactively in the TUI.
 
-# --- when connect = "dial" ---
-peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
-auth_token_file = "~/.config/duopipe/token.txt"
-
-# --- when connect = "listen" (comment out the dial fields above) ---
-# secret_file = "./peer.key"
-# auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
-
-# ALPN token (required for both roles)
-alpn_token_file = "~/.config/duopipe/alpn_token.txt"
+# Shared auth token (plaintext not allowed — use a file, env var, or ageenc: value)
+auth_token_file = "~/.config/duopipe/auth_token.txt"
 
 # relay_urls = ["https://relay.example.com"]
+# relay_only = false           # requires at least one relay_urls entry
 dns_server = "https://dns.example.com/pkarr"
 max_sessions = 100
 
-# Local forwards (-L): this peer listens locally, the peer connects to dest.
-[[local_forward]]
-listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
+# Tunnel requests: bind locally, ask the peer to connect out to source.
+[[request]]
+name = "db"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
-# Remote forwards (-R): the peer binds, forwarding back to our local dest.
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
+# Sources the peer may request of us (fail-closed if omitted).
+[allowed_sources]
+tcp = ["127.0.0.0/8"]
 ```
 
 > [!NOTE]
@@ -504,50 +410,13 @@ duopipe peer --default-config
 duopipe peer -c ./my-peer.toml
 ```
 
-Example: spawning a dialing peer with `--config-stdin` from Python:
-
-```python
-import json, socket, subprocess, time
-
-config = {
-    "connect": "dial",
-    "peer_node_id": "<ENDPOINT_ID>",
-    "auth_token": "<AUTH_TOKEN>",
-    "alpn_token": "<ALPN_TOKEN>",
-    "local_forward": [
-        {"listen": "127.0.0.1:2222", "dest": "tcp://127.0.0.1:22"}
-    ],
-}
-
-proc = subprocess.Popen(
-    ["duopipe", "peer", "--config-stdin"],
-    stdin=subprocess.PIPE,
-)
-proc.stdin.write(json.dumps(config).encode())
-proc.stdin.flush()  # config is parsed immediately, no need to close stdin
-
-# wait for the forwarded port to be ready
-for attempt in range(10):
-    try:
-        with socket.create_connection(("127.0.0.1", 2222), timeout=2):
-            print("tunnel is up")
-            break
-    except OSError:
-        time.sleep(1)
-else:
-    raise RuntimeError("tunnel failed to start")
-
-input("press enter to quit..")
-proc.terminate()
-```
-
 ---
 
 # Utility Commands
 
 ## generate-auth-token
 
-Generate authentication tokens for the dialing peer to present:
+Generate the shared authentication token used by both peers:
 
 ```bash
 # Generate a single auth token
@@ -560,43 +429,7 @@ duopipe generate-auth-token -c 5
 
 Auth token format: `i` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total.
 
-## generate-alpn-token
-
-Generate an ALPN token shared between both peers:
-
-```bash
-# Generate a single ALPN token
-duopipe generate-alpn-token
-
-# Generate multiple ALPN tokens
-duopipe generate-alpn-token -c 5
-```
-
-ALPN token format: Base64URL-encoded(8 random bytes + 2-byte CRC16 checksum) = 14 characters total.
-
-## generate-key
-
-Generate a private key for a peer's persistent identity (used by the listening peer).
-
-```bash
-duopipe generate-key --output ./peer.key
-
-# Write the key to stdout instead of a file (e.g. to capture it in a script)
-duopipe generate-key --output -
-
-# Overwrite an existing key file
-duopipe generate-key --output ./peer.key --force
-```
-
-The secret key is written to the `--output` target (created with `0600` permissions on Unix), and the EndpointId is printed to stdout. Use `-` as the output to write the key to stdout instead — in that case the EndpointId is printed to stderr so it stays off the key stream. Existing files are not overwritten unless `--force` is passed.
-
-## show-id
-
-Show the public EndpointId derived from a private key. The dialing peer uses this with `--peer-node-id`.
-
-```bash
-duopipe show-id --secret-file ./peer.key
-```
+> **Note:** A listening instance that starts without a configured token generates one automatically and shows it in the TUI header, so generating one ahead of time is optional.
 
 ## config-encryption
 
@@ -631,12 +464,11 @@ Output is a single-line `ageenc:` string ready to paste into TOML config values.
 ## Security
 
 - All traffic is encrypted using QUIC/TLS 1.3
-- The EndpointId is a public key that identifies the listening peer
-- **ALPN-level filtering:** A pre-shared ALPN token is embedded in the QUIC protocol identifier (`mf/2/<token>`). Connections from peers without the correct token are rejected at the QUIC handshake level — before any application streams are opened — acting as a lightweight "port knock".
-- **Token Authentication:** The dialing peer authenticates immediately after the QUIC connection via a dedicated auth stream. Invalid tokens are rejected with an `AuthResponse` and the connection is closed with an error code. See [Architecture: Token Authentication](docs/ARCHITECTURE.md#token-authentication-iroh-mode).
-- **Full trust after auth:** Once both the ALPN token and the auth token pass, the peer is fully trusted and there are no per-destination allowlists. Only share tokens with peers you trust.
-- Secret key files are created with `0600` permissions (Unix) and appropriate permissions on Windows
-- Treat secret key files, auth tokens, and ALPN tokens like passwords
+- The node id is a public key that identifies the listening peer. Because the identity is ephemeral, it changes every run.
+- **Fixed ALPN:** The QUIC protocol identifier is a fixed constant (`mf/2`). It is not used for access control.
+- **Token Authentication:** The dialing peer authenticates immediately after the QUIC connection via a dedicated auth stream, presenting the shared auth token. An invalid token is rejected with an `AuthResponse` and the connection is closed with an error code. See [Architecture: Token Authentication](docs/ARCHITECTURE.md#token-authentication-iroh-mode).
+- **Source allowlist (fail-closed):** After auth the peer may *request* tunnels, but each requested source is checked against our `[allowed_sources]` CIDR lists before we connect out. An empty or absent allowlist rejects every incoming request. Requests are also activated interactively — nothing forwards until started. Only share the token with peers you trust, and keep the allowlist narrow.
+- Treat the auth token like a password
 
 ## Exit Codes
 
@@ -682,12 +514,12 @@ done
 ## How It Works
 
 ### iroh Mode
-1. The listening peer creates an iroh endpoint with discovery services
-2. The listening peer publishes its address via Pkarr/DNS
-3. The dialing peer resolves the listening peer via discovery
-4. **ALPN handshake:** the QUIC connection requires a matching ALPN token (`mf/2/<token>`) — peers without the token are rejected at the handshake level
-5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with its token
-6. **The listening peer validates the token** (10s timeout) — invalid tokens are rejected with an error response
+1. On startup the TUI asks "Connect to an existing instance?", selecting the listen or dial role (the identity is freshly generated either way)
+2. The listening peer creates an iroh endpoint with discovery services and publishes its address via Pkarr/DNS; its node id is shown in the TUI header
+3. The dialing peer (given the listener's node id) resolves the listening peer via discovery
+4. **QUIC handshake:** the connection uses the fixed ALPN constant (`mf/2`); there is no token in the ALPN
+5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
+6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response
    - *If authentication fails, the connection is closed and the following steps do not occur*
-7. **Full trust:** once authenticated, the peer is fully trusted; either side may declare local (`-L`) and remote (`-R`) forwards
-8. Forwards are negotiated over the single connection and traffic flows in both directions
+7. **Auth, then a fail-closed allowlist:** once authenticated, either side may *request* tunnels of the other; each requested source is checked against the serving peer's `[allowed_sources]` CIDR lists before it connects out (fail-closed — an empty/absent list rejects everything)
+8. Requested tunnels are negotiated over the single connection and traffic flows in both directions

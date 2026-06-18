@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use crate::error::TunnelError;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures::StreamExt;
 use iroh::{
     address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
@@ -16,9 +15,9 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use noq_proto::congestion::{Bbr3Config, CubicConfig, NewRenoConfig};
 use log::{info, warn};
 use tokio::task::JoinHandle;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use crate::app_state::{AppState, PathInfo, PathKind, Role};
 use crate::config::{
     CongestionController, TransportTuning, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW,
 };
@@ -26,14 +25,11 @@ use url::Url;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build the ALPN protocol identifier with an embedded pre-shared token.
+/// Fixed ALPN protocol identifier for duopipe connections.
 ///
-/// The ALPN acts as a lightweight "port knock" — connections from clients that
-/// don't know the token fail at the QUIC handshake level before any application
-/// streams are opened.
-pub fn build_multi_alpn(alpn_token: &str) -> Vec<u8> {
-    format!("mf/2/{}", alpn_token).into_bytes()
-}
+/// Both peers advertise this; a mismatch fails at the QUIC handshake. Access
+/// control is handled by the shared `auth_token`, not the ALPN.
+pub const ALPN: &[u8] = b"mf/2";
 
 /// QUIC keep-alive interval for tunnel connections.
 ///
@@ -71,34 +67,6 @@ fn create_congestion_controller_factory(
         CongestionController::Bbr => Arc::new(Bbr3Config::default()),
         CongestionController::NewReno => Arc::new(NewRenoConfig::default()),
     }
-}
-
-/// Load secret key from file (base64 encoded).
-pub fn load_secret(path: &Path) -> Result<SecretKey> {
-    if !path.exists() {
-        anyhow::bail!(
-            "Secret key file not found: {}\nGenerate one with: duopipe generate-key --output {}",
-            path.display(),
-            path.display()
-        );
-    }
-
-    let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
-    load_secret_from_string(content.trim())
-}
-
-/// Load secret key from a base64-encoded string.
-pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
-    let bytes = BASE64
-        .decode(base64_key)
-        .context("Invalid base64 in secret key")?;
-
-    SecretKey::try_from(&bytes[..]).context("Invalid secret key (must be 32 bytes)")
-}
-
-/// Get public key (EndpointId) from secret key.
-pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
-    secret.public()
 }
 
 /// Parse relay URL strings into a RelayMode.
@@ -448,6 +416,23 @@ pub async fn connect_to_server(
     }
 }
 
+/// Classify the selected path into structured [`PathInfo`] for the TUI.
+fn classify_paths(paths: &PathList<'_>) -> PathInfo {
+    let selected = paths.iter().find(|p| p.is_selected());
+    match selected {
+        None => PathInfo::establishing(),
+        Some(path) => {
+            let rtt_ms = Some(path.rtt().as_secs_f64() * 1000.0);
+            let kind = match path.remote_addr() {
+                TransportAddr::Ip(addr) => PathKind::Direct(addr.to_string()),
+                TransportAddr::Relay(url) => PathKind::Relay(url.to_string()),
+                other => PathKind::Direct(format!("{:?}", other)),
+            };
+            PathInfo { kind, rtt_ms }
+        }
+    }
+}
+
 /// Format connection path info for display, showing selected paths with RTT.
 fn format_paths(paths: &PathList<'_>) -> String {
     if paths.is_empty() {
@@ -494,10 +479,16 @@ impl Drop for PathWatcherGuard {
 
 /// Log the current connection paths and spawn a background task that
 /// logs updates whenever the active path changes (e.g., relay -> direct).
+/// Each update is also written into [`AppState`] for the TUI: the dial role
+/// updates the single connection path, the listen role updates the matching peer.
 ///
 /// The returned [`PathWatcherGuard`] aborts the background task when dropped.
 /// Callers must keep the guard alive for the duration of the connection.
-pub fn watch_connection_paths(conn: &iroh::endpoint::Connection) -> PathWatcherGuard {
+pub fn watch_connection_paths(
+    conn: &iroh::endpoint::Connection,
+    state: Arc<AppState>,
+    remote_id: String,
+) -> PathWatcherGuard {
     let conn = conn.clone();
     PathWatcherGuard(tokio::spawn(async move {
         // The stream yields the current snapshot on the first poll, then a
@@ -506,6 +497,11 @@ pub fn watch_connection_paths(conn: &iroh::endpoint::Connection) -> PathWatcherG
         let mut stream = conn.paths_stream();
         let mut last_key = None;
         while let Some(paths) = stream.next().await {
+            let info = classify_paths(&paths);
+            match state.role {
+                Role::Dial => state.set_path(info),
+                Role::Listen => state.set_peer_path(&remote_id, info),
+            }
             let key = paths_key(&paths);
             if last_key.as_ref() != Some(&key) {
                 info!("Connection: {}", format_paths(&paths));

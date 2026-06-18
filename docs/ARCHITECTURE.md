@@ -26,15 +26,28 @@ Binary: `duopipe`
 
 > **Design Goal:** The project's primary goal is to provide a convenient way to connect to different networks for development or homelab purposes without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale.
 
-duopipe runs as a single, **symmetric peer**: `duopipe peer`. There is no separate "server" and "client" binary mode. Connection *setup* is asymmetric — QUIC needs one side to dial and the other to accept — but once a connection exists, **either side can open streams**, so tunnels flow in **both directions** over the one connection.
+duopipe runs as a single, **symmetric peer**: `duopipe peer`, which launches an interactive ratatui TUI. There is no separate "server" and "client" binary mode. Connection *setup* is asymmetric — QUIC needs one side to dial and the other to accept — but once a connection exists, **either side can open streams**, so tunnels flow in **both directions** over the one connection.
 
-- The **listen peer** (`--connect listen`) has a stable secret identity and calls `endpoint.accept()` in a loop.
-- The **dial peer** (`--connect dial`) knows the listener's `EndpointId` and connects to it, with an automatic reconnect loop (exponential backoff, capped). Its identity may be ephemeral.
+The role is chosen **at startup**: the TUI asks "Connect to an existing instance?" (or, for tests, the role is derived from environment variables — see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated on every run, so the listener's node id changes each run.
 
-Each peer can declare:
+- The **listen peer** (answers "no") generates an ephemeral identity and calls `endpoint.accept()` in a loop. The TUI shows its node id and the shared auth token.
+- The **dial peer** (answers "yes") is given the listener's node id and connects to it, with an automatic reconnect loop (exponential backoff, capped).
 
-- **Local forwards** (`-L LISTEN=DEST`): this peer binds a local listener; each accepted connection is forwarded to a destination the *other* peer connects out to.
-- **Remote forwards** (`-R BIND=DEST`): this peer asks the *other* peer to bind a listener and forward connections back to a destination *this* peer connects out to.
+Each peer declares **tunnel requests** in config (the connection role is chosen at startup, not here):
+
+- **`[[request]]`** (`name`, `remote_source`, `local_listen`): this peer binds a local listener at `local_listen`; each accepted connection asks the *other* peer to connect out to `remote_source`, then bridges the two. Requests are activated on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
+- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Fail-closed — an empty or absent list rejects every request.
+
+#### Non-interactive mode (testing)
+
+The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_MODE=1` runs the peer headless (no TUI) and gates all other test-only env vars:
+
+- `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
+- `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
+- `DUOPIPE_AUTOSTART_REQUESTS=1` — start every configured `[[request]]` on connect.
+- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
+
+In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
 
 ```mermaid
 graph TB
@@ -56,7 +69,7 @@ graph TB
     style A fill:#4CAF50
 ```
 
-Relay-only is a CLI-only flag that forces connections through relay servers instead of attempting direct connections. It is intended for testing or special scenarios and is not supported in config files to avoid accidental activation. See `duopipe --help` for usage.
+Relay-only (`relay_only`) is a config bool that forces connections through relay servers instead of attempting direct connections. It is intended for testing or special scenarios and requires at least one `relay_urls` entry.
 
 ### Core Components
 
@@ -64,20 +77,21 @@ Relay-only is a CLI-only flag that forces connections through relay servers inst
 graph LR
     subgraph "Core Modules"
         A[main.rs<br/>CLI & orchestration]
+        T[tui/<br/>Interactive setup + status]
         B[config.rs<br/>Config loading & validation]
         C[iroh_mode/peer.rs<br/>Symmetric peer runtime]
         C2[net.rs<br/>Address parsing & resolution]
         C3[iroh_mode/helpers.rs<br/>TCP/UDP bridging]
         D[iroh_mode/endpoint.rs<br/>iroh endpoint setup]
-        E[secret.rs<br/>Identity management]
-        E2[auth.rs<br/>Auth + ALPN tokens]
+        E2[auth.rs<br/>Auth token]
         F[signaling/codec.rs<br/>Stream framing & messages]
     end
 
+    A --> T
     A --> B
     A --> C
-    A --> E
     A --> E2
+    T --> C
     C --> C2
     C --> C3
     C --> D
@@ -100,7 +114,7 @@ graph TD
     subgraph "iroh"
         A1[Discovery: Automatic]
         A2[NAT: Relay Fallback]
-        A3[Setup: Minimal - EndpointId required]
+        A3[Setup: Minimal - node id required]
         A4[Infrastructure: Required]
     end
 
@@ -145,22 +159,22 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same `duopipe peer` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own outbound listeners, so local forwards (`-L`) and remote forwards (`-R`) declared on either side all multiplex over the single connection.
+Both ends run the same `duopipe peer` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own request listeners, so tunnel requests (`[[request]]`) activated on either side all multiplex over the single connection.
 
 ```mermaid
 graph TB
     subgraph "Listen Peer"
-        A[duopipe peer<br/>--connect listen]
-        B[iroh Endpoint<br/>stable EndpointId]
-        C[Accept Loop +<br/>Local/Remote Forwards]
+        A[duopipe peer<br/>answered no]
+        B[iroh Endpoint<br/>ephemeral node id]
+        C[Accept Loop +<br/>Request Listeners]
         D[Discovery<br/>Pkarr/DNS]
         E[Relay Server]
     end
 
     subgraph "Dial Peer"
-        F[duopipe peer<br/>--connect dial]
-        G[iroh Endpoint<br/>ephemeral or persistent]
-        H[Accept Loop +<br/>Local/Remote Forwards]
+        F[duopipe peer<br/>answered yes]
+        G[iroh Endpoint<br/>ephemeral node id]
+        H[Accept Loop +<br/>Request Listeners]
         I[Discovery<br/>Pkarr/DNS]
         J[Relay Server]
     end
@@ -196,29 +210,26 @@ sequenceDiagram
     participant D as Dial Peer
     participant RS as Relay Server
 
-    Note over L: Load Secret Key (stable identity)
+    Note over L: Generate ephemeral identity (TUI: answered "no")
     L->>L: Create iroh Endpoint
-    L->>SD: Publish EndpointId + Addresses
-    Note over L: Display EndpointId
+    L->>SD: Publish node id + Addresses
+    Note over L: Display node id + auth token in TUI
     L->>RS: Connect to relay
     L->>L: endpoint.accept() loop
 
-    Note over D: User provides EndpointId (--peer-node-id)
-    D->>D: Create iroh Endpoint
-    D->>SD: Resolve EndpointId
+    Note over D: User provides node id (TUI prompt, answered "yes")
+    D->>D: Create iroh Endpoint (ephemeral identity)
+    D->>SD: Resolve node id
     SD-->>D: Return addresses
     D->>RS: Connect to relay
 
     alt Direct Connection Possible
-        D->>L: Direct QUIC connection (ALPN: mf/2/<token>)
-        L-->>D: Accept connection (ALPN match)
-    else ALPN Mismatch
-        D->>L: QUIC connection (wrong ALPN)
-        L-->>D: Handshake rejected (no matching ALPN)
+        D->>L: Direct QUIC connection (ALPN: mf/2)
+        L-->>D: Accept connection
     else NAT Traversal Failed
         D->>RS: Connect via relay
         RS->>L: Forward connection
-        L-->>RS: Accept via relay (ALPN match)
+        L-->>RS: Accept via relay
         RS-->>D: Relay established
     end
 
@@ -236,96 +247,64 @@ sequenceDiagram
     end
 
     Note over D,L: After auth, BOTH sides run symmetrically
-    par Dial peer's tunnels
-        D->>L: open_bi() + StreamHello (-L / -R)
-    and Listen peer's tunnels
-        L->>D: open_bi() + StreamHello (-L / -R)
+    par Dial peer's requests
+        D->>L: open_bi() + StreamHello::LocalForward{source}
+    and Listen peer's requests
+        L->>D: open_bi() + StreamHello::LocalForward{source}
     end
-    Note over D,L: Tunnels flow in both directions
+    Note over D,L: Either side may request tunnels of the other
 ```
 
 ### Stream Dispatch (StreamHello)
 
-The **auth stream is the only stream that does not carry a hello** — it is positional (the first bi-stream the dialer opens). Every *other* bidirectional stream begins with a self-describing [`StreamHello`] frame written by the stream **opener**, so the **acceptor** can route it without positional assumptions. This is what makes a symmetric peer possible: the side that accepts a stream doesn't need to know in advance whether it is a local-forward data stream, a remote-forward data stream, or a remote-forward control stream.
+The **auth stream is the only stream that does not carry a hello** — it is positional (the first bi-stream the dialer opens). Every *other* bidirectional stream begins with a self-describing [`StreamHello`] frame written by the stream **opener**, so the **acceptor** can route it without positional assumptions. There is now a single non-auth stream kind: `StreamHello::LocalForward { source }`, a tunnel request.
 
 ```mermaid
 graph TB
     A[accept_bi: new stream] --> B[Read StreamHello<br/>HELLO_TIMEOUT 10s]
-    B --> C{kind?}
+    B --> C{LocalForward source}
 
-    C -->|LocalForward dest| D[Acquire session permit]
-    D --> E[Connect out to dest<br/>tcp:// or udp://]
+    C --> S{source in allowed_sources?<br/>fail-closed}
+    S -->|no| R[Reply StreamAck rejected]
+    S -->|yes| D[Acquire session permit]
+    D --> E[Connect out to source<br/>tcp:// or udp://]
     E --> F[Reply StreamAck, bridge]
-
-    C -->|RemoteForwardData tunnel_id| G[Look up tunnel_id -> local dest]
-    G --> H[Acquire session permit]
-    H --> I[Connect out to local dest]
-    I --> F
-
-    C -->|RemoteForwardControl| J[Read RemoteForwardRequest per -R]
-    J --> K[Bind requested listener<br/>full trust]
-    K --> L[Reply RemoteForwardResponse<br/>with bound_addr]
 
     style B fill:#FFF9C4
     style F fill:#C8E6C9
-    style L fill:#C8E6C9
+    style R fill:#FFCCBC
 ```
 
-A per-connection `Semaphore` (default `max_sessions = 100`) bounds concurrent **data** streams in both directions. Auth and remote-forward *control* streams do not consume permits. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
+A per-connection `Semaphore` (default `max_sessions = 100`) bounds concurrent **data** streams in both directions. The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. The CIDR allowlist check runs **before** a permit is acquired, so rejected sources never consume one; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
 
-### Local Forward (-L) Data Flow
+### Request Data Flow
 
-The declaring peer binds a local listener. Per connection it opens a stream tagged `StreamHello::LocalForward { dest }`; the peer connects out to `dest` (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. This is the generalization of the old "one side opens a stream, the other connects out" path.
+A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1`); stopping one cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
     participant App as Local App
-    participant O as Opener (declares -L)
+    participant O as Requester (binds listen)
     participant P as Peer (acceptor)
-    participant T as Target Service
+    participant T as Source Service
 
     App->>O: connect to local listener
-    O->>P: open_bi() + StreamHello::LocalForward{dest}
-    P->>T: connect out to dest
-    alt connect ok
+    O->>P: open_bi() + StreamHello::LocalForward{source}
+    P->>P: check source against allowed_sources (fail-closed)
+    alt allowed & connect ok
+        P->>T: connect out to source
         P-->>O: StreamAck{accepted: true}
         Note over O,P: bridge_streams() copies both directions
-    else connect failed
+    else rejected or connect failed
         P-->>O: StreamAck{accepted: false, reason}
     end
 ```
 
-### Remote Forward (-R) Data Flow
-
-The requester opens **one** control stream (`StreamHello::RemoteForwardControl`) and sends a `RemoteForwardRequest { tunnel_id, bind }` per `-R`. The host binds the requested listener (**full trust — no allowlist**), then replies `RemoteForwardResponse { accepted, bound_addr, ... }`. On each accepted connection, the host opens a fresh `StreamHello::RemoteForwardData { tunnel_id }` stream back; the requester maps `tunnel_id` to its own local `dest` and connects out.
-
-```mermaid
-sequenceDiagram
-    participant R as Requester (declares -R)
-    participant H as Host (peer)
-    participant App as External Client
-    participant Local as Requester's local dest
-
-    R->>H: open_bi() + StreamHello::RemoteForwardControl
-    loop per -R forward
-        R->>H: RemoteForwardRequest{tunnel_id, bind}
-        H->>H: bind listener (full trust)
-        H-->>R: RemoteForwardResponse{accepted, bound_addr}
-    end
-
-    App->>H: connect to hosted listener (bound_addr)
-    H->>R: open_bi() + StreamHello::RemoteForwardData{tunnel_id}
-    R->>R: map tunnel_id -> local dest
-    R->>Local: connect out
-    R-->>H: StreamAck{accepted: true}
-    Note over R,H: bridge_streams() copies both directions
-```
-
-Tunnel ids are allocated by the requester via an `AtomicU64`. Hosted `-R` listeners self-terminate when the connection closes (a `tokio::select!` on `conn.closed()`), freeing the bound port.
+A request's listener is owned by a task with its own `CancellationToken`; a `Stop` command (or the connection closing) cancels it, dropping the `TcpListener`/`UdpSocket` and aborting in-flight bridged connections, which frees the bound port.
 
 ### TCP Tunnel Data Flow
 
-TCP bridging uses `bridge_streams()` (`iroh_mode/helpers.rs`) regardless of forward direction. The "opener" is whichever peer accepted the local connection; the "connect side" is whichever peer dials the target.
+TCP bridging uses `bridge_streams()` (`iroh_mode/helpers.rs`). The "opener" is the requesting peer that accepted the local connection; the "connect side" is the peer that dials the source.
 
 ```mermaid
 graph LR
@@ -362,7 +341,7 @@ graph LR
 
 UDP forwarding reuses `forward_stream_to_udp_server` / `forward_stream_to_udp_client` / `forward_udp_to_stream` (`iroh_mode/helpers.rs`) and works in both directions. Each UDP forward uses a single bidirectional stream; packets are length-prefixed (see [UDP Packet Framing](#udp-packet-framing)).
 
-> **Note:** A hosted `-R` UDP forward inherits a single-peer-address reply limitation — the host tracks one external peer address per stream for return packets.
+> **Note:** A UDP request inherits a single-peer-address reply limitation — the connect side tracks one external peer address per stream for return packets.
 
 ```mermaid
 graph TB
@@ -400,17 +379,17 @@ graph TB
 
 ### Endpoint Management
 
-Both the listen peer (`create_server_endpoint`) and the dial peer (`create_client_endpoint`) build their `iroh::Endpoint` through the same `create_endpoint_builder`, which configures QUIC transport tuning, relay mode, and discovery. The listen peer always provides a secret key (stable `EndpointId`); the dial peer may provide one or run with an ephemeral identity.
+Both the listen peer (`create_server_endpoint`) and the dial peer (`create_client_endpoint`) build their `iroh::Endpoint` through the same `create_endpoint_builder`, which configures QUIC transport tuning, relay mode, and discovery. Neither role provides a secret key — iroh generates a fresh ephemeral identity on every run, so the node id changes each run.
 
 ```mermaid
 graph TB
     subgraph "Endpoint Creation"
-        A[Load/Generate Secret] --> B[Create Endpoint Builder]
+        A[Generate ephemeral identity] --> B[Create Endpoint Builder]
         B --> B2[QUIC transport config:<br/>idle timeout 300s,<br/>keep-alive 15s,<br/>cc + window sizes]
         B2 --> C{Relay URLs?}
         C -->|Yes| D[Add Custom Relays]
         C -->|No| E[Use Default Relays]
-        D --> F{Relay Only? (CLI-only)}
+        D --> F{Relay Only? (config bool)}
         E --> F
         F -->|Yes| G[clear_ip_transports]
         F -->|No| H[Keep IP + relay transports]
@@ -430,7 +409,7 @@ graph TB
         N --> O[Endpoint Ready]
     end
 
-    style A fill:#FFE0B2
+    style A fill:#C8E6C9
     style L fill:#C8E6C9
     style O fill:#C8E6C9
 ```
@@ -439,130 +418,80 @@ graph TB
 
 ## Configuration System
 
-A single, symmetric `PeerConfig` drives the peer. There is no `role` enum; the connection role is selected by the top-level `connect` key (`"dial"` or `"listen"`).
+A single, symmetric `PeerConfig` drives the peer. There is no `role` enum and no `connect` key; the connection role is chosen **at startup** (interactively in the TUI, or via env vars for tests), not in config.
 
 ### Configuration File Structure
 
 ```mermaid
 graph TB
     subgraph "Config File"
-        A[mode: iroh]
+        A[peer.toml]
     end
 
-    subgraph "iroh Options"
-        B[connect: dial / listen]
-        C[peer_node_id<br/>dial only]
-        D[secret / secret_file<br/>required for listen]
-        E[auth_token* — dialer presents<br/>auth_tokens* — listener accepts]
-        F[alpn_token* — both peers]
-        G[local_forward[] {listen, dest} -L<br/>remote_forward[] {bind, dest} -R]
+    subgraph "Options"
+        E[auth_token* — single shared token<br/>both peers]
+        G[request[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
         H[max_sessions]
-        I[relay_urls / dns_server]
+        I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
+        K[encryption_key_file / encryption_recipient]
     end
 
     A --> S[Validation]
-    S --> B
-    S --> C
-    S --> D
     S --> E
-    S --> F
     S --> G
     S --> H
     S --> I
     S --> J
+    S --> K
 
     style S fill:#FFF9C4
 ```
 
-The connection role and its role-specific requirements (`peer_node_id` + an auth token to present for `dial`; a secret identity + at least one accepted auth token for `listen`) are resolved and enforced in `main.rs` after merging CLI/env overrides, since those can supply the values.
+The role (listen vs dial) and the dialer's target node id are not config fields. They are resolved at startup from the TUI prompts, or — for tests — from `DUOPIPE_PEER_NODE_ID` (set ⇒ dial, unset ⇒ listen) under `DUOPIPE_TEST_MODE=1`.
 
 ### iroh Credential Mapping
 
-`iroh` mode uses two distinct credential types:
+`iroh` mode uses a **single** shared credential, the auth token. The ALPN is a fixed constant (`mf/2`) and carries no credential.
 
-| Credential | Env Vars / CLI Flags | Config Keys (TOML: use `_file` variants or age-encrypted inline) | Expected Usage |
-|------------|-----------|-------------|----------------|
-| **ALPN Token** | `DUOPIPE_ALPN_TOKEN` or `--alpn-token-file` | `alpn_token_file` or age-encrypted `alpn_token` | Pre-handshake QUIC ALPN filter (`mf/2/<token>`). One shared value for both peers. |
-| **Auth Token** | Dial peer: `DUOPIPE_AUTH_TOKEN` or `--auth-token-file`<br>Listen peer: `DUOPIPE_AUTH_TOKENS` or `--auth-tokens-file` | Dial peer: `auth_token_file` or age-encrypted `auth_token`<br>Listen peer: `auth_tokens_file` or age-encrypted `auth_tokens` | Connection-level credential validated on the first bi-stream. The dial peer **presents** one token; the listen peer **accepts** a set. Use separate values per dialer for revocation/rotation. |
+| Credential | Env Var | Config Key (TOML: use `_file` variant or age-encrypted inline) | Expected Usage |
+|------------|---------|-------------|----------------|
+| **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` or age-encrypted `auth_token` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. |
 
-Example usage with files (recommended):
+`DUOPIPE_AUTH_TOKEN` takes precedence over the config `auth_token` / `auth_token_file`.
 
-```bash
-# Listen peer — save tokens to files with restricted permissions
-echo "$ALPN_TOKEN" > alpn_token.txt && chmod 600 alpn_token.txt
-printf '%s\n' "$ALICE_AUTH_TOKEN" "$BOB_AUTH_TOKEN" > auth_tokens.txt && chmod 600 auth_tokens.txt
-duopipe peer --connect listen --secret-file ./peer.key \
-  --alpn-token-file ./alpn_token.txt --auth-tokens-file ./auth_tokens.txt \
-  -L 127.0.0.1:2222=tcp://127.0.0.1:22
-
-# Alice's dial peer
-echo "$ALICE_AUTH_TOKEN" > auth_token.txt && chmod 600 auth_token.txt
-duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> \
-  --alpn-token-file ./alpn_token.txt --auth-token-file ./auth_token.txt \
-  -L 127.0.0.1:8080=tcp://127.0.0.1:80
-```
-
-Example usage with environment variables (for containers/automation):
-
-```bash
-# Listen peer
-export DUOPIPE_ALPN_TOKEN="$ALPN_TOKEN"
-export DUOPIPE_AUTH_TOKENS="$ALICE_AUTH_TOKEN,$BOB_AUTH_TOKEN"
-duopipe peer --connect listen --secret-file ./peer.key ...
-
-# Alice's dial peer
-export DUOPIPE_ALPN_TOKEN="$ALPN_TOKEN"
-export DUOPIPE_AUTH_TOKEN="$ALICE_AUTH_TOKEN"
-duopipe peer --connect dial --peer-node-id <ENDPOINT_ID> ...
-```
-
-Example config usage (plaintext tokens are not allowed in TOML config files — use `_file` variants or age-encrypted inline values):
+Example config usage (a plaintext `auth_token` is not allowed in TOML config files — use `auth_token_file`, the `DUOPIPE_AUTH_TOKEN` env var, or an age-encrypted inline value):
 
 ```toml
-# peer-listen.toml — using _file variants
-connect = "listen"
-secret_file = "/etc/duopipe/peer.key"
-alpn_token_file = "/etc/duopipe/alpn_token.txt"
-auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
+# peer.toml — using the _file variant
+auth_token_file = "/etc/duopipe/auth_token.txt"
 
-[[local_forward]]
-listen = "127.0.0.1:2222"
-dest = "tcp://127.0.0.1:22"
+[[request]]
+name = "ssh"
+remote_source = "tcp://127.0.0.1:22"
+local_listen = "127.0.0.1:2222"
 ```
 
 ```toml
-# peer-dial.toml — using _file variants
-connect = "dial"
-peer_node_id = "<ENDPOINT_ID>"
-alpn_token_file = "~/.config/duopipe/alpn_token.txt"
-auth_token_file = "~/.config/duopipe/token.txt"
-
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
-```
-
-```toml
-# peer-dial.toml — using age-encrypted inline values
-connect = "dial"
-peer_node_id = "<ENDPOINT_ID>"
+# peer.toml — using an age-encrypted inline value
 encryption_key_file = "~/.config/duopipe/age.key"
 
 auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
-alpn_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
+
+[allowed_sources]
+tcp = ["127.0.0.0/8"]
 ```
 
 ### Configuration Loading Flow
 
-For normal usage, prefer file-based configs (`-c`, `--default-config`) which use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`. The `--config-stdin` flag is intended for automation and IPC only; it uses JSON because JSON is self-delimiting — `serde_json::Deserializer::from_reader` parses exactly one JSON object and returns without waiting for EOF, allowing the caller to keep stdin open. Config passed via stdin is not persisted.
+Configs are file-based (`-c`, `--default-config`) and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`. Without a config flag, configuration comes from environment variables and interactive prompts only.
 
 ```mermaid
 sequenceDiagram
     participant CLI as CLI Parser
     participant Main as Main
     participant Config as Config Module
-    participant Source as Config Source (file or stdin)
+    participant Source as Config Source (file)
 
     CLI->>Main: Parse arguments
     Main->>Main: Check config flags (only one allowed)
@@ -575,39 +504,33 @@ sequenceDiagram
         Main->>Config: Load from specified path
         Config->>Source: Read file
         Source-->>Config: TOML content
-    else --config-stdin
-        Main->>Config: Read from stdin
-        Source-->>Config: JSON content
     else No config flag
-        Main->>Main: Use CLI arguments only
+        Main->>Main: Use env vars + interactive prompts only
     end
 
     alt Config loaded
-        Config->>Config: Parse (TOML from file, JSON from stdin)
-        Config->>Config: Validate mode + address formats
+        Config->>Config: Parse TOML
+        Config->>Config: Validate address formats + auth token
         Config-->>Main: Validated config
-        Main->>Main: Merge with CLI/env args (CLI wins)
+        Main->>Main: Apply env overrides (DUOPIPE_AUTH_TOKEN wins)
     end
 
-    Main->>Main: Resolve connect role + role requirements
+    Main->>Main: Launch TUI: resolve role + dial target
 ```
 
 ### Config Validation
 
 ```mermaid
 graph TB
-    A[Load Config] --> B{config present?}
-    B -->|No| C[Error: Missing/invalid mode]
-    B -->|Yes| F{Check sections}
+    A[Load Config] --> F{Check fields}
 
-    F --> G{Plaintext secrets in file?}
-    G -->|Yes| H[Error: use _file or ageenc:]
-    G -->|No| I{Forward addresses valid?}
+    F --> G{Plaintext auth_token in file?}
+    G -->|Yes| H[Error: use auth_token_file, env, or ageenc:]
+    G -->|No| I{Request + allowlist valid?}
 
-    I -->|No| J[Error: bad -L/-R address]
+    I -->|No| J[Error: bad request address or CIDR]
     I -->|Yes| K[Validation Success]
 
-    style C fill:#FFCCBC
     style H fill:#FFCCBC
     style J fill:#FFCCBC
     style K fill:#C8E6C9
@@ -657,17 +580,15 @@ graph TB
 ```mermaid
 graph TB
     subgraph "iroh Mode"
-        A[Listen Peer Secret Key] --> B[Ed25519 Private Key]
-        B --> C[EndpointId - Public Key]
-        C --> D[Dial Peer Connects]
-        D --> D2[ALPN Token Validation]
-        D2 --> E[Auth Token Validation]
+        A[Ephemeral Ed25519 identity<br/>regenerated each run] --> C[node id - Public Key]
+        C --> D[Dial Peer Connects<br/>fixed ALPN mf/2]
+        D --> E[Auth Token Validation]
         E --> F{Valid Token?}
-        F -->|Yes| G[Authenticated - FULL TRUST]
+        F -->|Yes| G[Authenticated<br/>requests gated by allowed_sources]
         F -->|No| H[Rejected]
     end
 
-    style B fill:#FFE0B2
+    style A fill:#FFE0B2
     style C fill:#C8E6C9
     style G fill:#C8E6C9
     style H fill:#FFCCBC
@@ -675,26 +596,23 @@ graph TB
 
 ### Trust Model
 
-**Full trust after authentication.** Connection setup is asymmetric, but trust is symmetric: once the ALPN + token handshake passes, the peer is fully trusted. There are **no per-destination allowlists** and no CIDR gating. A `-L` forward connects out to whatever `dest` the opener names, and a `-R` forward binds whatever listener the requester asks for. Only grant a peer access via a token you would trust with that level of network reach.
+**Auth, then a fail-closed source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). The check is **fail-closed** — an empty or absent list rejects every requested source — so a peer can only reach addresses you explicitly allow. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
-Iroh mode uses two layers of authentication. First, a pre-shared ALPN token is embedded in the QUIC protocol identifier (`mf/2/<token>`), rejecting unknown peers at the TLS handshake level before any application streams are opened. Second, the dialing peer must present a valid auth token on the **first bidirectional stream** (positional — this auth stream is the only stream that carries no `StreamHello`) within a 10-second timeout. **Both layers are mandatory.**
+Access control rests on a single shared auth token. The ALPN is a fixed constant (`mf/2`) and carries no credential. After the QUIC/TLS handshake, the dialing peer must present a valid auth token on the **first bidirectional stream** (positional — this auth stream is the only stream that carries no `StreamHello`) within a 10-second timeout.
 
-#### ALPN Token vs Auth Token
+#### Auth Token
 
-- **ALPN Token** (`DUOPIPE_ALPN_TOKEN` env var / `--alpn-token-file` / `alpn_token_file`): Pre-handshake shared value used for QUIC ALPN filtering. Both peers must use the same value.
-- **Auth Token** (listen peer: `DUOPIPE_AUTH_TOKENS` env var / `--auth-tokens-file` / `auth_tokens_file`; dial peer: `DUOPIPE_AUTH_TOKEN` env var / `--auth-token-file` / `auth_token_file`): Connection-level token validated on the first bi-stream.
-- **Mapping**: These are **distinct tokens**, not the same value. In code, ALPN tokens are 14-char Base64URL values, while auth tokens are 47-char `i...` tokens. Typical setup is one shared ALPN token plus per-dialer auth tokens for revocation.
+- **Auth Token** (`DUOPIPE_AUTH_TOKEN` env var / `auth_token_file` / age-encrypted `auth_token`): A single shared connection-level token, validated on the first bi-stream. Both peers use the **same** value. In code it is a 47-char `i...` token.
 
-1. **ALPN Filtering**: Both peers set `DUOPIPE_ALPN_TOKEN`. The token is embedded in the QUIC ALPN identifier (`mf/2/<token>`). Connections without a matching ALPN are rejected at the handshake level — acting as a lightweight "port knock".
-2. **Listen Peer Configuration**: The listen peer sets `DUOPIPE_AUTH_TOKENS` with one or more accepted tokens (comma-separated), or `--auth-tokens-file`.
-3. **Dial Peer Configuration**: The dial peer sets `DUOPIPE_AUTH_TOKEN` with the token it was issued.
-4. **Protocol Flow**: The dialer opens the first bidirectional stream and sends an `AuthRequest` positionally (no hello). **No tunnel streams are processed until authentication succeeds.**
-5. **Validation**: The listen peer validates the token using `is_token_valid()` within a 10-second timeout (`auth_as_listener`).
-6. **Rejection**: Invalid tokens are rejected with an `AuthResponse` containing the rejection reason, and the connection is closed with an error code.
+1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or generates one if none is set, displaying it in the TUI).
+2. **Dial Peer Configuration**: The dial peer is configured with — or interactively prompted for — the same shared token.
+3. **Protocol Flow**: The dialer opens the first bidirectional stream and sends an `AuthRequest` positionally (no hello). **No tunnel streams are processed until authentication succeeds.**
+4. **Validation**: The listen peer validates the presented token against its single accepted token within a 10-second timeout (`auth_as_listener`).
+5. **Rejection**: An invalid token is rejected with an `AuthResponse` containing the rejection reason, and the connection is closed with an error code.
 
-This layered validation prevents unauthorized peers from holding open connections or opening tunnel streams.
+This validation prevents unauthorized peers from holding open connections or opening tunnel streams.
 
 ```mermaid
 sequenceDiagram
@@ -702,21 +620,16 @@ sequenceDiagram
     participant L as Listen Peer
     participant A as Auth Module
 
-    D->>L: Connect (QUIC TLS handshake, ALPN: mf/2/<token>)
-    alt ALPN matches
-        L->>D: Accept connection
-    else ALPN mismatch
-        L-->>D: Handshake rejected
-        Note over L,D: Connection rejected at handshake level
-    end
+    D->>L: Connect (QUIC TLS handshake, ALPN: mf/2 fixed)
+    L->>D: Accept connection
 
     Note over D,L: Auth Phase (10s timeout, first bi-stream)
     D->>L: open_bi() + AuthRequest {version, auth_token}
-    L->>A: is_token_valid(auth_token, auth_tokens)
+    L->>A: validate against shared auth token
     alt Token is valid
         A-->>L: true
         L->>D: AuthResponse {accepted: true}
-        Note over L,D: Connection authenticated — full trust
+        Note over L,D: Connection authenticated — requests gated by allowed_sources
     else Token is invalid
         A-->>L: false
         L->>D: AuthResponse {accepted: false, reason}
@@ -732,14 +645,13 @@ sequenceDiagram
 
 ### Token Security Notes (iroh Mode)
 
-- Tokens are **bearer credentials**: possession is sufficient for access. Use one token per dialer to enable revocation.
-- Token strength comes from **randomness, not format**: 32 random bytes (256 bits of entropy). Treat tokens like high‑entropy secrets.
-- Tokens are sent only **after** the QUIC/TLS 1.3 handshake, so the auth stream is encrypted in transit.
+- The token is a **bearer credential**: possession is sufficient for access. Rotate it if exposure is suspected.
+- Token strength comes from **randomness, not format**: 32 random bytes (256 bits of entropy). Treat the token like a high‑entropy secret.
+- The token is sent only **after** the QUIC/TLS 1.3 handshake, so the auth stream is encrypted in transit.
 - The CRC16-CCITT-FALSE checksum is **for typo detection only**, not cryptographic security.
-- Tokens are Base64URL-encoded and validated as ASCII.
-- The **ALPN token** acts as a pre-handshake filter (lightweight "port knock"). It is embedded in the TLS ClientHello and therefore **visible in cleartext** on the wire — it is not a secret, but prevents casual scanners from completing a QUIC handshake.
-- Avoid logging or sharing tokens; the `AuthToken` wrapper redacts values in Debug output, but treat them like passwords.
-- Prefer token files with restricted permissions (e.g., `0600`) and rotate tokens if exposure is suspected.
+- The token is Base64URL-encoded and validated as ASCII.
+- Avoid logging or sharing the token; the `AuthToken` wrapper redacts values in Debug output, but treat it like a password.
+- Prefer a token file with restricted permissions (e.g., `0600`).
 
 ### Threat Model
 
@@ -750,14 +662,13 @@ graph TB
         B[MITM<br/>Peer authentication]
         C[Replay Attacks<br/>QUIC nonces]
         D[Tampering<br/>Authenticated encryption]
-        E2[Unauthorized Access<br/>ALPN + Token Authentication]
+        E2[Unauthorized Access<br/>Shared Token Authentication]
     end
 
     subgraph "User Responsibility"
-        F[Secret Key Protection<br/>listen peer]
-        G[EndpointId Verification<br/>Trust on first use]
-        H[Auth Token Security<br/>Treat tokens like passwords]
-        I[Full Trust After Auth<br/>peers can reach any dest/bind]
+        G[node id Verification<br/>Trust on first use]
+        H[Auth Token Security<br/>Treat the token like a password]
+        I[Source Allowlist<br/>scope each peer with allowed_sources CIDRs]
     end
 
     style A fill:#C8E6C9
@@ -766,49 +677,27 @@ graph TB
     style D fill:#C8E6C9
     style E2 fill:#C8E6C9
 
-    style F fill:#FFF9C4
     style G fill:#FFF9C4
     style H fill:#FFF9C4
     style I fill:#FFF9C4
 ```
 
-### Secret Key Management (Listen Peer)
+### Identity Management
 
-The **listen peer** needs a persistent secret key to maintain a stable `EndpointId` that the dial peer connects to. The dial peer typically uses an ephemeral identity and authenticates via a token (it may optionally use a persistent key).
+The iroh identity is **ephemeral**: iroh generates a fresh Ed25519 keypair on every run, so there is no key file to store or protect. The consequence is that the **listen peer's node id changes every run** and must be re-copied to the dial peer (the TUI displays the current node id). This avoids same-machine locking that could otherwise produce duplicate node ids.
 
 ```mermaid
 sequenceDiagram
     participant User as User
-    participant CLI as CLI
-    participant Secret as Secret Module
-    participant FS as File System
+    participant TUI as TUI
+    participant EP as iroh Endpoint
 
-    alt Generate Key
-        User->>CLI: generate-key --output peer.key
-        CLI->>Secret: Generate Ed25519 key
-        Secret->>Secret: Derive EndpointId
-        Secret->>FS: Write with 0600 permissions
-        FS-->>Secret: Success
-        Secret->>CLI: Display EndpointId
-        CLI->>User: Show EndpointId (share with dial peer)
-    end
-
-    alt Load Listen Peer Secret
-        User->>CLI: peer --connect listen --secret-file peer.key
-        CLI->>FS: Read key file
-        FS-->>Secret: Key bytes
-        Secret->>Secret: Parse Ed25519 key
-        Secret->>Secret: Derive EndpointId
-        Secret-->>CLI: Secret + EndpointId
-    end
-
-    alt Show EndpointId
-        User->>CLI: show-id --secret-file peer.key
-        CLI->>FS: Read key file
-        FS-->>Secret: Key bytes
-        Secret->>Secret: Derive EndpointId
-        Secret->>User: Display EndpointId
-    end
+    Note over EP: No key file — fresh identity each run
+    User->>TUI: duopipe peer  (answer "no" → listen)
+    TUI->>EP: Create endpoint (ephemeral identity)
+    EP->>EP: Derive node id from fresh keypair
+    EP-->>TUI: node id
+    TUI->>User: Display node id + auth token (copy to dial peer)
 ```
 
 ---
@@ -817,17 +706,13 @@ sequenceDiagram
 
 ### Signaling Protocol (signaling/codec.rs)
 
-The signaling protocol is `IROH_MULTI_VERSION = 4`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
+The signaling protocol is `IROH_MULTI_VERSION = 5`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
 
 | Message | Direction | Carried On | Purpose |
 |---------|-----------|------------|---------|
 | `AuthRequest` / `AuthResponse` | dialer → listener / reply | first bi-stream (positional, no hello) | Connection-level token auth. |
-| `StreamHello::LocalForward { dest }` | opener → acceptor | first frame of a `-L` data stream | Asks the acceptor to connect out to `dest` and bridge. |
-| `StreamHello::RemoteForwardData { tunnel_id }` | host → requester | first frame of a `-R` data stream | A connection arrived on a hosted listener; requester maps `tunnel_id` to its local dest. |
-| `StreamHello::RemoteForwardControl` | requester → host | first frame of the `-R` control stream | Opens remote-forward negotiation. |
-| `RemoteForwardRequest { tunnel_id, bind }` | requester → host | `-R` control stream | One per `-R`: asks the host to bind `bind`. |
-| `RemoteForwardResponse { tunnel_id, accepted, reason, bound_addr }` | host → requester | `-R` control stream | Result of a bind, including the actual `bound_addr`. |
-| `StreamAck { accepted, reason }` | acceptor → opener | per data stream | Acceptance reply once the acceptor has connected out (or failed). |
+| `StreamHello::LocalForward { source }` | requester → acceptor | first frame of a request data stream | Asks the acceptor to connect out to `source` (after the acceptor's `allowed_sources` check) and bridge. |
+| `StreamAck { accepted, reason }` | acceptor → requester | per data stream | Acceptance reply once the acceptor passes the allowlist and connects out (or rejects/fails). |
 
 ### TCP Tunneling Architecture
 
@@ -846,8 +731,8 @@ graph TB
     end
 
     subgraph "Connect Side (dials target)"
-        H[Read StreamHello + route]
-        I[Connect to dest / local dest]
+        H[Read StreamHello + check allowed_sources]
+        I[Connect out to source]
         J[StreamAck + Async Read/Write]
     end
     
@@ -956,16 +841,16 @@ The `iroh::Endpoint` provides:
 - **Discovery**: Automatic peer discovery via Pkarr/DNS/mDNS
 - **Relay**: Fallback relay servers for NAT traversal
 - **QUIC**: Built-in QUIC transport with hole punching
-- **Identity**: Ed25519-based peer identity and authentication
+- **Identity**: Ephemeral Ed25519 peer identity, regenerated each run
 
 ### Peer Runtime (iroh_mode/peer.rs)
 
-`run_peer(PeerConfig)` is the single entry point. It validates relay-only usage, builds the ALPN, and dispatches on `connect`:
+`run_peer(PeerConfig)` is the single entry point. It validates relay-only usage and dispatches on `config.role` (resolved at startup from the TUI or env vars). The ALPN is the fixed `ALPN` constant.
 
-- `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`.
+- `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`. When `announce_endpoint` is set (non-interactive mode) it prints `node_id:` and `auth_token:` to stderr.
 - `run_dial` — `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs three concurrent halves over the one connection: an `accept_loop` (incoming streams), one task per local-forward listener (`run_local_forward`), and a remote-forward requester task (`request_remote_forwards`). Everything is torn down when `conn.closed()` resolves.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs two concurrent halves over the one connection: an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out) and a `request_supervisor` that starts/stops our own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request. With `DUOPIPE_AUTOSTART_REQUESTS=1` every request is started on connect. Everything is torn down when `conn.closed()` resolves.
 
 ---
 
@@ -1026,7 +911,7 @@ has its own internal reconnect loop; the process only exits on fatal errors.
 |------|----------|---------|
 | 0 | Success | Normal termination |
 | 1 | General error | Unexpected/uncategorized failures |
-| 2 | Configuration | Missing connect role, missing `--peer-node-id`/secret, invalid token format, bad ALPN, bad `-L`/`-R` address |
+| 2 | Configuration | Missing/invalid node id, invalid token format, bad request address or `allowed_sources` CIDR |
 | 3 | Authentication | Token rejected by peer, auth response timeout |
 | 10 | Connection failed | Relay timeout, endpoint offline, peer unreachable |
 | 11 | Connection lost | QUIC connection closed after tunnel was established |
@@ -1051,9 +936,9 @@ Retry guidance:
 
 | Feature | Support |
 |---------|---------|
-| Bidirectional tunnels | **Yes** — `-L` and `-R` on either peer over one connection |
+| Bidirectional tunnels | **Yes** — either peer may request tunnels of the other over one connection |
 | Multi-Session | **Yes** — many concurrent data streams per connection (`max_sessions`) |
-| Dynamic destinations | **Yes** — each `-L`/`-R` names its own `dest`/`bind` |
+| Per-tunnel addresses | **Yes** — each `[[request]]` names its own `remote_source` / `local_listen` |
 | Encryption | QUIC/TLS 1.3 |
 | Platform | Linux, macOS, Windows |
 

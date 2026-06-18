@@ -3,48 +3,39 @@
 # Usage: duopipe peer -c peer.toml
 #        duopipe peer --default-config   # loads ~/.config/duopipe/peer.toml
 #
-# One peer DIALS (connect = "dial"), the other LISTENS (connect = "listen").
-# Over the single connection, EITHER side may declare:
-#   - local forwards  (-L): this peer listens locally, the peer connects to dest
-#   - remote forwards (-R): the peer listens, forwarding back to our local dest
+# `duopipe peer` is interactive: on startup the TUI asks whether to connect to an
+# existing instance. The role (dial/listen), the target node id, and (if missing)
+# the auth token are answered there — they are NOT config keys. This file supplies
+# the rest: the shared auth token, tunnel requests, the allowlist, relays, tuning.
 #
-# Trust model: once ALPN + token auth succeeds, the peer is fully trusted (there
-# are no per-destination allowlists). CLI flags take precedence over this file.
+# Tunnel model: each side always *requests* tunnels from the other. A [[request]]
+# binds a local listener and asks the peer to connect out to a remote 'source';
+# traffic is bridged between them. Requests do NOT start automatically — the TUI
+# lists them and you start/stop each one with Enter (in test mode only, with
+# DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start all on connect).
+#
+# Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
+# requests one of OUR sources we only honor addresses inside [allowed_sources]
+# (separate CIDR lists per protocol). Fail-closed: an empty or absent allowlist
+# rejects every incoming request. The iroh identity key is ephemeral (regenerated
+# every run), so a listening instance's node id changes between runs.
 
-# Connection role: "dial" or "listen".
-connect = "dial"
-
-# --- when connect = "dial" ---
-# EndpointId of the peer to dial. Get it from the listening peer's startup log
-# or via: duopipe show-id --secret-file peer.key
-peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
-
-# Auth token presented to the listening peer.
-# Generate with: duopipe generate-auth-token
+# The shared auth token, presented by both sides. Optional: a fresh listening
+# instance generates one if absent (shown in the TUI). Generate with:
+#   duopipe generate-auth-token
 # SECURITY: Plaintext 'auth_token' is not allowed in config files. Use
 # 'auth_token_file' (recommended), DUOPIPE_AUTH_TOKEN, or an age-encrypted value.
 auth_token_file = "~/.config/duopipe/token.txt"
-
-# --- when connect = "listen" (comment out the dial fields above) ---
-# Stable identity so the dialing peer can reach this one.
-# Generate with: duopipe generate-key --output peer.key
-# secret_file = "./peer.key"
-#
-# Accepted auth tokens (one per line, # comments allowed).
-# auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
-
-# ALPN token (REQUIRED for both roles). Pre-shared token embedded in the QUIC
-# ALPN identifier; rejects unknown peers at the handshake before any stream opens.
-# Both peers must use the same token. Generate with: duopipe generate-alpn-token
-# SECURITY: Plaintext 'alpn_token' is not allowed in config files. Use
-# 'alpn_token_file' (recommended), DUOPIPE_ALPN_TOKEN, or an age-encrypted value.
-alpn_token_file = "~/.config/duopipe/alpn_token.txt"
 
 # Maximum concurrent data streams per connection (default: 100).
 # max_sessions = 100
 
 # Custom relay server URL(s) for failover. Defaults to iroh's public relays.
 # relay_urls = ["https://relay1.example.com", "https://relay2.example.com"]
+
+# Force all traffic through the relay (disables direct P2P). Requires at least
+# one entry in relay_urls (the public relay is rate-limited and not allowed here).
+# relay_only = true
 
 # Custom DNS server URL for iroh endpoint discovery (pkarr), or "none" to disable
 # DNS discovery. NOT system DNS; does not affect destination resolution.
@@ -53,28 +44,37 @@ alpn_token_file = "~/.config/duopipe/alpn_token.txt"
 # dns_server = "none"
 
 # ============================================================================
-# Local forwards (-L): this peer listens locally, the peer connects to dest.
-# The 'dest' scheme (tcp:// or udp://) selects the protocol.
+# Tunnel requests: ask the peer to connect out to 'remote_source'; deliver traffic
+# to a local listener bound at 'local_listen'. The 'remote_source' scheme (tcp://
+# or udp://) selects the protocol. 'name' is the label shown in the TUI. Nothing
+# starts until you activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1
+# in test mode).
 # ============================================================================
-[[local_forward]]
-listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
+[[request]]
+name = "db"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
-[[local_forward]]
-listen = "127.0.0.1:15679"
-dest = "tcp://127.0.0.1:5679"
+[[request]]
+name = "cache"
+remote_source = "tcp://127.0.0.1:5679"
+local_listen = "127.0.0.1:15679"
 
 # ============================================================================
-# Remote forwards (-R): the peer binds 'bind' and forwards back to our 'dest'.
-# The 'bind' scheme (tcp:// or udp://) selects the protocol.
+# Allowed source networks the peer may request of US (CIDR notation).
+# Separate lists for TCP and UDP. Supports IPv4 and IPv6.
+# An empty/omitted `tcp` list defaults to dual-stack localhost (127.0.0.0/8, ::1/128).
+# An empty/omitted `udp` list is fail-closed: every incoming UDP request is rejected.
 # ============================================================================
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
-
-[[remote_forward]]
-bind = "udp://127.0.0.1:5447"
-dest = "127.0.0.1:5447"
+[allowed_sources]
+tcp = [
+    "127.0.0.0/8",      # localhost
+    "192.168.0.0/16",   # private network
+    "::1/128",          # IPv6 localhost
+]
+udp = [
+    "10.0.0.0/8",       # private network
+]
 
 # ============================================================================
 # Encrypted Inline Secrets (Optional)
@@ -93,7 +93,6 @@ dest = "127.0.0.1:5447"
 # encryption_recipient = "age1..."
 #
 # auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
-# alpn_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
 
 # ============================================================================
 # Transport Tuning (Optional)

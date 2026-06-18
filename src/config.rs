@@ -2,11 +2,17 @@
 //!
 //! A single symmetric peer config with all keys at the top level.
 //!
-//! `connect` selects the connection role ("dial" or "listen"). Over one
-//! established connection a peer can run many tunnels in both directions:
-//! local forwards (`-L`, `[[local_forward]]`) and remote forwards
-//! (`-R`, `[[remote_forward]]`). `validate()` checks required fields and
-//! address formats at parse time.
+//! The connection role is chosen interactively at startup (or via env vars for
+//! tests), not in the config. Over one established connection a peer always
+//! *requests* tunnels from the other party: each `[[request]]` names a remote
+//! `source` on the peer to connect out to and a local `listen` address where
+//! the traffic is delivered. Requests are activated interactively (nothing
+//! starts automatically). When the peer requests one of *our* sources, the
+//! `[allowed_sources]` CIDR lists gate what we are willing to expose. An empty or
+//! absent TCP list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); an
+//! empty or absent UDP list rejects everything (fail-closed). `validate()` checks
+//! address and CIDR formats at parse time. The single `auth_token` is the shared
+//! secret used by both sides.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -20,43 +26,29 @@ use std::path::{Path, PathBuf};
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
-    /// Connection role: "dial" (connect out to `peer_node_id`) or "listen" (accept).
-    pub connect: Option<ConnectRole>,
-    /// EndpointId of the peer to dial (required when `connect = "dial"`).
-    pub peer_node_id: Option<String>,
-    /// Local forwards (-L): this peer listens locally and forwards to the peer's `dest`.
+    /// Tunnel requests this peer can make of the other party. Each entry asks the
+    /// peer to connect out to a remote `source`; traffic is delivered to a local
+    /// `listen` address. Activated interactively — nothing starts automatically.
     #[serde(default)]
-    pub local_forward: Vec<LocalForward>,
-    /// Remote forwards (-R): ask the peer to bind `bind` and forward back to our `dest`.
+    pub request: Vec<RequestEntry>,
+    /// Source networks (CIDR) this peer is willing to expose when the other party
+    /// requests one of *our* sources. Fail-closed: empty/absent rejects everything.
     #[serde(default)]
-    pub remote_forward: Vec<RemoteForward>,
-    /// Path to secret key file for persistent identity (required when listening).
-    pub secret_file: Option<PathBuf>,
-    /// Base64-encoded secret key for persistent identity.
-    /// Prefer `secret_file` in production; inline secrets are best kept to testing or
-    /// special cases due to VCS/log exposure risk. Secret files should be 0600 on Unix.
-    pub secret: Option<String>,
+    pub allowed_sources: AllowedSources,
     pub relay_urls: Option<Vec<String>>,
+    /// Force all traffic through the relay server (disables direct P2P).
+    /// Requires at least one entry in `relay_urls`.
+    pub relay_only: Option<bool>,
     pub dns_server: Option<String>,
     /// Maximum concurrent data streams per connection (default: 100).
     pub max_sessions: Option<usize>,
-    /// Authentication tokens accepted from dialing peers (used when listening).
-    /// Prefer `auth_tokens_file` in production; inline tokens are best kept to testing or
-    /// special cases due to VCS/log exposure risk.
-    pub auth_tokens: Option<Vec<String>>,
-    /// Path to file containing accepted authentication tokens (used when listening).
-    /// One token per line, # comments allowed.
-    pub auth_tokens_file: Option<PathBuf>,
-    /// Authentication token presented to the peer (used when dialing).
-    /// Prefer `auth_token_file` in production to avoid exposing tokens in config files.
+    /// The shared authentication token, used by both sides of the connection.
+    /// Optional: when starting a fresh (listening) instance without one, a token
+    /// is generated and shown in the TUI. Prefer `auth_token_file` or an
+    /// age-encrypted value in production to avoid exposing it in config files.
     pub auth_token: Option<String>,
-    /// Path to file containing the authentication token (used when dialing).
+    /// Path to file containing the authentication token.
     pub auth_token_file: Option<PathBuf>,
-    /// ALPN token for QUIC handshake-level filtering.
-    /// Both peers must use the same token.
-    pub alpn_token: Option<String>,
-    /// Path to file containing the ALPN token.
-    pub alpn_token_file: Option<PathBuf>,
     /// Path to age identity (private key) file for decrypting age-encrypted values.
     pub encryption_key_file: Option<PathBuf>,
     /// Age public key (recipient) for encrypting values in this config.
@@ -70,9 +62,7 @@ pub struct PeerConfig {
 }
 
 impl PeerConfig {
-    /// Reject plaintext sensitive fields when config is loaded from a file.
-    ///
-    /// Checked fields: `auth_token`, `auth_tokens`, `alpn_token`, `secret`.
+    /// Reject a plaintext `auth_token` when config is loaded from a file.
     ///
     /// Age-encrypted values (detected by `ageenc:` prefix) are allowed through;
     /// they will be decrypted later via `decrypt_secrets()`.
@@ -82,31 +72,6 @@ impl PeerConfig {
             anyhow::bail!(
                 "Plaintext 'auth_token' is not allowed in config files. \
                  Use 'auth_token_file', set DUOPIPE_AUTH_TOKEN env var, \
-                 or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        if self
-            .auth_tokens
-            .as_ref()
-            .is_some_and(|vs| vs.iter().any(|v| !is_age_encrypted(v)))
-        {
-            anyhow::bail!(
-                "Plaintext 'auth_tokens' is not allowed in config files. \
-                 Use 'auth_tokens_file', set DUOPIPE_AUTH_TOKENS env var, \
-                 or use age-encrypted values. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        if self.alpn_token.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
-            anyhow::bail!(
-                "Plaintext 'alpn_token' is not allowed in config files. \
-                 Use 'alpn_token_file', set DUOPIPE_ALPN_TOKEN env var, \
-                 or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        if self.secret.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
-            anyhow::bail!(
-                "Plaintext 'secret' is not allowed in config files. \
-                 Use 'secret_file', set DUOPIPE_SECRET env var, \
                  or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
             );
         }
@@ -123,16 +88,7 @@ impl PeerConfig {
         let has_encrypted = self
             .auth_token
             .as_ref()
-            .is_some_and(|v| is_age_encrypted(v))
-            || self
-                .alpn_token
-                .as_ref()
-                .is_some_and(|v| is_age_encrypted(v))
-            || self.secret.as_ref().is_some_and(|v| is_age_encrypted(v))
-            || self
-                .auth_tokens
-                .as_ref()
-                .is_some_and(|vs| vs.iter().any(|v| is_age_encrypted(v)));
+            .is_some_and(|v| is_age_encrypted(v));
 
         if !has_encrypted {
             return Ok(());
@@ -141,7 +97,7 @@ impl PeerConfig {
         let key_path = encryption_key_file.ok_or_else(|| {
             anyhow::anyhow!(
                 "Age-encrypted values found but no encryption key file specified.\n\
-                 Set encryption_key_file in config, use --encryption-key-file, \
+                 Set encryption_key_file in config \
                  or set DUOPIPE_ENCRYPTION_KEY_FILE env var."
             )
         })?;
@@ -151,73 +107,64 @@ impl PeerConfig {
                 self.auth_token =
                     Some(decrypt_value(v, key_path).context("Failed to decrypt auth_token")?);
             }
-        if let Some(ref v) = self.alpn_token
-            && is_age_encrypted(v) {
-                self.alpn_token =
-                    Some(decrypt_value(v, key_path).context("Failed to decrypt alpn_token")?);
-            }
-        if let Some(ref v) = self.secret
-            && is_age_encrypted(v) {
-                self.secret =
-                    Some(decrypt_value(v, key_path).context("Failed to decrypt secret")?);
-            }
-        if let Some(ref vs) = self.auth_tokens {
-            let mut decrypted = Vec::with_capacity(vs.len());
-            for (i, v) in vs.iter().enumerate() {
-                if is_age_encrypted(v) {
-                    decrypted.push(
-                        decrypt_value(v, key_path)
-                            .with_context(|| format!("Failed to decrypt auth_tokens[{}]", i))?,
-                    );
-                } else {
-                    decrypted.push(v.clone());
-                }
-            }
-            self.auth_tokens = Some(decrypted);
-        }
 
         Ok(())
     }
 }
 
-/// Connection role: who establishes the QUIC connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConnectRole {
-    /// Dial out to `peer_node_id`. Identity may be ephemeral.
-    Dial,
-    /// Accept incoming connections. Requires a stable secret.
-    Listen,
-}
-
-/// Local forward (-L): this peer binds `listen` locally and the peer connects to `dest`.
+/// A tunnel request: ask the peer to connect out to `remote_source` and deliver
+/// the traffic to a local listener bound at `local_listen`.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct LocalForward {
-    /// Local address to listen on (host:port).
-    pub listen: String,
-    /// Destination the peer connects to (tcp://host:port or udp://host:port).
+pub struct RequestEntry {
+    /// Display label shown in the TUI tunnel list.
+    pub name: String,
+    /// Remote origin on the peer to connect to (tcp://host:port or udp://host:port).
     /// The scheme selects the protocol of the local listener.
-    pub dest: String,
+    pub remote_source: String,
+    /// Local address to listen on (host:port) where traffic is delivered.
+    pub local_listen: String,
 }
 
-/// Remote forward (-R): ask the peer to bind `bind`, forwarding back to our local `dest`.
+/// Source networks (CIDR) we will expose when the peer requests one of our
+/// sources. Separate lists for TCP and UDP. An empty TCP list defaults to
+/// dual-stack localhost (see [`AllowedSources::with_localhost_tcp_default`]); an
+/// empty UDP list ⇒ reject all UDP (fail-closed).
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct RemoteForward {
-    /// Address the peer should bind (tcp://host:port or udp://host:port).
-    /// The scheme selects the protocol.
-    pub bind: String,
-    /// Our local destination to connect to (host:port).
-    pub dest: String,
+pub struct AllowedSources {
+    /// Allowed TCP source networks (CIDR notation, e.g. "127.0.0.0/8", "::1/128").
+    #[serde(default)]
+    pub tcp: Vec<String>,
+    /// Allowed UDP source networks (CIDR notation).
+    #[serde(default)]
+    pub udp: Vec<String>,
+}
+
+/// Dual-stack localhost networks used to default an empty TCP allowlist.
+pub const DEFAULT_LOCALHOST_TCP: [&str; 2] = ["127.0.0.0/8", "::1/128"];
+
+impl AllowedSources {
+    /// True when no networks are configured for either protocol.
+    pub fn is_empty(&self) -> bool {
+        self.tcp.is_empty() && self.udp.is_empty()
+    }
+
+    /// Fill an empty TCP allowlist with dual-stack localhost. An empty TCP list
+    /// otherwise rejects everything (fail-closed), which is useless for the common
+    /// loopback-tunnel case. UDP is left untouched (empty UDP still rejects all).
+    pub fn with_localhost_tcp_default(mut self) -> Self {
+        if self.tcp.is_empty() {
+            self.tcp = DEFAULT_LOCALHOST_TCP.iter().map(|s| s.to_string()).collect();
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
     /// TOML file on disk — plaintext secrets rejected
     File,
-    /// JSON from stdin — all values allowed
-    Stdin,
     /// No config, defaults only
     None,
 }
@@ -352,19 +299,34 @@ fn validate_host_port(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate local- and remote-forward address formats.
-/// Used for both config-file forwards and CLI `-L`/`-R` specs.
-pub fn validate_forward_specs(
-    local: &[LocalForward],
-    remote: &[RemoteForward],
-) -> Result<()> {
-    for lf in local {
-        validate_host_port(&lf.listen, "local_forward.listen")?;
-        validate_tcp_udp_url(&lf.dest, "local_forward.dest")?;
+/// Validate tunnel-request address formats (`remote_source` URL + `local_listen`
+/// host:port).
+pub fn validate_request_specs(requests: &[RequestEntry]) -> Result<()> {
+    for r in requests {
+        validate_tcp_udp_url(&r.remote_source, "request.remote_source")?;
+        validate_host_port(&r.local_listen, "request.local_listen")?;
     }
-    for rf in remote {
-        validate_tcp_udp_url(&rf.bind, "remote_forward.bind")?;
-        validate_host_port(&rf.dest, "remote_forward.dest")?;
+    Ok(())
+}
+
+/// Validate that a string is valid CIDR notation (IPv4 or IPv6).
+pub fn validate_cidr(cidr: &str) -> Result<()> {
+    cidr.parse::<ipnet::IpNet>().with_context(|| {
+        format!(
+            "Invalid CIDR network '{}'. Expected format: 192.168.0.0/16 or ::1/128",
+            cidr
+        )
+    })?;
+    Ok(())
+}
+
+/// Validate the CIDR entries in both allowed-source lists.
+pub fn validate_allowed_sources(allowed: &AllowedSources) -> Result<()> {
+    for cidr in &allowed.tcp {
+        validate_cidr(cidr).context("Invalid TCP allowed_sources")?;
+    }
+    for cidr in &allowed.udp {
+        validate_cidr(cidr).context("Invalid UDP allowed_sources")?;
     }
     Ok(())
 }
@@ -429,27 +391,19 @@ pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Res
 impl PeerConfig {
     /// Validate config structure and address formats.
     ///
-    /// Note: the connection role (dial/listen) and its required fields
-    /// (`peer_node_id` for dial, secret for listen) are resolved and enforced in
-    /// `main.rs` after merging CLI/env overrides, since those can supply the values.
+    /// Note: the connection role (dial/listen) and the target node id are
+    /// resolved interactively at startup (or via env vars for tests), so they
+    /// are not part of the config and not checked here.
     pub fn validate(&self, source: ConfigSource) -> Result<()> {
         let iroh = self;
         if source == ConfigSource::File {
             iroh.reject_plaintext_secrets()?;
         }
-        if iroh.secret.is_some() && iroh.secret_file.is_some() {
-            anyhow::bail!("Use only one of 'secret' or 'secret_file'.");
-        }
-        if iroh.auth_tokens.is_some() && iroh.auth_tokens_file.is_some() {
-            anyhow::bail!("Use only one of 'auth_tokens' or 'auth_tokens_file'.");
-        }
         if iroh.auth_token.is_some() && iroh.auth_token_file.is_some() {
             anyhow::bail!("Use only one of 'auth_token' or 'auth_token_file'.");
         }
-        if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
-            anyhow::bail!("Use only one of 'alpn_token' or 'alpn_token_file'.");
-        }
-        validate_forward_specs(&iroh.local_forward, &iroh.remote_forward)?;
+        validate_request_specs(&iroh.request)?;
+        validate_allowed_sources(&iroh.allowed_sources)?;
         validate_transport_tuning(&iroh.transport, "transport")?;
 
         Ok(())
@@ -490,25 +444,6 @@ fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
 }
 
-/// Parse configuration as JSON from a reader (e.g. stdin).
-///
-/// Uses `serde_json::Deserializer::from_reader` to parse exactly one JSON value
-/// without calling `end()`, so it returns immediately after the closing `}`
-/// without waiting for EOF. This leaves the rest of the stream unconsumed.
-/// Times out after 30 seconds since this is intended for automation/IPC.
-pub async fn parse_config_from_reader<T: for<'de> Deserialize<'de> + Send + 'static, R: std::io::Read + Send + 'static>(reader: R) -> Result<T> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || {
-            let mut de = serde_json::Deserializer::from_reader(reader);
-            T::deserialize(&mut de).context("Failed to parse JSON config from stdin")
-        }),
-    )
-    .await
-    .context("Timed out waiting for JSON config from stdin (30s)")? // timeout
-    .context("Failed to read config from stdin")? // join error
-}
-
 /// Resolve the default peer config path (~/.config/duopipe/peer.toml).
 fn default_peer_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config").join("duopipe").join("peer.toml"))
@@ -539,27 +474,27 @@ mod tests {
     #[test]
     fn parses_toml_config() {
         let toml = r#"
-connect = "dial"
-peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
 max_sessions = 100
 
-[[local_forward]]
-listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
+[[request]]
+name = "db"
+remote_source = "tcp://127.0.0.1:5678"
+local_listen = "127.0.0.1:15678"
 
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
+[allowed_sources]
+tcp = ["127.0.0.0/8", "::1/128"]
+udp = ["10.0.0.0/8"]
 
 [transport]
 congestion_controller = "bbr"
 receive_window = 67108864
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
-        assert_eq!(cfg.connect, Some(ConnectRole::Dial));
         assert_eq!(cfg.max_sessions, Some(100));
-        assert_eq!(cfg.local_forward.len(), 1);
-        assert_eq!(cfg.remote_forward.len(), 1);
+        assert_eq!(cfg.request.len(), 1);
+        assert_eq!(cfg.request[0].name, "db");
+        assert_eq!(cfg.allowed_sources.tcp.len(), 2);
+        assert_eq!(cfg.allowed_sources.udp.len(), 1);
         assert_eq!(
             cfg.transport.congestion_controller,
             CongestionController::Bbr
@@ -569,15 +504,26 @@ receive_window = 67108864
     }
 
     #[test]
+    fn rejects_invalid_cidr() {
+        let toml = r#"
+[allowed_sources]
+tcp = ["not-a-cidr"]
+"#;
+        let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
+        let err = cfg.validate(ConfigSource::File).unwrap_err();
+        assert!(err.to_string().contains("allowed_sources"), "error was: {err}");
+    }
+
+    #[test]
     fn rejects_unknown_field() {
-        // A leftover `mode = "iroh"` (or any unknown top-level key) must now error.
+        // Any unknown top-level key (e.g. a removed `connect`) must now error.
         // Avoid unwrap_err so PeerConfig need not derive Debug (it holds secrets).
-        let toml = "connect = \"dial\"\nmode = \"iroh\"\n";
+        let toml = "connect = \"dial\"\n";
         let err = match toml::from_str::<PeerConfig>(toml) {
             Ok(_) => panic!("expected unknown-field error"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("mode"), "error was: {err}");
+        assert!(err.contains("connect"), "error was: {err}");
     }
 
     #[test]
@@ -600,112 +546,73 @@ receive_window = 67108864
         assert!(err.to_string().contains("Plaintext 'auth_token'"));
     }
 
-    #[test]
-    fn allows_plaintext_auth_token_from_stdin() {
-        let cfg = peer_config(PeerConfig {
-            auth_token: Some("secret123".into()),
-            ..Default::default()
-        });
-        assert!(cfg.validate(ConfigSource::Stdin).is_ok());
-    }
-
-    #[test]
-    fn rejects_plaintext_auth_tokens_from_file() {
-        let cfg = peer_config(PeerConfig {
-            auth_tokens: Some(vec!["tok1".into()]),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'auth_tokens'"));
-    }
-
-    #[test]
-    fn rejects_plaintext_alpn_token_from_file() {
-        let cfg = peer_config(PeerConfig {
-            alpn_token: Some("alpn123".into()),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'alpn_token'"));
-    }
-
-    #[test]
-    fn rejects_plaintext_secret_from_file() {
-        let cfg = peer_config(PeerConfig {
-            secret: Some("base64secret".into()),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'secret'"));
-    }
-
-    #[test]
-    fn allows_plaintext_secrets_from_stdin() {
-        let cfg = peer_config(PeerConfig {
-            auth_tokens: Some(vec!["tok1".into()]),
-            alpn_token: Some("alpn123".into()),
-            secret: Some("base64secret".into()),
-            ..Default::default()
-        });
-        assert!(cfg.validate(ConfigSource::Stdin).is_ok());
-    }
-
     const FAKE_AGE_ENCRYPTED: &str = "ageenc:YWdlLWVuY3J5cHRpb24=";
 
     #[test]
     fn allows_age_encrypted_secrets_from_file() {
         let cfg = peer_config(PeerConfig {
             auth_token: Some(FAKE_AGE_ENCRYPTED.into()),
-            auth_tokens: Some(vec![FAKE_AGE_ENCRYPTED.into()]),
-            alpn_token: Some(FAKE_AGE_ENCRYPTED.into()),
-            secret: Some(FAKE_AGE_ENCRYPTED.into()),
             ..Default::default()
         });
         assert!(cfg.validate(ConfigSource::File).is_ok());
     }
 
     #[test]
-    fn rejects_mixed_plaintext_age_auth_tokens_from_file() {
+    fn validates_request_address_formats() {
         let cfg = peer_config(PeerConfig {
-            auth_tokens: Some(vec![FAKE_AGE_ENCRYPTED.into(), "plaintext".into()]),
+            request: vec![RequestEntry {
+                name: "ok".into(),
+                remote_source: "tcp://127.0.0.1:5678".into(),
+                local_listen: "127.0.0.1:15678".into(),
+            }],
             ..Default::default()
         });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'auth_tokens'"));
+        assert!(cfg.validate(ConfigSource::File).is_ok());
+
+        let bad_listen = peer_config(PeerConfig {
+            request: vec![RequestEntry {
+                name: "bad-listen".into(),
+                remote_source: "tcp://127.0.0.1:5678".into(),
+                local_listen: "127.0.0.1".into(), // missing port
+            }],
+            ..Default::default()
+        });
+        assert!(bad_listen.validate(ConfigSource::File).is_err());
+
+        let bad_source = peer_config(PeerConfig {
+            request: vec![RequestEntry {
+                name: "bad-source".into(),
+                remote_source: "127.0.0.1:5678".into(), // missing scheme
+                local_listen: "127.0.0.1:15678".into(),
+            }],
+            ..Default::default()
+        });
+        assert!(bad_source.validate(ConfigSource::File).is_err());
     }
 
     #[test]
-    fn validates_forward_address_formats() {
-        let cfg = peer_config(PeerConfig {
-            local_forward: vec![LocalForward {
-                listen: "127.0.0.1:15678".into(),
-                dest: "tcp://127.0.0.1:5678".into(),
-            }],
-            remote_forward: vec![RemoteForward {
-                bind: "tcp://0.0.0.0:6574".into(),
-                dest: "127.0.0.1:6574".into(),
-            }],
-            ..Default::default()
-        });
-        assert!(cfg.validate(ConfigSource::Stdin).is_ok());
+    fn with_localhost_tcp_default_fills_empty_tcp_only() {
+        // Empty TCP -> dual-stack localhost; UDP untouched.
+        let filled = AllowedSources::default().with_localhost_tcp_default();
+        assert_eq!(filled.tcp, vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]);
+        assert!(filled.udp.is_empty());
 
-        let bad_listen = peer_config(PeerConfig {
-            local_forward: vec![LocalForward {
-                listen: "127.0.0.1".into(), // missing port
-                dest: "tcp://127.0.0.1:5678".into(),
-            }],
-            ..Default::default()
-        });
-        assert!(bad_listen.validate(ConfigSource::Stdin).is_err());
+        // Empty TCP but explicit UDP -> TCP defaulted, UDP preserved.
+        let with_udp = AllowedSources {
+            tcp: vec![],
+            udp: vec!["10.0.0.0/8".to_string()],
+        }
+        .with_localhost_tcp_default();
+        assert_eq!(with_udp.tcp, vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]);
+        assert_eq!(with_udp.udp, vec!["10.0.0.0/8".to_string()]);
 
-        let bad_dest = peer_config(PeerConfig {
-            local_forward: vec![LocalForward {
-                listen: "127.0.0.1:15678".into(),
-                dest: "127.0.0.1:5678".into(), // missing scheme
-            }],
-            ..Default::default()
-        });
-        assert!(bad_dest.validate(ConfigSource::Stdin).is_err());
+        // Non-empty TCP -> left verbatim (no localhost added).
+        let explicit = AllowedSources {
+            tcp: vec!["192.168.0.0/16".to_string()],
+            udp: vec![],
+        }
+        .with_localhost_tcp_default();
+        assert_eq!(explicit.tcp, vec!["192.168.0.0/16".to_string()]);
     }
 
     #[test]
