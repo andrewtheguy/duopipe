@@ -32,7 +32,8 @@ pub struct PeerConfig {
     #[serde(default)]
     pub request: Vec<RequestEntry>,
     /// Source networks (CIDR) this peer is willing to expose when the other party
-    /// requests one of *our* sources. Fail-closed: empty/absent rejects everything.
+    /// requests one of *our* sources. Runtime defaulting fills an empty TCP list
+    /// with dual-stack localhost; an empty UDP list rejects all UDP.
     #[serde(default)]
     pub allowed_sources: AllowedSources,
     pub relay_urls: Option<Vec<String>>,

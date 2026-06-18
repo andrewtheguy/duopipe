@@ -11,7 +11,8 @@
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
 //! peer is trusted, but the *acceptor* still gates each requested `source`
-//! against its `allowed_sources` CIDR allowlist (fail-closed) before connecting.
+//! against its `allowed_sources` CIDR allowlist before connecting. Empty TCP
+//! allowlists are defaulted to localhost at startup; empty UDP allowlists reject all.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -91,7 +92,8 @@ pub struct PeerConfig {
     pub role: Role,
     /// EndpointId of the peer to dial (required for `Dial`).
     pub peer_node_id: Option<EndpointId>,
-    /// CIDR allowlist gating which of our sources the peer may request (fail-closed).
+    /// CIDR allowlist gating which of our sources the peer may request.
+    /// Empty TCP is defaulted to localhost in `run_peer`; empty UDP rejects all.
     pub allowed_sources: AllowedSources,
     /// When true, start every configured request as soon as a connection is up
     /// (set from `DUOPIPE_AUTOSTART_REQUESTS` in test mode; see `DUOPIPE_TEST_MODE`).

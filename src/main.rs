@@ -63,9 +63,10 @@ enum Command {
     },
     /// Generate an authentication token
     ///
-    /// The auth token is the shared secret presented by both sides. Put it in a
-    /// config `auth_token`/`auth_token_file`, or set DUOPIPE_AUTH_TOKEN. A fresh
-    /// listening instance generates one automatically if none is provided.
+    /// The auth token is the shared secret presented by both sides. Store it with
+    /// `auth_token_file`, an age-encrypted config `auth_token`, or
+    /// DUOPIPE_AUTH_TOKEN. A fresh listening instance generates one automatically
+    /// if none is provided.
     GenerateAuthToken {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
@@ -163,7 +164,7 @@ fn detect_env_preset(
                 anyhow::anyhow!("DUOPIPE_PEER_NODE_ID is not a valid node id.")
             })?;
             let auth_token = config_auth_token.context(
-                "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN or auth_token in the config.",
+                "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN, auth_token_file, or an age-encrypted auth_token in the config.",
             )?;
             Ok(Some(ResolvedPeer {
                 role: Role::Dial,

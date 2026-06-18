@@ -192,8 +192,9 @@ fn submit_start(state: &mut SetupState) -> Step {
     }
 }
 
-/// Parse a line of space/comma-separated CIDRs, validating each. Empty input is an
-/// empty list (fail-closed for that protocol).
+/// Parse a line of space/comma-separated CIDRs, validating each. Empty input
+/// yields an empty list; `run_peer` later applies the TCP localhost default and
+/// leaves UDP empty.
 fn parse_cidr_list(buffer: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for tok in buffer.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
@@ -695,8 +696,8 @@ mod tests {
     #[test]
     fn allowlist_blank_entries_yield_empty_lists() {
         let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default());
-        // Blank TCP/UDP, default listen role: Enter finishes with empty
-        // (fail-closed) lists.
+        // Blank TCP/UDP, default listen role: Enter finishes with empty lists.
+        // `run_peer` later defaults empty TCP to localhost and leaves UDP empty.
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert!(r.allowed_sources.is_empty());

@@ -1,6 +1,6 @@
 //! Token-based authentication for iroh tunnel connections.
 //!
-//! Provides pre-shared token authentication for the iroh multi-source server.
+//! Provides pre-shared token authentication for the symmetric iroh peer runtime.
 //!
 //! ## Token Format
 //! - Exactly 47 characters

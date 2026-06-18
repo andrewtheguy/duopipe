@@ -87,7 +87,7 @@ pub fn parse_relay_mode(relay_urls: &[String]) -> Result<RelayMode> {
 pub fn validate_relay_only(relay_only: bool, relay_urls: &[String]) -> Result<()> {
     if relay_only && relay_urls.is_empty() {
         anyhow::bail!(
-            "--relay-only requires at least one --relay-url to be specified.\n\
+            "relay_only requires at least one relay_urls entry.\n\
             The default public relay is rate-limited and cannot be used for relay-only mode."
         );
     }
@@ -118,7 +118,8 @@ pub fn print_relay_status(relay_urls: &[String], relay_only: bool, using_custom_
 /// * `relay_mode` - The relay mode to use
 /// * `relay_only` - If true, only use relay connections (no direct P2P).
 /// * `dns_server` - Optional custom DNS server URL (e.g., "https://dns.example.com"), or "none" to disable DNS discovery
-/// * `secret_key` - Optional secret key (required for publishing to custom DNS server)
+/// * `secret_key` - Optional iroh identity key. Normal runtime passes `None`,
+///   so iroh generates an ephemeral identity.
 /// * `transport_tuning` - Optional transport layer tuning (congestion control, buffer sizes)
 pub fn create_endpoint_builder(
     relay_mode: RelayMode,
@@ -274,7 +275,8 @@ async fn wait_for_endpoint_online(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-/// Create a server endpoint with optional persistent identity.
+/// Create a listening endpoint. Normal runtime passes no secret key, so the
+/// endpoint identity is ephemeral and the node id changes every run.
 pub async fn create_server_endpoint(
     relay_urls: &[String],
     relay_only: bool,
@@ -305,8 +307,8 @@ pub async fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create a client endpoint.
-/// If a secret key is provided, the client will use a persistent identity for authentication.
+/// Create a dialing endpoint. Normal runtime passes no secret key, so the
+/// endpoint identity is ephemeral.
 pub async fn create_client_endpoint(
     relay_urls: &[String],
     relay_only: bool,
@@ -320,7 +322,7 @@ pub async fn create_client_endpoint(
 
     let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret_key, transport_tuning)?;
 
-    // Set the secret key for persistent identity (used for authentication)
+    // Set a caller-supplied identity key. The normal runtime leaves this unset.
     if let Some(secret) = secret_key {
         builder = builder.secret_key(secret.clone());
     }
@@ -335,7 +337,7 @@ pub async fn create_client_endpoint(
     Ok(endpoint)
 }
 
-/// Connect to a server endpoint with relay failover support.
+/// Connect to a listening endpoint with relay failover support.
 pub async fn connect_to_server(
     endpoint: &Endpoint,
     server_id: EndpointId,
