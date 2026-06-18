@@ -7,8 +7,9 @@ pub enum ErrorCategory {
     Config,
     /// Authentication failure — do not retry (wrong credentials).
     Auth,
-    /// Peer refused an authenticated connection (e.g. it already has an active
-    /// peer) — do not retry, since reconnecting would only race for the slot.
+    /// Peer refused an authenticated connection because its session is bound to a
+    /// different node id — do not retry, since this node id can never match until
+    /// the listener unbinds or restarts.
     Rejected,
     /// Connection establishment failed — retry only if it worked before.
     Connection,

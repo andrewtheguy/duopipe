@@ -156,12 +156,38 @@ fn tunnel_row_for(req: &RequestEntry) -> TunnelRow {
     }
 }
 
-/// A currently-connected, authenticated peer (listen role may have several).
+/// A currently-connected, authenticated peer (listen role; at most one at a time
+/// under the single-session model).
 #[derive(Clone)]
 pub struct PeerRow {
     pub remote_id: String,
     pub connected_since: Instant,
     pub path: PathInfo,
+}
+
+/// Sticky single-session binding state for the listen role. Set once on the first
+/// successful auth and held for the program's lifetime (see [`AppState::session`]).
+#[derive(Default)]
+struct SessionBinding {
+    /// Node id bound on first successful auth; cleared only by
+    /// [`AppState::unbind_session`] or process exit.
+    bound_id: Option<String>,
+    /// Whether a connection from the bound peer is currently live (concurrency guard
+    /// against a second connection duplicating tunnel binds).
+    connected: bool,
+}
+
+/// Outcome of an authenticated peer trying to take the single session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerAdmission {
+    /// Admitted: the session is now bound to this peer and marked connected.
+    Admitted,
+    /// A live connection already holds the session (same bound peer, old connection
+    /// still tearing down). Transient — the dialer should retry with backoff.
+    Busy,
+    /// The session is bound to a different node id. Sticky — the dialer must not
+    /// retry (its node id won't match until the listener unbinds or restarts).
+    WrongPeer,
 }
 
 /// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
@@ -179,19 +205,22 @@ pub struct AppState {
     conn_status: RwLock<ConnStatus>,
     path: RwLock<PathInfo>,
     peers: RwLock<Vec<PeerRow>>,
-    /// Single-owner slot for the listen role: holds the `remote_id` of the one
-    /// authenticated peer allowed to drive tunnels at a time. Claimed atomically
-    /// after auth so a second dialer is rejected rather than duplicating binds and
-    /// reseeding the shared tunnel table. `None` when no peer is connected.
-    active_peer: RwLock<Option<String>>,
+    /// Sticky single-session binding for the listen role. The first peer to
+    /// authenticate binds the session to its `remote_id` for the lifetime of the
+    /// program; only that node id may (re)connect afterwards. Any other node id is
+    /// rejected until the operator unbinds (TUI `u`) or restarts. The `connected`
+    /// flag is the concurrency guard that stops a second live connection from
+    /// duplicating tunnel binds while one is already active.
+    session: RwLock<SessionBinding>,
     /// Authoritative tunnel-request list, seeded from config and appended to at
     /// runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this, so a
     /// row's position is its request index (used to start/stop it).
     requests: RwLock<Vec<RequestEntry>>,
     tunnels: RwLock<Vec<TunnelRow>>,
-    /// Live session limiter; `used = max - available_permits()`.
+    /// Live stream limiter; `used = max - available_permits()`. Caps concurrent
+    /// forwarded connections across all tunnels in the one session.
     semaphore: RwLock<Option<Arc<Semaphore>>>,
-    sessions_max: RwLock<usize>,
+    streams_max: RwLock<usize>,
     /// Broadcast channel for tunnel start/stop commands (TUI -> connection supervisor).
     tunnel_tx: broadcast::Sender<TunnelCommand>,
     pub shutdown: CancellationToken,
@@ -215,11 +244,11 @@ impl AppState {
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
-            active_peer: RwLock::new(None),
+            session: RwLock::new(SessionBinding::default()),
             requests: RwLock::new(requests),
             tunnels: RwLock::new(Vec::new()),
             semaphore: RwLock::new(None),
-            sessions_max: RwLock::new(0),
+            streams_max: RwLock::new(0),
             tunnel_tx,
             shutdown: CancellationToken::new(),
             logs,
@@ -268,10 +297,10 @@ impl AppState {
         *self.path.write() = path;
     }
 
-    /// Record the live session limiter so the gauge tracks it exactly.
+    /// Record the live stream limiter so the gauge tracks it exactly.
     pub fn set_semaphore(&self, semaphore: Arc<Semaphore>, max: usize) {
         *self.semaphore.write() = Some(semaphore);
-        *self.sessions_max.write() = max;
+        *self.streams_max.write() = max;
     }
 
     /// Update the path of a connected peer (listen role), matched by `remote_id`.
@@ -282,28 +311,39 @@ impl AppState {
         }
     }
 
-    /// Claim the single peer slot for `remote_id` (listen role). Returns `true` if
-    /// the slot was free and is now held by the caller, `false` if another peer
-    /// already holds it (the caller should reject this connection). The write lock
-    /// serializes simultaneous auths so exactly one claimant wins.
-    pub fn try_claim_peer(&self, remote_id: &str) -> bool {
-        let mut slot = self.active_peer.write();
-        if slot.is_none() {
-            *slot = Some(remote_id.to_string());
-            true
-        } else {
-            false
+    /// Decide whether an authenticated `remote_id` may take the single session
+    /// (listen role). The write lock serializes simultaneous auths so exactly one
+    /// peer wins the bind. See [`PeerAdmission`]. On `Admitted` the session is bound
+    /// (first time) and marked connected; the caller owns the live connection.
+    pub fn admit_peer(&self, remote_id: &str) -> PeerAdmission {
+        let mut b = self.session.write();
+        if b.bound_id.as_deref().is_some_and(|id| id != remote_id) {
+            return PeerAdmission::WrongPeer;
         }
+        if b.connected {
+            return PeerAdmission::Busy;
+        }
+        b.bound_id.get_or_insert_with(|| remote_id.to_string());
+        b.connected = true;
+        PeerAdmission::Admitted
     }
 
-    /// Release the peer slot if `remote_id` holds it. A no-op for a connection that
-    /// never claimed it (e.g. one rejected as a duplicate), so it is safe to call
-    /// unconditionally on teardown.
-    pub fn release_peer(&self, remote_id: &str) {
-        let mut slot = self.active_peer.write();
-        if slot.as_deref() == Some(remote_id) {
-            *slot = None;
-        }
+    /// Mark the live connection gone, keeping the sticky binding so the same peer
+    /// may reconnect but a different node id still cannot. Called on teardown by the
+    /// connection that was `Admitted`.
+    pub fn disconnect_peer(&self) {
+        self.session.write().connected = false;
+    }
+
+    /// Clear the sticky binding so a different node id may bind next (TUI `u`). The
+    /// `connected` guard is left untouched: any in-flight connection runs to its end.
+    pub fn unbind_session(&self) {
+        self.session.write().bound_id = None;
+    }
+
+    /// The node id currently bound to the session, if any (for display).
+    pub fn bound_peer(&self) -> Option<String> {
+        self.session.read().bound_id.clone()
     }
 
     pub fn add_peer(&self, remote_id: String) {
@@ -371,12 +411,12 @@ impl AppState {
 
     /// Take an owned snapshot for rendering (releases all locks before returning).
     pub fn snapshot(&self) -> AppSnapshot {
-        let sessions_max = *self.sessions_max.read();
-        let sessions_used = self
+        let streams_max = *self.streams_max.read();
+        let streams_used = self
             .semaphore
             .read()
             .as_ref()
-            .map(|s| sessions_max.saturating_sub(s.available_permits()))
+            .map(|s| streams_max.saturating_sub(s.available_permits()))
             .unwrap_or(0);
         AppSnapshot {
             role: self.role,
@@ -387,9 +427,10 @@ impl AppState {
             conn_status: self.conn_status.read().clone(),
             path: self.path.read().clone(),
             peers: self.peers.read().clone(),
+            bound_peer: self.bound_peer(),
             tunnels: self.tunnels.read().clone(),
-            sessions_used,
-            sessions_max,
+            streams_used,
+            streams_max,
         }
     }
 }
@@ -404,9 +445,12 @@ pub struct AppSnapshot {
     pub conn_status: ConnStatus,
     pub path: PathInfo,
     pub peers: Vec<PeerRow>,
+    /// Node id bound to the session (listen role), even when no peer is currently
+    /// connected. Drives the "bound — waiting" display and the unbind hint.
+    pub bound_peer: Option<String>,
     pub tunnels: Vec<TunnelRow>,
-    pub sessions_used: usize,
-    pub sessions_max: usize,
+    pub streams_used: usize,
+    pub streams_max: usize,
 }
 
 #[cfg(test)]
@@ -451,20 +495,27 @@ mod tests {
     }
 
     #[test]
-    fn single_active_peer_slot_admits_one_and_frees_on_release() {
+    fn session_binds_to_first_peer_and_stays_sticky() {
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
 
-        // First claimant wins the slot; a second, different peer is rejected.
-        assert!(state.try_claim_peer("peer-a"));
-        assert!(!state.try_claim_peer("peer-b"));
+        // First peer to authenticate binds the session.
+        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Admitted);
+        // A different node id is rejected as the wrong peer while bound.
+        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::WrongPeer);
+        // A second live connection from the same peer is transient-busy.
+        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Busy);
 
-        // Releasing a non-holder is a no-op (rejected peers call this on teardown),
-        // so the holder keeps the slot.
-        state.release_peer("peer-b");
-        assert!(!state.try_claim_peer("peer-b"));
+        // The binding is sticky: even after the peer disconnects, a different node
+        // id still cannot bind...
+        state.disconnect_peer();
+        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::WrongPeer);
+        // ...but the originally-bound peer may reconnect.
+        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Admitted);
 
-        // Once the holder releases, the next dialer can take over.
-        state.release_peer("peer-a");
-        assert!(state.try_claim_peer("peer-b"));
+        // Unbinding (TUI `u`) frees the session for a new node id once the current
+        // connection ends.
+        state.disconnect_peer();
+        state.unbind_session();
+        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::Admitted);
     }
 }

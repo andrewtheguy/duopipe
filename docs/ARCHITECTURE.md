@@ -275,7 +275,7 @@ graph TB
     style R fill:#FFCCBC
 ```
 
-A per-connection `Semaphore` (default `max_sessions = 100`) bounds concurrent **data** streams in both directions. The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. The CIDR allowlist check runs **before** a permit is acquired, so rejected sources never consume one; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
+A per-connection `Semaphore` (default `max_streams = 100`) bounds concurrent forwarded **data** streams in both directions (surfaced in the TUI as the `streams` gauge). The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. The CIDR allowlist check runs **before** a permit is acquired, so rejected sources never consume one; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
 
 ### Request Data Flow
 
@@ -431,7 +431,7 @@ graph TB
     subgraph "Options"
         E[auth_token* — single shared token<br/>both peers]
         G[request[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
-        H[max_sessions]
+        H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
         K[encryption_key_file / encryption_recipient]
@@ -599,10 +599,18 @@ graph TB
 **Two trusted endpoints, coordinated out-of-band.** duopipe is built for a link between **two parties who trust each other** or **one person across their own devices** — not a public service or multi-tenant gateway. Several design choices follow directly from this assumption:
 
 - **Out-of-band credential exchange.** The ephemeral node id and the shared auth token change every run and carry no directory or discovery-by-name; the two operators pass them over a side channel they already share (chat, an existing SSH session, a password manager, a second device under their control) before connecting.
-- **Interactive, co-operated runtime.** Both ends run the TUI and watch shared status — connection state, the single active peer slot, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* happens between the two humans (or the one human on two screens), not automatically.
+- **Interactive, co-operated runtime.** Both ends run the TUI and watch shared status — connection state, the bound peer, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* happens between the two humans (or the one human on two screens), not automatically.
 - **Symmetric mutual trust.** Because either peer may *request* tunnels of the other once authenticated, the token should only ever be shared with an endpoint you trust; the `[allowed_sources]` allowlist then bounds what that trusted peer can actually reach.
 
-**Auth, then a fail-closed source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). The check is **fail-closed** — an empty or absent list rejects every requested source — so a peer can only reach addresses you explicitly allow. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
+**Sticky single-session binding (listen role).** The first peer to authenticate binds the session to its node id (`AppState::admit_peer`) for the **lifetime of the program**. Afterwards:
+
+- The **same** node id may disconnect and reconnect freely (the dialer's endpoint is reused across its reconnect loop, so its id is stable).
+- A **different** node id is rejected as a wrong peer (`WRONG_PEER_CODE`) — a *fatal* rejection (`ErrorCategory::Rejected`, exit 4) so that dialer stops instead of racing for the session. This is deliberately robust against accidental rebinding: launching several dialers at one listener (each with a fresh ephemeral id) deterministically admits only the first.
+- A *second live connection from the bound peer* (its previous connection still tearing down) is rejected transiently as busy (`PEER_BUSY_CODE`); that dialer retries with backoff and gets back in once the old connection clears.
+
+The binding persists even while no peer is connected. To admit a different node id, the operator either restarts the listener or presses `u` in the listen dashboard (`AppState::unbind_session`), which clears the binding so the next authenticated peer may bind.
+
+**Auth, then a fail-closed source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the session binding admits the peer, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). The check is **fail-closed** — an empty or absent list rejects every requested source — so a peer can only reach addresses you explicitly allow. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
@@ -883,7 +891,7 @@ graph LR
 - **UDP Tunneling**: Additional framing overhead (2 bytes per packet)
 - **Relay Mode**: Higher latency, potentially lower throughput
 - **Direct Mode**: Near-native performance with encryption overhead
-- **Concurrency**: A per-connection semaphore caps concurrent data streams (`max_sessions`, default 100) across both directions.
+- **Concurrency**: A per-connection semaphore caps concurrent forwarded data streams (`max_streams`, default 100) across both directions.
 
 ---
 
@@ -919,6 +927,7 @@ has its own internal reconnect loop; the process only exits on fatal errors.
 | 1 | General error | Unexpected/uncategorized failures |
 | 2 | Configuration | Missing/invalid node id, invalid token format, bad request address or `allowed_sources` CIDR |
 | 3 | Authentication | Token rejected by peer, auth response timeout |
+| 4 | Rejected | A different node id tried to bind a session already bound to another peer (`WRONG_PEER_CODE`). Fatal — the dialer stops rather than retrying, since its node id can't match until the listener unbinds or restarts |
 | 10 | Connection failed | Relay timeout, endpoint offline, peer unreachable |
 | 11 | Connection lost | QUIC connection closed after tunnel was established |
 
@@ -943,7 +952,7 @@ Retry guidance:
 | Feature | Support |
 |---------|---------|
 | Bidirectional tunnels | **Yes** — either peer may request tunnels of the other over one connection |
-| Multi-Session | **Yes** — many concurrent data streams per connection (`max_sessions`) |
+| Multi-Stream | **Yes** — many concurrent forwarded data streams per connection (`max_streams`) |
 | Per-tunnel addresses | **Yes** — each `[[request]]` names its own `remote_source` / `local_listen` |
 | Encryption | QUIC/TLS 1.3 |
 | Platform | Linux, macOS, Windows |
