@@ -24,6 +24,9 @@ use crate::peer_params::ResolvedPeer;
 enum SetupPhase {
     /// "Connect to an existing instance? (y/N)"
     ConnectExisting,
+    /// Listen only, when no config token: confirm a fresh token will be
+    /// generated for this run before generating it.
+    ConfirmGenerateToken,
     /// Dial only: the existing instance's node id.
     NodeId,
     /// Dial only: the auth token (skipped when one came from config/env).
@@ -155,8 +158,28 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                 state.buffer.clear();
                 Step::Continue
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => finalize_listen(state),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
+                // A config/env token is used as-is (no confirmation). Without one,
+                // confirm before generating a fresh ephemeral token.
+                if state.config_auth_token.is_some() {
+                    finalize_listen(state)
+                } else {
+                    state.phase = SetupPhase::ConfirmGenerateToken;
+                    state.buffer.clear();
+                    Step::Continue
+                }
+            }
             KeyCode::Char('q') | KeyCode::Esc => Step::Quit,
+            _ => Step::Continue,
+        },
+        SetupPhase::ConfirmGenerateToken => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => finalize_listen(state),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                state.phase = SetupPhase::ConnectExisting;
+                state.buffer.clear();
+                Step::Continue
+            }
+            KeyCode::Char('q') => Step::Quit,
             _ => Step::Continue,
         },
         SetupPhase::NodeId => match key.code {
@@ -325,6 +348,14 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        SetupPhase::ConfirmGenerateToken => {
+            lines.push(Line::from("No auth token configured."));
+            lines.push(Line::from(Span::styled(
+                "  A fresh token will be generated for this session (changes every run).",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from("Proceed? (Y/n)"));
+        }
         SetupPhase::NodeId => {
             lines.push(Line::from("Existing instance node id:"));
             lines.push(input_line(&state.buffer));
@@ -363,7 +394,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     // `q` quits only at the y/n prompt; in the text fields it's literal input,
     // so don't advertise it there.
     let footer = match state.phase {
-        SetupPhase::ConnectExisting => "Ctrl-C / q quit",
+        SetupPhase::ConnectExisting | SetupPhase::ConfirmGenerateToken => "Ctrl-C / q quit",
         SetupPhase::NodeId
         | SetupPhase::AuthToken
         | SetupPhase::AllowedTcp
@@ -420,15 +451,30 @@ mod tests {
     #[test]
     fn listen_generates_token_when_none() {
         let mut s = SetupState::new(None, from_config());
-        match handle_key(key(KeyCode::Char('n')), &mut s) {
+        // Without a config token, choosing listen first asks for confirmation.
+        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
+        // Confirming generates a fresh token and finishes (config supplies the allowlist).
+        match handle_key(key(KeyCode::Char('y')), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Listen);
                 assert!(r.peer_node_id.is_none());
+                assert!(r.token_generated);
                 assert!(auth::validate_token(&r.auth_token).is_ok());
                 assert_eq!(r.allowed_sources.tcp, vec!["127.0.0.0/8".to_string()]);
             }
             _ => panic!("expected Done(Listen)"),
         }
+    }
+
+    #[test]
+    fn listen_no_token_confirm_back_returns_to_connect_existing() {
+        let mut s = SetupState::new(None, from_config());
+        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
+        // Declining the confirmation returns to the initial prompt.
+        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::ConnectExisting);
     }
 
     #[test]

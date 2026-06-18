@@ -89,39 +89,28 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     // Phase 3: dashboard loop.
     let mut tick = tokio::time::interval(TICK);
     let mut ui_state = UiState::default();
-    // Listen + freshly generated token: show it once in a modal (with the node
-    // id) before the dashboard. For security the token is shown nowhere else.
-    let mut token_dialog = resolved.role == Role::Listen && resolved.token_generated;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 let snap = state.snapshot();
                 let logs = state.logs.snapshot();
+                // Once a peer has connected, the generated-token banner is no longer
+                // needed (the dialer already has it); hide it for the rest of the run.
+                if !snap.peers.is_empty() {
+                    ui_state.token_banner_hidden = true;
+                }
                 let _ = terminal.draw(|f| {
-                    if token_dialog {
-                        ui::render_token_dialog(f, &snap);
-                    } else {
-                        ui::render(f, &snap, &logs, &ui_state);
-                        if let Some(form) = &ui_state.add_form {
-                            ui::render_add_request_dialog(f, form);
-                        }
+                    ui::render(f, &snap, &logs, &ui_state);
+                    if let Some(form) = &ui_state.add_form {
+                        ui::render_add_request_dialog(f, form);
                     }
                 });
             }
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if token_dialog {
-                            // Any key dismisses the one-time token dialog; Ctrl-C quits.
-                            if key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                state.shutdown.cancel();
-                                break;
-                            }
-                            token_dialog = false;
-                        } else if handle_key(key, &mut ui_state, &state) {
+                        if handle_key(key, &mut ui_state, &state) {
                             break;
                         }
                     }
@@ -205,8 +194,8 @@ async fn run_setup(
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
 ///
 /// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
-/// stop the selected tunnel; `a` opens the add-request modal. Logs scroll with
-/// `PageUp`/`PageDown` and `[`/`]`.
+/// stop the selected tunnel; `a` opens the add-request modal; `h` hides the
+/// generated-token banner. Logs scroll with `PageUp`/`PageDown` and `[`/`]`.
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     // Ctrl-C always quits, even with the add-request modal open.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -228,6 +217,9 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         }
         KeyCode::Char('a') => {
             ui.add_form = Some(AddRequestForm::default());
+        }
+        KeyCode::Char('h') => {
+            ui.token_banner_hidden = true;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             ui.selected = ui.selected.saturating_sub(1);

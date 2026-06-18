@@ -20,6 +20,9 @@ pub struct UiState {
     pub selected: usize,
     /// When `Some`, the "add request" modal is open and captures all keystrokes.
     pub add_form: Option<AddRequestForm>,
+    /// Set once the user presses `h`, or once a peer has connected: hides the
+    /// generated-token banner in the header for the rest of the session.
+    pub token_banner_hidden: bool,
 }
 
 /// Which field the "add request" modal is currently editing.
@@ -53,13 +56,17 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, snap);
+    // Show the freshly generated token in the header until a peer connects or the
+    // user dismisses it (both captured by `token_banner_hidden`).
+    let show_token_banner =
+        snap.role == Role::Listen && snap.token_generated && !ui.token_banner_hidden;
+    render_header(frame, header_area, snap, show_token_banner);
     render_tunnels(frame, tunnels_area, snap, ui);
     render_peers(frame, peers_area, snap);
     render_logs(frame, logs_area, logs, ui);
 }
 
-fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
+fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_banner: bool) {
     let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
     let status_label = snap.conn_status.label();
     let mut lines = vec![
@@ -88,12 +95,28 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
             Span::raw("   path: "),
             Span::raw(snap.path.describe()),
         ]));
+    } else if show_token_banner {
+        // Listen + freshly generated token, not yet dismissed: surface the token so
+        // the dialer can copy it. Hidden once a peer connects or the user presses `h`.
+        let token = snap.auth_token.as_deref().unwrap_or("(pending)");
+        lines.push(Line::from(vec![
+            Span::raw("auth token: "),
+            Span::styled(
+                token.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (generated — press h to hide)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
     } else {
         // Listen role: the node id (above) is ephemeral and stays visible so the
-        // dialer can copy it. The auth token is NOT shown here — for security it
-        // is displayed only once, in a startup dialog, when freshly generated.
+        // dialer can copy it. The token itself is not shown here.
         let hint = if snap.token_generated {
-            "auth token was shown once at startup"
+            "auth token generated for this session"
         } else {
             "auth token loaded from config"
         };
@@ -104,59 +127,6 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
     }
 
     let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(para, area);
-}
-
-/// One-time startup modal showing the freshly generated auth token together with
-/// the node id to dial. Shown once for security — the token appears nowhere else.
-pub fn render_token_dialog(frame: &mut Frame, snap: &AppSnapshot) {
-    let node_id = snap.endpoint_id.as_deref().unwrap_or("(starting…)");
-    let token = snap.auth_token.as_deref().unwrap_or("(pending)");
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "Generated auth token",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from("Copy both now — the token is shown only once, and both values change every run."),
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("node id:  "),
-            Span::styled(node_id.to_string(), Style::default().fg(Color::Cyan)),
-        ]),
-        Line::from(vec![
-            Span::raw("token:    "),
-            Span::styled(
-                token.to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Can't copy & paste here? Quit (Ctrl-C) and preconfigure auth_token in your config file.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Press any key to continue · Ctrl-C to quit",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let area = centered(frame.area(), 88, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" auth token (shown once) "),
-        )
-        .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
