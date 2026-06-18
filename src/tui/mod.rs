@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 
 use crate::app_state::{AppSnapshot, AppState, Role, TunnelCommand};
-use crate::config::{
-    validate_request_specs, AllowedSources, RequestEntry, TransportTuning,
-};
+use crate::config::{AllowedSources, RequestEntry, TransportTuning, validate_request_specs};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use setup::{SetupOutcome, SetupState, Step};
@@ -370,8 +370,10 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
     use std::fmt::Write as _;
 
     let now = jiff::Zoned::now();
-    let path =
-        std::env::temp_dir().join(format!("duopipe-conn-{}.txt", now.strftime("%Y%m%d-%H%M%S")));
+    let path = std::env::temp_dir().join(format!(
+        "duopipe-conn-{}.txt",
+        now.strftime("%Y%m%d-%H%M%S")
+    ));
 
     let mut out = String::new();
     let _ = writeln!(out, "duopipe connection info");

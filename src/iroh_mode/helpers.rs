@@ -16,8 +16,8 @@ use tokio::sync::Mutex;
 
 use crate::buffer::uninitialized_vec;
 use crate::net::{
-    order_udp_addresses, retry_with_backoff, tune_tcp_stream, STREAM_OPEN_BASE_DELAY_MS,
-    STREAM_OPEN_MAX_ATTEMPTS,
+    STREAM_OPEN_BASE_DELAY_MS, STREAM_OPEN_MAX_ATTEMPTS, order_udp_addresses, retry_with_backoff,
+    tune_tcp_stream,
 };
 
 /// Read exactly enough bytes to fill `read_buf` to its capacity from a QUIC
@@ -110,10 +110,7 @@ pub(super) async fn bridge_streams(
 const TCP_TO_QUIC_CHUNK_SIZE: usize = 256 * 1024;
 const QUIC_TO_TCP_CHUNKS: usize = 64;
 
-async fn copy_tcp_to_quic<R>(
-    reader: &mut R,
-    writer: &mut iroh::endpoint::SendStream,
-) -> Result<()>
+async fn copy_tcp_to_quic<R>(reader: &mut R, writer: &mut iroh::endpoint::SendStream) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -138,10 +135,7 @@ where
     Ok(())
 }
 
-async fn copy_quic_to_tcp<W>(
-    reader: &mut iroh::endpoint::RecvStream,
-    writer: &mut W,
-) -> Result<()>
+async fn copy_quic_to_tcp<W>(reader: &mut iroh::endpoint::RecvStream, writer: &mut W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {

@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::{lookup_host, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
 /// Delay between starting connection attempts (Happy Eyeballs style).
 pub const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
@@ -318,7 +318,10 @@ pub fn extract_port_from_source(source: &str) -> Option<u16> {
 /// rejects the source, since the outbound connection may pick any of them).
 pub async fn check_source_allowed(source: &str, allowed_networks: &[String]) -> Result<()> {
     if allowed_networks.is_empty() {
-        anyhow::bail!("source '{}' rejected: no allowed_sources configured", source);
+        anyhow::bail!(
+            "source '{}' rejected: no allowed_sources configured",
+            source
+        );
     }
 
     let host = extract_host_from_source(source)
@@ -385,7 +388,9 @@ where
                 if attempt >= max_attempts {
                     return Err(err);
                 }
-                let multiplier = 1_u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+                let multiplier = 1_u64
+                    .checked_shl(attempt.saturating_sub(1))
+                    .unwrap_or(u64::MAX);
                 let bounded = multiplier.min(BACKOFF_MAX_MULTIPLIER);
                 let delay = Duration::from_millis(base_delay_ms.saturating_mul(bounded));
                 tokio::time::sleep(delay).await;
@@ -599,8 +604,7 @@ mod tests {
 
     #[test]
     fn test_extract_addr_from_source_ipv6() {
-        let result =
-            extract_addr_from_source("tcp://[2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8]:22");
+        let result = extract_addr_from_source("tcp://[2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8]:22");
         assert_eq!(
             result.as_deref(),
             Some("[2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8]:22")
@@ -612,19 +616,31 @@ mod tests {
     #[tokio::test]
     async fn check_source_empty_list_rejects() {
         // Fail-closed: with no configured networks, everything is rejected.
-        assert!(check_source_allowed("tcp://127.0.0.1:22", &[]).await.is_err());
+        assert!(
+            check_source_allowed("tcp://127.0.0.1:22", &[])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn check_source_in_range_allowed() {
         let nets = vec!["127.0.0.0/8".to_string()];
-        assert!(check_source_allowed("tcp://127.0.0.1:22", &nets).await.is_ok());
+        assert!(
+            check_source_allowed("tcp://127.0.0.1:22", &nets)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn check_source_out_of_range_rejected() {
         let nets = vec!["192.168.0.0/16".to_string()];
-        assert!(check_source_allowed("tcp://10.0.0.1:22", &nets).await.is_err());
+        assert!(
+            check_source_allowed("tcp://10.0.0.1:22", &nets)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -662,7 +678,9 @@ mod tests {
         // An allowlist covering every resolved IP must accept.
         let all_nets: Vec<String> = resolved.iter().copied().map(helper).collect();
         assert!(
-            check_source_allowed("tcp://localhost:22", &all_nets).await.is_ok(),
+            check_source_allowed("tcp://localhost:22", &all_nets)
+                .await
+                .is_ok(),
             "every resolved IP allowed -> accept"
         );
 
@@ -672,7 +690,9 @@ mod tests {
         if distinct.len() >= 2 {
             let partial = vec![helper(resolved[0])]; // allow only the first IP
             assert!(
-                check_source_allowed("tcp://localhost:22", &partial).await.is_err(),
+                check_source_allowed("tcp://localhost:22", &partial)
+                    .await
+                    .is_err(),
                 "one disallowed resolved IP must reject (all(), not any())"
             );
         }

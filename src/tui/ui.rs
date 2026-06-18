@@ -1,16 +1,14 @@
 //! Rendering for the duopipe TUI. Pure functions over an [`AppSnapshot`].
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
-use ratatui::Frame;
 use tui_input::Input;
 
 use super::textinput::render_spans;
-use crate::app_state::{
-    AppSnapshot, ConnStatus, PeerRow, Role, TunnelRow, TunnelStatus,
-};
+use crate::app_state::{AppSnapshot, ConnStatus, PeerRow, Role, TunnelRow, TunnelStatus};
 use crate::logging::LogLine;
 
 /// View state owned by the TUI loop (not shared with the runtime).
@@ -140,7 +138,10 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
     if snap.role == Role::Dial {
         lines.push(Line::from(vec![
             Span::raw("status: "),
-            Span::styled(status_label, Style::default().fg(conn_color(&snap.conn_status))),
+            Span::styled(
+                status_label,
+                Style::default().fg(conn_color(&snap.conn_status)),
+            ),
             Span::raw("   path: "),
             Span::raw(snap.path.describe()),
         ]));
@@ -402,7 +403,9 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
     let title = if ui.quit_armed {
         format!(" Logs ({total})  [press Esc again to quit] ")
     } else if scroll == 0 {
-        format!(" Logs ({total})  [Esc Esc quit · [/] or PgUp/PgDn scroll · g/G top/bottom · d dump] ")
+        format!(
+            " Logs ({total})  [Esc Esc quit · [/] or PgUp/PgDn scroll · g/G top/bottom · d dump] "
+        )
     } else {
         format!(" Logs ({total})  [scrolled +{scroll}] ")
     };
@@ -448,9 +451,9 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 fn conn_color(status: &ConnStatus) -> Color {
     match status {
         ConnStatus::Connected => Color::Green,
-        ConnStatus::Connecting
-        | ConnStatus::Authenticating
-        | ConnStatus::Reconnecting { .. } => Color::Yellow,
+        ConnStatus::Connecting | ConnStatus::Authenticating | ConnStatus::Reconnecting { .. } => {
+            Color::Yellow
+        }
         ConnStatus::Closed => Color::Red,
     }
 }

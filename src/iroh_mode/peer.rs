@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{ApplicationClose, ConnectionError};
 use iroh::EndpointId;
+use iroh::endpoint::{ApplicationClose, ConnectionError};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -37,17 +37,17 @@ use crate::net::{
 };
 
 use crate::iroh_mode::endpoint::{
-    connect_to_server, create_client_endpoint, create_server_endpoint, validate_relay_only,
-    watch_connection_paths, ALPN,
+    ALPN, connect_to_server, create_client_endpoint, create_server_endpoint, validate_relay_only,
+    watch_connection_paths,
 };
 use crate::iroh_mode::helpers::{
     bridge_streams, forward_stream_to_udp_client, forward_stream_to_udp_server,
     forward_udp_to_stream, open_bi_with_retry,
 };
 use crate::signaling::{
-    decode_auth_request, decode_auth_response, decode_stream_ack, decode_stream_hello,
-    encode_auth_request, encode_auth_response, encode_stream_ack, encode_stream_hello,
-    read_length_prefixed, AuthRequest, AuthResponse, StreamAck, StreamHello,
+    AuthRequest, AuthResponse, StreamAck, StreamHello, decode_auth_request, decode_auth_response,
+    decode_stream_ack, decode_stream_hello, encode_auth_request, encode_auth_response,
+    encode_stream_ack, encode_stream_hello, read_length_prefixed,
 };
 
 /// Default maximum concurrent forwarded streams across all tunnels in the session.
@@ -287,10 +287,7 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
                         // unbinds or restarts. (A transient peer-busy close is NOT
                         // surfaced as an error, so it falls through to a retry.)
                         if e.downcast_ref::<TunnelError>().is_some_and(|te| {
-                            matches!(
-                                te.category,
-                                ErrorCategory::Auth | ErrorCategory::Rejected
-                            )
+                            matches!(te.category, ErrorCategory::Auth | ErrorCategory::Rejected)
                         }) {
                             endpoint.close().await;
                             return Err(e);
@@ -302,9 +299,9 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
             Err(e) => log::warn!("Failed to connect to peer: {}", e),
         }
 
-        config
-            .status
-            .set_conn_status(ConnStatus::Reconnecting { backoff_secs: backoff.as_secs() });
+        config.status.set_conn_status(ConnStatus::Reconnecting {
+            backoff_secs: backoff.as_secs(),
+        });
         log::info!("Reconnecting in {:?}...", backoff);
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -334,8 +331,7 @@ async fn handle_connection(
         auth_as_dialer(&conn, &config.auth_token).await?;
         config.status.set_conn_status(ConnStatus::Connected);
     } else {
-        let accepted: HashSet<String> =
-            std::iter::once(config.auth_token.clone()).collect();
+        let accepted: HashSet<String> = std::iter::once(config.auth_token.clone()).collect();
         auth_as_listener(&conn, &accepted).await?;
         // Single sticky session: the first peer to authenticate binds it for the
         // program's lifetime. A second authenticated connection would otherwise
@@ -347,12 +343,18 @@ async fn handle_connection(
                 log::info!("Peer {} authenticated and bound to the session", remote_id);
             }
             PeerAdmission::Busy => {
-                log::warn!("Rejecting {}: bound peer's connection is still active", remote_id);
+                log::warn!(
+                    "Rejecting {}: bound peer's connection is still active",
+                    remote_id
+                );
                 conn.close(PEER_BUSY_CODE.into(), b"peer_busy");
                 return Ok(());
             }
             PeerAdmission::WrongPeer => {
-                log::warn!("Rejecting {}: session is bound to a different peer", remote_id);
+                log::warn!(
+                    "Rejecting {}: session is bound to a different peer",
+                    remote_id
+                );
                 conn.close(WRONG_PEER_CODE.into(), b"wrong_peer");
                 return Ok(());
             }
@@ -361,8 +363,7 @@ async fn handle_connection(
 
     config.status.seed_tunnels_from_requests();
 
-    let _path_watcher =
-        watch_connection_paths(&conn, config.status.clone(), remote_id.to_string());
+    let _path_watcher = watch_connection_paths(&conn, config.status.clone(), remote_id.to_string());
 
     let conn = Arc::new(conn);
     let max_streams = config.max_streams.unwrap_or(DEFAULT_MAX_STREAMS);
@@ -910,8 +911,8 @@ mod tests {
     use crate::iroh_mode::endpoint::create_endpoint_builder;
     use crate::logging::LogBuffer;
     use bytes::Bytes;
-    use iroh::endpoint::{RelayMode, VarInt};
     use iroh::Endpoint;
+    use iroh::endpoint::{RelayMode, VarInt};
 
     fn app_close(code: u32) -> ConnectionError {
         ConnectionError::ApplicationClosed(ApplicationClose {

@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(token.as_str(), "");
         assert_eq!(token.as_ref(), "");
         assert_eq!(&*token, ""); // Deref
-                                 // Debug should still be redacted
+        // Debug should still be redacted
         let debug_output = format!("{:?}", token);
         assert_eq!(debug_output, "AuthToken(***)");
     }
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(token.as_str(), special_token);
         assert_eq!(token.as_ref(), special_token);
         assert_eq!(&*token, special_token); // Deref
-                                            // Debug should still be redacted (not expose unicode/special chars)
+        // Debug should still be redacted (not expose unicode/special chars)
         let debug_output = format!("{:?}", token);
         assert_eq!(debug_output, "AuthToken(***)");
         assert!(!debug_output.contains("tök€n"));
@@ -554,5 +554,4 @@ mod tests {
         assert!(!decoded.accepted);
         assert_eq!(decoded.reason.as_deref(), Some("bad token"));
     }
-
 }

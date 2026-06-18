@@ -7,18 +7,18 @@
 //! the dialer never attempts a connection with bad inputs.
 
 use iroh::EndpointId;
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 use tui_input::Input;
 
 use super::textinput::{handle_edit, render_spans};
 use crate::app_state::Role;
 use crate::auth;
-use crate::config::{validate_cidr, AllowedSources};
+use crate::config::{AllowedSources, validate_cidr};
 use crate::peer_params::ResolvedPeer;
 
 /// The two roles offered on the start screen, in display order. Index 0 (listen)
@@ -525,7 +525,10 @@ mod tests {
         assert!(matches!(choose_listen(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
         // Declining the confirmation returns to the start screen.
-        assert!(matches!(handle_key(key(KeyCode::Char('n')), &mut s), Step::Continue));
+        assert!(matches!(
+            handle_key(key(KeyCode::Char('n')), &mut s),
+            Step::Continue
+        ));
         assert_eq!(s.phase, SetupPhase::Start);
     }
 
@@ -548,7 +551,10 @@ mod tests {
         assert!(matches!(choose_dial(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::NodeId);
         type_str(&mut s, "not-a-node-id");
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
         assert!(s.error.is_some());
     }
 
@@ -577,10 +583,16 @@ mod tests {
         choose_dial(&mut s);
         type_str(&mut s, &node_id);
         // Valid node id with no config token -> advance to the token prompt.
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
         // A bad token is rejected inline.
         type_str(&mut s, "short");
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
         assert!(s.error.is_some());
         // Clear and enter a valid token.
         for _ in 0.."short".len() {
@@ -626,7 +638,10 @@ mod tests {
         handle_key(key(KeyCode::Down), &mut s);
         assert_eq!(s.connect_choice, CONNECT_DIAL);
         // Enter on the dial option advances to the node id prompt.
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
         assert_eq!(s.phase, SetupPhase::NodeId);
     }
 
@@ -687,7 +702,10 @@ mod tests {
         let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default());
         handle_key(key(KeyCode::Tab), &mut s); // -> AllowedTcp
         type_str(&mut s, "not-a-cidr");
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
         assert!(s.error.is_some());
         assert_eq!(s.phase, SetupPhase::Start); // stays put
         assert_eq!(s.section, StartSection::AllowedTcp);

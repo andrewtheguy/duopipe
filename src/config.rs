@@ -69,7 +69,11 @@ impl PeerConfig {
     /// they will be decrypted later via `decrypt_secrets()`.
     fn reject_plaintext_secrets(&self) -> Result<()> {
         use crate::encryption::is_age_encrypted;
-        if self.auth_token.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
+        if self
+            .auth_token
+            .as_ref()
+            .is_some_and(|v| !is_age_encrypted(v))
+        {
             anyhow::bail!(
                 "Plaintext 'auth_token' is not allowed in config files. \
                  Use 'auth_token_file', set DUOPIPE_AUTH_TOKEN env var, \
@@ -104,10 +108,11 @@ impl PeerConfig {
         })?;
 
         if let Some(ref v) = self.auth_token
-            && is_age_encrypted(v) {
-                self.auth_token =
-                    Some(decrypt_value(v, key_path).context("Failed to decrypt auth_token")?);
-            }
+            && is_age_encrypted(v)
+        {
+            self.auth_token =
+                Some(decrypt_value(v, key_path).context("Failed to decrypt auth_token")?);
+        }
 
         Ok(())
     }
@@ -156,7 +161,10 @@ impl AllowedSources {
     /// loopback-tunnel case. UDP is left untouched (empty UDP still rejects all).
     pub fn with_localhost_tcp_default(mut self) -> Self {
         if self.tcp.is_empty() {
-            self.tcp = DEFAULT_LOCALHOST_TCP.iter().map(|s| s.to_string()).collect();
+            self.tcp = DEFAULT_LOCALHOST_TCP
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         }
         self
     }
@@ -427,9 +435,10 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
             return home.join(stripped);
         }
     } else if path_str == "~"
-        && let Some(home) = dirs::home_dir() {
-            return home;
-        }
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
     path.to_path_buf()
 }
 
@@ -501,7 +510,8 @@ receive_window = 67108864
             CongestionController::Bbr
         );
         assert_eq!(cfg.transport.receive_window, Some(67108864));
-        cfg.validate(ConfigSource::File).expect("config should validate");
+        cfg.validate(ConfigSource::File)
+            .expect("config should validate");
     }
 
     #[test]
@@ -512,7 +522,10 @@ tcp = ["not-a-cidr"]
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
         let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("allowed_sources"), "error was: {err}");
+        assert!(
+            err.to_string().contains("allowed_sources"),
+            "error was: {err}"
+        );
     }
 
     #[test]
@@ -595,7 +608,10 @@ tcp = ["not-a-cidr"]
     fn with_localhost_tcp_default_fills_empty_tcp_only() {
         // Empty TCP -> dual-stack localhost; UDP untouched.
         let filled = AllowedSources::default().with_localhost_tcp_default();
-        assert_eq!(filled.tcp, vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]);
+        assert_eq!(
+            filled.tcp,
+            vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
+        );
         assert!(filled.udp.is_empty());
 
         // Empty TCP but explicit UDP -> TCP defaulted, UDP preserved.
@@ -604,7 +620,10 @@ tcp = ["not-a-cidr"]
             udp: vec!["10.0.0.0/8".to_string()],
         }
         .with_localhost_tcp_default();
-        assert_eq!(with_udp.tcp, vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]);
+        assert_eq!(
+            with_udp.tcp,
+            vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
+        );
         assert_eq!(with_udp.udp, vec!["10.0.0.0/8".to_string()]);
 
         // Non-empty TCP -> left verbatim (no localhost added).

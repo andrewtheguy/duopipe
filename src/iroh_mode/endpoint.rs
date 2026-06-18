@@ -1,26 +1,26 @@
 //! Common endpoint helpers for iroh tunnel connections.
 
-use anyhow::{Context, Result};
-use crate::error::TunnelError;
-use futures::StreamExt;
-use iroh::{
-    address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{
-        presets, AckFrequencyConfig, Builder as EndpointBuilder, ControllerFactory, PathList,
-        QuicTransportConfig,
-    },
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
-};
-use iroh_mdns_address_lookup::MdnsAddressLookup;
-use noq_proto::congestion::{Bbr3Config, CubicConfig, NewRenoConfig};
-use log::{info, warn};
-use tokio::task::JoinHandle;
-use std::sync::Arc;
-use std::time::Duration;
 use crate::app_state::{AppState, PathInfo, PathKind, Role};
 use crate::config::{
-    CongestionController, TransportTuning, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW,
+    CongestionController, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, TransportTuning,
 };
+use crate::error::TunnelError;
+use anyhow::{Context, Result};
+use futures::StreamExt;
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
+    endpoint::{
+        AckFrequencyConfig, Builder as EndpointBuilder, ControllerFactory, PathList,
+        QuicTransportConfig, presets,
+    },
+};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
+use log::{info, warn};
+use noq_proto::congestion::{Bbr3Config, CubicConfig, NewRenoConfig};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
 use url::Url;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -174,9 +174,17 @@ pub fn create_endpoint_builder(
         };
         transport_config = transport_config.send_window(send_window.into());
 
-        let recv_source = if tuning.receive_window.is_none() { "default" } else { "config" };
+        let recv_source = if tuning.receive_window.is_none() {
+            "default"
+        } else {
+            "config"
+        };
         let send_source = if tuning.send_window.is_none() {
-            if tuning.receive_window.is_none() { "default" } else { "derived" }
+            if tuning.receive_window.is_none() {
+                "default"
+            } else {
+                "derived"
+            }
         } else {
             "config"
         };
@@ -271,7 +279,8 @@ async fn wait_for_endpoint_online(endpoint: &Endpoint) -> Result<()> {
         Err(_) => Err(TunnelError::connection(anyhow::anyhow!(
             "Endpoint failed to come online after {}s - check relay server connectivity",
             RELAY_CONNECT_TIMEOUT.as_secs()
-        )).into()),
+        ))
+        .into()),
     }
 }
 
@@ -289,9 +298,14 @@ pub async fn create_server_endpoint(
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder =
-        create_endpoint_builder(relay_mode, relay_only, dns_server, secret.as_ref(), transport_tuning)?
-            .alpns(vec![alpn.to_vec()]);
+    let mut builder = create_endpoint_builder(
+        relay_mode,
+        relay_only,
+        dns_server,
+        secret.as_ref(),
+        transport_tuning,
+    )?
+    .alpns(vec![alpn.to_vec()]);
 
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
@@ -320,7 +334,13 @@ pub async fn create_client_endpoint(
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret_key, transport_tuning)?;
+    let mut builder = create_endpoint_builder(
+        relay_mode,
+        relay_only,
+        dns_server,
+        secret_key,
+        transport_tuning,
+    )?;
 
     // Set a caller-supplied identity key. The normal runtime leaves this unset.
     if let Some(secret) = secret_key {
@@ -379,7 +399,8 @@ pub async fn connect_to_server(
         Err(TunnelError::connection(anyhow::anyhow!(
             "Failed to connect via any relay: {}",
             last_error.unwrap_or_else(|| "No relay URLs provided".to_string())
-        )).into())
+        ))
+        .into())
     } else {
         // Include relay URLs in EndpointAddr if available, allowing iroh to use
         // the relay for initial connection when DNS discovery is disabled.
@@ -409,11 +430,13 @@ pub async fn connect_to_server(
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => Err(TunnelError::connection(
                 anyhow::Error::from(e).context("Failed to connect to server"),
-            ).into()),
+            )
+            .into()),
             Err(_) => Err(TunnelError::connection(anyhow::anyhow!(
                 "Connection timed out after {}s",
                 RELAY_CONNECT_TIMEOUT.as_secs()
-            )).into()),
+            ))
+            .into()),
         }
     }
 }

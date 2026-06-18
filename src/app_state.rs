@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::{Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RequestEntry;
