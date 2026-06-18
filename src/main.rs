@@ -142,15 +142,15 @@ fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
     Ok(token)
 }
 
-/// Detect a non-interactive (test) preset from environment variables.
+/// Detect a test-mode preset from environment variables.
 ///
-/// Requires `DUOPIPE_NONINTERACTIVE` to be truthy. Role is inferred from
-/// `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial (parse the id), absent ⇒ Listen. The
-/// auth token comes from `config_auth_token` (already resolved/validated), or is
-/// generated for Listen. Evaluated before the TUI starts so failures print
-/// plainly and exit.
+/// Requires `DUOPIPE_TEST_MODE` to be truthy (the single gate for all test-only
+/// env vars). Role is inferred from `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial (parse
+/// the id), absent ⇒ Listen. The auth token comes from `config_auth_token`
+/// (already resolved/validated), or is generated for Listen. Evaluated before the
+/// peer starts so failures print plainly and exit.
 fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<ResolvedPeer>> {
-    if !env_truthy("DUOPIPE_NONINTERACTIVE") {
+    if !env_truthy("DUOPIPE_TEST_MODE") {
         return Ok(None);
     }
 
@@ -276,14 +276,15 @@ async fn run_inner() -> Result<()> {
     let command = args.command;
 
     // The interactive `peer` command renders a TUI and captures logs into a ring
-    // buffer. In non-interactive (test) mode — `DUOPIPE_NONINTERACTIVE=1` — the
-    // peer runs headless with no TUI, logging to stderr, so it needs no terminal.
-    // Every other command logs to the console as usual.
-    let noninteractive = env_truthy("DUOPIPE_NONINTERACTIVE");
-    let log_buffer = if matches!(&command, Command::Peer { .. }) && !noninteractive {
+    // buffer. In test mode — `DUOPIPE_TEST_MODE=1` — the peer runs headless with
+    // no TUI, logging to stderr, so it needs no terminal. `DUOPIPE_TEST_MODE` is
+    // the single gate for all test-only env vars. Every other command logs to the
+    // console as usual.
+    let test_mode = env_truthy("DUOPIPE_TEST_MODE");
+    let log_buffer = if matches!(&command, Command::Peer { .. }) && !test_mode {
         if !std::io::stdout().is_terminal() {
             return Err(TunnelError::config(anyhow::anyhow!(
-                "duopipe peer requires an interactive terminal (set DUOPIPE_NONINTERACTIVE=1 for headless test mode)."
+                "duopipe peer requires an interactive terminal (set DUOPIPE_TEST_MODE=1 for headless test mode)."
             ))
             .into());
         }
@@ -329,12 +330,12 @@ async fn run_inner() -> Result<()> {
                 resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
             let preset =
                 detect_env_preset(config_auth_token.clone()).map_err(TunnelError::config)?;
-            let autostart_requests =
-                env_var_opt("DUOPIPE_AUTOSTART_REQUESTS").is_some_and(|v| v == "1");
+            // Autostart is a test-only convenience, gated by test mode.
+            let autostart_requests = test_mode && env_truthy("DUOPIPE_AUTOSTART_REQUESTS");
 
-            // Non-interactive (test) mode: run headless with the resolved preset,
-            // no TUI. Interactive mode: hand off to the TUI lifecycle.
-            if let (true, Some(resolved)) = (noninteractive, preset.clone()) {
+            // Test mode: run headless with the resolved preset, no TUI.
+            // Interactive mode: hand off to the TUI lifecycle.
+            if let (true, Some(resolved)) = (test_mode, preset.clone()) {
                 return run_peer_headless(resolved, &cfg, relay_urls, relay_only, autostart_requests)
                     .await;
             }

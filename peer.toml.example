@@ -11,8 +11,8 @@
 # Tunnel model: each side always *requests* tunnels from the other. A [[request]]
 # binds a local listener and asks the peer to connect out to a remote 'source';
 # traffic is bridged between them. Requests do NOT start automatically — the TUI
-# lists them and you start/stop each one with Enter (set DUOPIPE_AUTOSTART_REQUESTS=1
-# to auto-start all on connect, e.g. for tests).
+# lists them and you start/stop each one with Enter (in test mode only, with
+# DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start all on connect).
 #
 # Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
@@ -47,7 +47,7 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # Tunnel requests: ask the peer to connect out to 'source'; deliver traffic to a
 # local listener bound at 'listen'. The 'source' scheme (tcp:// or udp://) selects
 # the protocol. 'name' is the label shown in the TUI. Nothing starts until you
-# activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1).
+# activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1 in test mode).
 # ============================================================================
 [[request]]
 name = "db"

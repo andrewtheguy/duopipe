@@ -32,7 +32,7 @@ pub struct TuiLaunch {
     pub logs: Arc<LogBuffer>,
     pub requests: Vec<RequestEntry>,
     pub allowed_sources: AllowedSources,
-    /// Autostart all requests once connected (from `DUOPIPE_AUTOSTART_REQUESTS`).
+    /// Autostart all requests once connected (test mode only; see `DUOPIPE_TEST_MODE`).
     pub autostart_requests: bool,
     pub relay_urls: Vec<String>,
     pub relay_only: bool,

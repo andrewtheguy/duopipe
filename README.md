@@ -280,17 +280,18 @@ listen = "0.0.0.0:51820"
 
 > **Note:** UDP requests use a single-peer-address reply model — suitable for single-client UDP services.
 
-### Non-interactive (testing only)
+### Test mode (testing only)
 
-duopipe is meant for interactive use. For automated tests, the interactive prompts can be bypassed with environment variables:
+duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1` runs the peer **headless** (no TUI, logs to stderr, needs no terminal) and is the single gate that enables all test-only env vars:
 
 | Env Var | Purpose |
 |---------|---------|
-| `DUOPIPE_NONINTERACTIVE=1` | Skip the TUI prompts entirely. |
+| `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (see env table below). |
+| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start every configured `[[request]]` once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
 
-In non-interactive mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
+In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
 
 ## CLI Options
 
@@ -303,7 +304,7 @@ In non-interactive mode the listener prints `node_id: <id>` and `auth_token: <to
 | `--config`, `-c` | - | Path to TOML config file |
 | `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` |
 
-The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Non-interactive (testing only)](#non-interactive-testing-only)).
+The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
 
 **Environment variables:**
 
@@ -311,8 +312,9 @@ The connection role (listen/dial) and the dialer's target node id are chosen int
 |---------|-------------|
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (highest precedence over config `auth_token` / `auth_token_file`). |
 | `DUOPIPE_ENCRYPTION_KEY_FILE` | Path to age identity file for decrypting age-encrypted config values. |
-| `DUOPIPE_NONINTERACTIVE` | Testing only: set to `1` to skip the interactive prompts. |
-| `DUOPIPE_PEER_NODE_ID` | Testing only: when set ⇒ dial that node id; when unset ⇒ listen. |
+| `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
+| `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
+| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
 
 ## Configuration Files
 

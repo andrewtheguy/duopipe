@@ -40,11 +40,12 @@ Each peer can declare:
 
 #### Non-interactive mode (testing)
 
-The project is meant for interactive use, but the TUI prompts can be bypassed for automated tests:
+The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_MODE=1` runs the peer headless (no TUI) and gates all other test-only env vars:
 
-- `DUOPIPE_NONINTERACTIVE=1` — skip the interactive prompts.
+- `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
-- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token.
+- `DUOPIPE_AUTOSTART_REQUESTS=1` — start every configured `[[request]]` on connect.
+- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
 
@@ -447,7 +448,7 @@ graph TB
     style S fill:#FFF9C4
 ```
 
-The role (listen vs dial) and the dialer's target node id are not config fields. They are resolved at startup from the TUI prompts, or — for tests — from `DUOPIPE_PEER_NODE_ID` (set ⇒ dial, unset ⇒ listen) under `DUOPIPE_NONINTERACTIVE=1`.
+The role (listen vs dial) and the dialer's target node id are not config fields. They are resolved at startup from the TUI prompts, or — for tests — from `DUOPIPE_PEER_NODE_ID` (set ⇒ dial, unset ⇒ listen) under `DUOPIPE_TEST_MODE=1`.
 
 ### iroh Credential Mapping
 

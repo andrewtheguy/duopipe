@@ -6,7 +6,7 @@
 //! tunnels from the other: a request binds a local listener and asks the peer to
 //! connect out to a remote `source`, bridging the two. Requests are activated
 //! on demand (the TUI sends start/stop commands); nothing starts automatically
-//! unless `DUOPIPE_AUTOSTART_REQUESTS` is set.
+//! unless `DUOPIPE_AUTOSTART_REQUESTS` is set (test mode only).
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
@@ -81,7 +81,7 @@ pub struct PeerConfig {
     /// CIDR allowlist gating which of our sources the peer may request (fail-closed).
     pub allowed_sources: AllowedSources,
     /// When true, start every configured request as soon as a connection is up
-    /// (set from `DUOPIPE_AUTOSTART_REQUESTS`, mainly for non-interactive tests).
+    /// (set from `DUOPIPE_AUTOSTART_REQUESTS` in test mode; see `DUOPIPE_TEST_MODE`).
     pub autostart_requests: bool,
     /// The shared auth token (presented when dialing, required when listening).
     /// **Sensitive - redacted in Debug.**
