@@ -1,38 +1,37 @@
-//! Symmetric iroh peer: one connection, many tunnels in both directions.
+//! Symmetric iroh peer: one connection, request-based tunnels.
 //!
 //! A peer either dials another peer (`Role::Dial`) or listens for one
-//! (`Role::Listen`). Connection *setup* is asymmetric (QUIC needs a dialer
-//! and an acceptor), but once a connection is established either side can open
-//! streams, so tunnels flow both ways:
-//!
-//! - Local forward (`-L`): this peer binds a local listener and forwards each
-//!   connection to a destination the *peer* connects out to.
-//! - Remote forward (`-R`): this peer asks the *peer* to bind a listener and
-//!   forward connections back to a destination *we* connect out to.
+//! (`Role::Listen`). Connection *setup* is asymmetric (QUIC needs a dialer and
+//! an acceptor), but once a connection is established each side *requests*
+//! tunnels from the other: a request binds a local listener and asks the peer to
+//! connect out to a remote `source`, bridging the two. Requests are activated
+//! on demand (the TUI sends start/stop commands); nothing starts automatically
+//! unless `DUOPIPE_AUTOSTART_REQUESTS` is set.
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
-//! peer is fully trusted — there are no per-destination allowlists.
+//! peer is trusted, but the *acceptor* still gates each requested `source`
+//! against its `allowed_sources` CIDR allowlist (fail-closed) before connecting.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
-use crate::app_state::{AppState, ConnStatus, Role, TunnelDir, TunnelRow, TunnelStatus};
+use crate::app_state::{AppState, ConnStatus, Role, TunnelCommand, TunnelRow, TunnelStatus};
 use crate::auth::is_token_valid;
-use crate::config::{LocalForward, RemoteForward, TransportTuning};
+use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::net::{
-    bind_udp_for_targets, extract_addr_from_source, resolve_all_target_addrs, resolve_listen_addrs,
-    try_connect_tcp, tune_tcp_stream,
+    bind_udp_for_targets, check_source_allowed, extract_addr_from_source, resolve_all_target_addrs,
+    resolve_listen_addrs, try_connect_tcp, tune_tcp_stream,
 };
 
 use crate::iroh_mode::endpoint::{
@@ -44,11 +43,9 @@ use crate::iroh_mode::helpers::{
     forward_udp_to_stream, open_bi_with_retry,
 };
 use crate::signaling::{
-    decode_auth_request, decode_auth_response, decode_remote_forward_request,
-    decode_remote_forward_response, decode_stream_ack, decode_stream_hello, encode_auth_request,
-    encode_auth_response, encode_remote_forward_request, encode_remote_forward_response,
-    encode_stream_ack, encode_stream_hello, read_length_prefixed, AuthRequest, AuthResponse,
-    RemoteForwardRequest, RemoteForwardResponse, StreamAck, StreamHello,
+    decode_auth_request, decode_auth_response, decode_stream_ack, decode_stream_hello,
+    encode_auth_request, encode_auth_response, encode_stream_ack, encode_stream_hello,
+    read_length_prefixed, AuthRequest, AuthResponse, StreamAck, StreamHello,
 };
 
 /// Default maximum concurrent data streams per connection.
@@ -61,7 +58,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// opener from holding a session permit indefinitely).
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Timeout for reading a [`StreamAck`] / [`RemoteForwardResponse`].
+/// Timeout for reading a [`StreamAck`].
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connection close code for authentication failure (invalid token).
@@ -73,22 +70,19 @@ const AUTH_TIMEOUT_CODE: u32 = 2;
 /// Maximum reconnect backoff for the dialing peer.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Monotonic allocator for remote-forward tunnel ids (unique per requester).
-static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Map of `tunnel_id -> destination URL` for remote forwards we requested.
-type RemoteForwardMap = Arc<Mutex<HashMap<u64, String>>>;
-
 /// Runtime configuration for a symmetric peer.
 pub struct PeerConfig {
     /// Connection role (dial out or listen).
     pub role: Role,
     /// EndpointId of the peer to dial (required for `Dial`).
     pub peer_node_id: Option<EndpointId>,
-    /// Local forwards (-L) hosted by this peer.
-    pub local_forwards: Vec<LocalForward>,
-    /// Remote forwards (-R) this peer requests from the other peer.
-    pub remote_forwards: Vec<RemoteForward>,
+    /// Tunnel requests this peer can make of the peer (activated on demand).
+    pub requests: Vec<RequestEntry>,
+    /// CIDR allowlist gating which of our sources the peer may request (fail-closed).
+    pub allowed_sources: AllowedSources,
+    /// When true, start every configured request as soon as a connection is up
+    /// (set from `DUOPIPE_AUTOSTART_REQUESTS`, mainly for non-interactive tests).
+    pub autostart_requests: bool,
     /// The shared auth token (presented when dialing, required when listening).
     /// **Sensitive - redacted in Debug.**
     pub auth_token: String,
@@ -115,8 +109,9 @@ impl std::fmt::Debug for PeerConfig {
         f.debug_struct("PeerConfig")
             .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
-            .field("local_forwards", &self.local_forwards)
-            .field("remote_forwards", &self.remote_forwards)
+            .field("requests", &self.requests)
+            .field("allowed_sources", &self.allowed_sources)
+            .field("autostart_requests", &self.autostart_requests)
             .field("auth_token", &"[REDACTED]")
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
@@ -132,6 +127,13 @@ impl std::fmt::Debug for PeerConfig {
 /// Run a symmetric peer: dial or listen, then serve tunnels in both directions.
 pub async fn run_peer(config: PeerConfig) -> Result<()> {
     validate_relay_only(config.relay_only, &config.relay_urls)?;
+
+    if config.allowed_sources.is_empty() {
+        log::warn!(
+            "No allowed_sources configured; all incoming source requests from the peer \
+             will be rejected (fail-closed)."
+        );
+    }
 
     match config.role {
         Role::Listen => run_listen(config).await,
@@ -323,48 +325,42 @@ async fn handle_connection(
     let max_sessions = config.max_sessions.unwrap_or(DEFAULT_MAX_SESSIONS);
     let semaphore = Arc::new(Semaphore::new(max_sessions));
     config.status.set_semaphore(semaphore.clone(), max_sessions);
-    let rf_map: RemoteForwardMap = Arc::new(Mutex::new(HashMap::new()));
+
+    // Subscribe to tunnel commands before spawning the supervisor so an autostart
+    // burst sent below cannot race ahead of the subscription.
+    let command_rx = config.status.subscribe_commands();
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
-    // (a) Accept incoming streams (local-forward data from the peer, remote-forward
-    //     data for tunnels we requested, and remote-forward control from the peer).
+    // (a) Accept incoming requests from the peer: for each, gate the requested
+    //     source against our allowed_sources allowlist, then connect out.
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
-        let rf_map = rf_map.clone();
+        let allowed_sources = Arc::new(config.allowed_sources.clone());
         tasks.spawn(async move {
-            if let Err(e) = accept_loop(conn, semaphore, rf_map).await {
+            if let Err(e) = accept_loop(conn, semaphore, allowed_sources).await {
                 log::debug!("Accept loop ended: {}", e);
             }
         });
     }
 
-    // (b) Our local-forward listeners (-L).
-    for lf in &config.local_forwards {
+    // (b) Supervise our own tunnel requests: start/stop them on command.
+    {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
-        let lf = lf.clone();
+        let requests = config.requests.clone();
         let status = config.status.clone();
         tasks.spawn(async move {
-            if let Err(e) = run_local_forward(conn, lf.clone(), semaphore, status.clone()).await {
-                status.update_tunnel(&lf.listen, TunnelStatus::Error, e.to_string());
-                log::warn!("Local forward {} ended: {}", lf.listen, e);
-            }
+            request_supervisor(conn, requests, semaphore, status, command_rx).await;
         });
     }
 
-    // (c) Request remote forwards (-R) from the peer.
-    if !config.remote_forwards.is_empty() {
-        let conn = conn.clone();
-        let forwards = config.remote_forwards.clone();
-        let rf_map = rf_map.clone();
-        let status = config.status.clone();
-        tasks.spawn(async move {
-            if let Err(e) = request_remote_forwards(conn, forwards, rf_map, status).await {
-                log::warn!("Remote forward negotiation ended: {}", e);
-            }
-        });
+    // Optionally autostart every configured request (non-interactive/test mode).
+    if config.autostart_requests {
+        for i in 0..config.requests.len() {
+            config.status.send_command(TunnelCommand::Start(i));
+        }
     }
 
     // Run until the connection closes, then tear everything down.
@@ -379,28 +375,90 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Seed the TUI tunnel table from this peer's configured forwards.
+/// Seed the TUI tunnel table from this peer's configured requests. Rows are kept
+/// in config order so a row's position is its request index. All start Idle —
+/// nothing is active until started (by the user, or by autostart).
 fn seed_tunnel_rows(config: &PeerConfig) {
-    let mut rows = Vec::new();
-    for lf in &config.local_forwards {
-        rows.push(TunnelRow {
-            dir: TunnelDir::Local,
-            key: lf.listen.clone(),
-            spec: format!("{} -> {}", lf.listen, lf.dest),
-            status: TunnelStatus::Pending,
+    let rows = config
+        .requests
+        .iter()
+        .map(|r| TunnelRow {
+            name: r.name.clone(),
+            spec: format!("{} <- {}", r.listen, r.source),
+            status: TunnelStatus::Idle,
             detail: String::new(),
-        });
-    }
-    for rf in &config.remote_forwards {
-        rows.push(TunnelRow {
-            dir: TunnelDir::Remote,
-            key: rf.bind.clone(),
-            spec: format!("{} -> {}", rf.bind, rf.dest),
-            status: TunnelStatus::Pending,
-            detail: String::new(),
-        });
-    }
+        })
+        .collect();
     config.status.set_tunnels(rows);
+}
+
+/// Supervise this peer's tunnel requests over one connection. Listens for
+/// [`TunnelCommand`]s and starts/stops each request, tracking a cancellation
+/// token per running request so a `Stop` (or the connection closing) frees the
+/// bound local port.
+async fn request_supervisor(
+    conn: Arc<iroh::endpoint::Connection>,
+    requests: Vec<RequestEntry>,
+    semaphore: Arc<Semaphore>,
+    status: Arc<AppState>,
+    mut command_rx: broadcast::Receiver<TunnelCommand>,
+) {
+    let mut running: HashMap<usize, CancellationToken> = HashMap::new();
+    // Tasks report their own index here when they end on their own (error/EOF),
+    // so the supervisor can drop the stale token and allow a restart.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<usize>();
+
+    loop {
+        tokio::select! {
+            cmd = command_rx.recv() => match cmd {
+                Ok(TunnelCommand::Start(idx)) => {
+                    if running.contains_key(&idx) {
+                        continue; // already running
+                    }
+                    let Some(req) = requests.get(idx).cloned() else { continue };
+                    let token = CancellationToken::new();
+                    running.insert(idx, token.clone());
+
+                    let conn = conn.clone();
+                    let semaphore = semaphore.clone();
+                    let status = status.clone();
+                    let done_tx = done_tx.clone();
+                    tokio::spawn(async move {
+                        let outcome = tokio::select! {
+                            r = run_request(conn.clone(), req, semaphore, status.clone(), idx) => Some(r),
+                            _ = token.cancelled() => None,
+                            // Tie the listener's lifetime to the connection so it
+                            // never outlives it (which would leak the bound port).
+                            _ = conn.closed() => None,
+                        };
+                        match outcome {
+                            Some(Err(e)) => {
+                                status.update_tunnel(idx, TunnelStatus::Error, e.to_string());
+                                log::warn!("Request {} ended: {}", idx, e);
+                            }
+                            // Stopped, connection closed, or the listen loop ended cleanly.
+                            Some(Ok(())) | None => {
+                                status.update_tunnel(idx, TunnelStatus::Idle, String::new());
+                            }
+                        }
+                        let _ = done_tx.send(idx);
+                    });
+                }
+                Ok(TunnelCommand::Stop(idx)) => {
+                    if let Some(token) = running.remove(&idx) {
+                        token.cancel();
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("Tunnel command channel lagged by {n}");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            Some(idx) = done_rx.recv() => {
+                running.remove(&idx);
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -484,7 +542,7 @@ async fn auth_as_listener(
 async fn accept_loop(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
-    rf_map: RemoteForwardMap,
+    allowed_sources: Arc<AllowedSources>,
 ) -> Result<()> {
     let mut stream_tasks: JoinSet<()> = JoinSet::new();
 
@@ -494,11 +552,10 @@ async fn accept_loop(
             .await
             .context("accept_bi failed (connection closed)")?;
 
-        let conn = conn.clone();
         let semaphore = semaphore.clone();
-        let rf_map = rf_map.clone();
+        let allowed_sources = allowed_sources.clone();
         stream_tasks.spawn(async move {
-            if let Err(e) = handle_incoming_stream(conn, send, recv, semaphore, rf_map).await {
+            if let Err(e) = handle_incoming_stream(send, recv, semaphore, allowed_sources).await {
                 log::warn!("Stream error: {}", e);
             }
         });
@@ -508,11 +565,10 @@ async fn accept_loop(
 }
 
 async fn handle_incoming_stream(
-    conn: Arc<iroh::endpoint::Connection>,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     semaphore: Arc<Semaphore>,
-    rf_map: RemoteForwardMap,
+    allowed_sources: Arc<AllowedSources>,
 ) -> Result<()> {
     let hello_bytes = tokio::time::timeout(HELLO_TIMEOUT, read_length_prefixed(&mut recv))
         .await
@@ -521,29 +577,26 @@ async fn handle_incoming_stream(
     let hello = decode_stream_hello(&hello_bytes).context("Invalid stream hello")?;
 
     match hello {
-        StreamHello::LocalForward { dest, .. } => {
-            let Some(permit) = acquire_or_reject(&semaphore, &mut send).await? else {
-                return Ok(());
+        StreamHello::LocalForward { source, .. } => {
+            // Gate the requested source against our allowlist (fail-closed) before
+            // committing a session permit or connecting out.
+            let networks = if source.starts_with("udp://") {
+                &allowed_sources.udp
+            } else {
+                &allowed_sources.tcp
             };
-            let _permit = permit;
-            connect_side(send, recv, &dest).await
-        }
-        StreamHello::RemoteForwardData { tunnel_id, .. } => {
-            let dest = rf_map.lock().await.get(&tunnel_id).cloned();
-            let Some(dest) = dest else {
-                let ack = StreamAck::rejected("Unknown tunnel_id");
+            if let Err(e) = check_source_allowed(&source, networks).await {
+                log::warn!("Rejecting requested source: {}", e);
+                let ack = StreamAck::rejected(e.to_string());
                 let _ = send.write_all(&encode_stream_ack(&ack)?).await;
                 let _ = send.finish();
-                anyhow::bail!("RemoteForwardData for unknown tunnel_id {}", tunnel_id);
-            };
+                return Ok(());
+            }
             let Some(permit) = acquire_or_reject(&semaphore, &mut send).await? else {
                 return Ok(());
             };
             let _permit = permit;
-            connect_side(send, recv, &dest).await
-        }
-        StreamHello::RemoteForwardControl { .. } => {
-            host_remote_forwards(conn, send, recv, semaphore).await
+            connect_side(send, recv, &source).await
         }
     }
 }
@@ -621,198 +674,45 @@ async fn connect_side(
 }
 
 // ============================================================================
-// Local forwards (-L): opener / listen side
+// Tunnel requests: opener / listen side
 // ============================================================================
 
-async fn run_local_forward(
+/// Run one tunnel request: bind the local `listen` address and, for each incoming
+/// connection, open a stream asking the peer to connect out to `source`. Runs
+/// until the listener errors or the caller cancels it (freeing the bound port).
+async fn run_request(
     conn: Arc<iroh::endpoint::Connection>,
-    lf: LocalForward,
+    req: RequestEntry,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
+    idx: usize,
 ) -> Result<()> {
-    let hello = StreamHello::local_forward(&lf.dest);
-    let listen_addrs = resolve_listen_addrs(&lf.listen)
+    let hello = StreamHello::local_forward(&req.source);
+    let listen_addrs = resolve_listen_addrs(&req.listen)
         .await
-        .with_context(|| format!("Invalid local_forward listen address '{}'", lf.listen))?;
+        .with_context(|| format!("Invalid request listen address '{}'", req.listen))?;
 
-    if lf.dest.starts_with("udp://") {
+    if req.source.starts_with("udp://") {
         let listen_addr = *listen_addrs
             .first()
-            .context("No listen address resolved for local forward")?;
+            .context("No listen address resolved for request")?;
         let udp_socket = Arc::new(
             UdpSocket::bind(listen_addr)
                 .await
                 .with_context(|| format!("Failed to bind UDP listener on {}", listen_addr))?,
         );
-        log::info!("Listening on UDP {} -> {}", listen_addr, lf.dest);
-        status.update_tunnel(&lf.listen, TunnelStatus::Listening, listen_addr.to_string());
+        log::info!("Listening on UDP {} <- {}", listen_addr, req.source);
+        status.update_tunnel(idx, TunnelStatus::Listening, listen_addr.to_string());
         udp_listen_side(&conn, hello, udp_socket).await
     } else {
-        let listeners = bind_tcp_listeners(&listen_addrs, &lf.dest).await?;
-        status.update_tunnel(&lf.listen, TunnelStatus::Listening, String::new());
+        let listeners = bind_tcp_listeners(&listen_addrs, &req.source).await?;
+        status.update_tunnel(idx, TunnelStatus::Listening, req.listen.clone());
         tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
     }
 }
 
 // ============================================================================
-// Remote forwards (-R): requester side
-// ============================================================================
-
-async fn request_remote_forwards(
-    conn: Arc<iroh::endpoint::Connection>,
-    forwards: Vec<RemoteForward>,
-    rf_map: RemoteForwardMap,
-    status: Arc<AppState>,
-) -> Result<()> {
-    let (mut send, mut recv) = open_bi_with_retry(&conn).await?;
-    send.write_all(&encode_stream_hello(&StreamHello::remote_forward_control())?)
-        .await?;
-
-    for rf in &forwards {
-        let tunnel_id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
-        let scheme = if rf.bind.starts_with("udp://") {
-            "udp"
-        } else {
-            "tcp"
-        };
-        let dest_url = format!("{}://{}", scheme, rf.dest);
-        rf_map.lock().await.insert(tunnel_id, dest_url);
-
-        let req = RemoteForwardRequest::new(tunnel_id, rf.bind.clone());
-        send.write_all(&encode_remote_forward_request(&req)?).await?;
-
-        let resp_bytes = tokio::time::timeout(ACK_TIMEOUT, read_length_prefixed(&mut recv))
-            .await
-            .context("Timed out waiting for remote forward response")?
-            .context("Failed to read remote forward response")?;
-        let resp = decode_remote_forward_response(&resp_bytes)
-            .context("Invalid remote forward response")?;
-
-        if resp.accepted {
-            let bound = resp.bound_addr.as_deref().unwrap_or("?");
-            status.update_tunnel(&rf.bind, TunnelStatus::Bound, bound.to_string());
-            log::info!(
-                "Remote forward established: peer binds {} -> our {} ({})",
-                rf.bind,
-                rf.dest,
-                bound
-            );
-        } else {
-            rf_map.lock().await.remove(&tunnel_id);
-            let reason = resp.reason.as_deref().unwrap_or("Unknown");
-            status.update_tunnel(&rf.bind, TunnelStatus::Rejected, reason.to_string());
-            log::warn!("Remote forward rejected for {}: {}", rf.bind, reason);
-        }
-    }
-
-    // Signal clean EOF on the control stream; data arrives on separate streams.
-    let _ = send.finish();
-    Ok(())
-}
-
-// ============================================================================
-// Remote forwards (-R): host side
-// ============================================================================
-
-async fn host_remote_forwards(
-    conn: Arc<iroh::endpoint::Connection>,
-    mut send: iroh::endpoint::SendStream,
-    mut recv: iroh::endpoint::RecvStream,
-    semaphore: Arc<Semaphore>,
-) -> Result<()> {
-    loop {
-        // Read the next request; a clean EOF ends the control stream.
-        let req_bytes = match read_length_prefixed(&mut recv).await {
-            Ok(bytes) => bytes,
-            Err(_) => break,
-        };
-        let req =
-            decode_remote_forward_request(&req_bytes).context("Invalid remote forward request")?;
-
-        let resp = match start_hosted_listener(conn.clone(), req.tunnel_id, &req.bind, &semaphore)
-            .await
-        {
-            Ok(bound) => RemoteForwardResponse::accepted(req.tunnel_id, Some(bound)),
-            Err(e) => {
-                log::warn!("Refusing remote forward bind {}: {}", req.bind, e);
-                RemoteForwardResponse::rejected(req.tunnel_id, e.to_string())
-            }
-        };
-        send.write_all(&encode_remote_forward_response(&resp)?)
-            .await?;
-    }
-    Ok(())
-}
-
-/// Bind the listener requested by a remote forward and spawn its accept loop.
-/// Returns the bound address. The spawned task self-terminates when the
-/// connection closes, freeing the port.
-async fn start_hosted_listener(
-    conn: Arc<iroh::endpoint::Connection>,
-    tunnel_id: u64,
-    bind: &str,
-    semaphore: &Arc<Semaphore>,
-) -> Result<String> {
-    let is_udp = bind.starts_with("udp://");
-    let addr_str =
-        extract_addr_from_source(bind).ok_or_else(|| anyhow::anyhow!("Invalid bind URL: {}", bind))?;
-    let listen_addrs = resolve_listen_addrs(&addr_str).await?;
-    let hello = StreamHello::remote_forward_data(tunnel_id);
-
-    if is_udp {
-        let listen_addr = *listen_addrs
-            .first()
-            .context("No listen address resolved for remote forward bind")?;
-        let udp_socket = Arc::new(
-            UdpSocket::bind(listen_addr)
-                .await
-                .with_context(|| format!("Failed to bind UDP listener on {}", listen_addr))?,
-        );
-        let bound = udp_socket
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| listen_addr.to_string());
-
-        let conn_for_task = conn.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                r = udp_listen_side(&conn_for_task, hello, udp_socket) => {
-                    if let Err(e) = r {
-                        log::warn!("Hosted UDP forward (tunnel {}) ended: {}", tunnel_id, e);
-                    }
-                }
-                _ = conn_for_task.closed() => {}
-            }
-        });
-        log::info!("Hosting remote forward: bound UDP {} (tunnel {})", bound, tunnel_id);
-        Ok(bound)
-    } else {
-        let listeners = bind_tcp_listeners(&listen_addrs, bind).await?;
-        let bound = listeners
-            .first()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| addr_str.clone());
-
-        let conn_for_task = conn.clone();
-        let semaphore = semaphore.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                r = tcp_accept_and_tunnel(conn_for_task.clone(), listeners, hello, semaphore) => {
-                    if let Err(e) = r {
-                        log::warn!("Hosted TCP forward (tunnel {}) ended: {}", tunnel_id, e);
-                    }
-                }
-                _ = conn_for_task.closed() => {}
-            }
-        });
-        log::info!("Hosting remote forward: bound TCP {} (tunnel {})", bound, tunnel_id);
-        Ok(bound)
-    }
-}
-
-// ============================================================================
-// Shared listen-side helpers (used by both -L and hosted -R listeners)
+// Shared listen-side helpers
 // ============================================================================
 
 async fn bind_tcp_listeners(listen_addrs: &[SocketAddr], label: &str) -> Result<Vec<TcpListener>> {

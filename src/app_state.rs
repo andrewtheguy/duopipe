@@ -10,10 +10,22 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
-use tokio::sync::Semaphore;
+use tokio::sync::{broadcast, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::LogBuffer;
+
+/// Capacity of the tunnel-command broadcast channel (commands are tiny; this
+/// only bounds how far a lagging connection supervisor may fall behind).
+const TUNNEL_COMMAND_CAPACITY: usize = 64;
+
+/// A request to start or stop a configured tunnel, addressed by its index in the
+/// configured request list. Sent by the TUI, consumed by the connection supervisor.
+#[derive(Debug, Clone, Copy)]
+pub enum TunnelCommand {
+    Start(usize),
+    Stop(usize),
+}
 
 /// Connection role for this peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,51 +105,39 @@ impl PathInfo {
     }
 }
 
-/// Direction of a configured tunnel: local-forward (`-L`) or remote-forward (`-R`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TunnelDir {
-    Local,
-    Remote,
-}
-
-impl TunnelDir {
-    pub fn label(self) -> &'static str {
-        match self {
-            TunnelDir::Local => "-L",
-            TunnelDir::Remote => "-R",
-        }
-    }
-}
-
-/// Lifecycle status of a configured tunnel.
+/// Lifecycle status of a configured tunnel request.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TunnelStatus {
-    Pending,
+    /// Configured but not started (or stopped).
+    Idle,
+    /// Local listener is bound and the request is active.
     Listening,
-    Bound,
-    Rejected,
+    /// The request failed (bind error, peer rejection, etc.).
     Error,
 }
 
 impl TunnelStatus {
     pub fn label(self) -> &'static str {
         match self {
-            TunnelStatus::Pending => "Pending",
+            TunnelStatus::Idle => "Idle",
             TunnelStatus::Listening => "Listening",
-            TunnelStatus::Bound => "Bound",
-            TunnelStatus::Rejected => "Rejected",
             TunnelStatus::Error => "Error",
         }
     }
+
+    /// Whether the tunnel is currently running (toggling it should stop it).
+    pub fn is_running(self) -> bool {
+        matches!(self, TunnelStatus::Listening)
+    }
 }
 
-/// A configured tunnel and its current status.
+/// A configured tunnel request and its current status. Rows are kept in config
+/// order, so a row's position is its request index (used to start/stop it).
 #[derive(Clone)]
 pub struct TunnelRow {
-    pub dir: TunnelDir,
-    /// Stable key used to find this row when updating status (the listen/bind spec).
-    pub key: String,
-    /// Human-readable "LISTEN -> DEST" description.
+    /// Display label from the request's `name`.
+    pub name: String,
+    /// Human-readable "LISTEN <- SOURCE" description.
     pub spec: String,
     pub status: TunnelStatus,
     /// Bound address or rejection/error reason.
@@ -171,12 +171,15 @@ pub struct AppState {
     /// Live session limiter; `used = max - available_permits()`.
     semaphore: RwLock<Option<Arc<Semaphore>>>,
     sessions_max: RwLock<usize>,
+    /// Broadcast channel for tunnel start/stop commands (TUI -> connection supervisor).
+    tunnel_tx: broadcast::Sender<TunnelCommand>,
     pub shutdown: CancellationToken,
     pub logs: Arc<LogBuffer>,
 }
 
 impl AppState {
     pub fn new(role: Role, token_generated: bool, logs: Arc<LogBuffer>) -> Arc<Self> {
+        let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         Arc::new(Self {
             role,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -189,9 +192,36 @@ impl AppState {
             tunnels: RwLock::new(Vec::new()),
             semaphore: RwLock::new(None),
             sessions_max: RwLock::new(0),
+            tunnel_tx,
             shutdown: CancellationToken::new(),
             logs,
         })
+    }
+
+    /// Subscribe to tunnel commands. Each connection supervisor subscribes once;
+    /// only commands sent after subscribing are delivered (so reconnects start clean).
+    pub fn subscribe_commands(&self) -> broadcast::Receiver<TunnelCommand> {
+        self.tunnel_tx.subscribe()
+    }
+
+    /// Send a tunnel command to any active connection supervisor(s).
+    pub fn send_command(&self, cmd: TunnelCommand) {
+        let _ = self.tunnel_tx.send(cmd);
+    }
+
+    /// Toggle the tunnel at `idx`: stop it if running, otherwise (re)start it.
+    pub fn toggle_tunnel(&self, idx: usize) {
+        let running = self
+            .tunnels
+            .read()
+            .get(idx)
+            .is_some_and(|t| t.status.is_running());
+        let cmd = if running {
+            TunnelCommand::Stop(idx)
+        } else {
+            TunnelCommand::Start(idx)
+        };
+        self.send_command(cmd);
     }
 
     pub fn set_endpoint_id(&self, id: String) {
@@ -244,10 +274,15 @@ impl AppState {
         *self.tunnels.write() = tunnels;
     }
 
-    /// Update the status/detail of a tunnel identified by `key`.
-    pub fn update_tunnel(&self, key: &str, status: TunnelStatus, detail: impl Into<String>) {
+    /// Number of configured tunnel rows (used to clamp the TUI selection cursor).
+    pub fn tunnel_count(&self) -> usize {
+        self.tunnels.read().len()
+    }
+
+    /// Update the status/detail of the tunnel at request index `idx`.
+    pub fn update_tunnel(&self, idx: usize, status: TunnelStatus, detail: impl Into<String>) {
         let mut tunnels = self.tunnels.write();
-        if let Some(row) = tunnels.iter_mut().find(|t| t.key == key) {
+        if let Some(row) = tunnels.get_mut(idx) {
             row.status = status;
             row.detail = detail.into();
         }

@@ -18,7 +18,7 @@ use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventK
 use ratatui::DefaultTerminal;
 
 use crate::app_state::{AppSnapshot, AppState, Role};
-use crate::config::{LocalForward, RemoteForward, TransportTuning};
+use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use setup::{SetupOutcome, SetupState, Step};
@@ -30,8 +30,10 @@ const TICK: Duration = Duration::from_millis(200);
 /// Everything the TUI needs to run setup and build the runtime `PeerConfig`.
 pub struct TuiLaunch {
     pub logs: Arc<LogBuffer>,
-    pub local_forwards: Vec<LocalForward>,
-    pub remote_forwards: Vec<RemoteForward>,
+    pub requests: Vec<RequestEntry>,
+    pub allowed_sources: AllowedSources,
+    /// Autostart all requests once connected (from `DUOPIPE_AUTOSTART_REQUESTS`).
+    pub autostart_requests: bool,
     pub relay_urls: Vec<String>,
     pub relay_only: bool,
     pub dns_server: Option<String>,
@@ -139,8 +141,9 @@ fn build_peer_config(
     crate::iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        local_forwards: launch.local_forwards.clone(),
-        remote_forwards: launch.remote_forwards.clone(),
+        requests: launch.requests.clone(),
+        allowed_sources: launch.allowed_sources.clone(),
+        autostart_requests: launch.autostart_requests,
         auth_token: resolved.auth_token.clone(),
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
@@ -184,8 +187,12 @@ async fn run_setup(
 }
 
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
+///
+/// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
+/// stop the selected tunnel. Logs scroll with `PageUp`/`PageDown` and `[`/`]`.
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     let total = state.logs.len();
+    let tunnels = state.tunnel_count();
     match key.code {
         KeyCode::Char('q') => {
             state.shutdown.cancel();
@@ -196,9 +203,22 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
             return true;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            ui.log_scroll = ui.log_scroll.saturating_add(1).min(total);
+            ui.selected = ui.selected.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
+            if tunnels > 0 {
+                ui.selected = (ui.selected + 1).min(tunnels - 1);
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if ui.selected < tunnels {
+                state.toggle_tunnel(ui.selected);
+            }
+        }
+        KeyCode::Char(']') => {
+            ui.log_scroll = ui.log_scroll.saturating_add(1).min(total);
+        }
+        KeyCode::Char('[') => {
             ui.log_scroll = ui.log_scroll.saturating_sub(1);
         }
         KeyCode::PageUp => {
@@ -255,8 +275,8 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         for t in &snap.tunnels {
             let _ = writeln!(
                 out,
-                "  {:<2} {:<40} {:<10} {}",
-                t.dir.label(),
+                "  {:<16} {:<40} {:<10} {}",
+                t.name,
                 t.spec,
                 t.status.label(),
                 t.detail

@@ -16,6 +16,8 @@ use crate::logging::LogLine;
 pub struct UiState {
     /// Lines scrolled up from the bottom of the log pane. 0 = follow tail.
     pub log_scroll: usize,
+    /// Index of the highlighted tunnel row (toggled with Enter).
+    pub selected: usize,
 }
 
 pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
@@ -30,7 +32,7 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
     .areas(frame.area());
 
     render_header(frame, header_area, snap);
-    render_tunnels(frame, tunnels_area, snap);
+    render_tunnels(frame, tunnels_area, snap, ui);
     render_peers(frame, peers_area, snap);
     render_logs(frame, logs_area, logs, ui);
 }
@@ -147,36 +149,51 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     v
 }
 
-fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
-    let header = Row::new(["DIR", "SPEC", "STATUS", "DETAIL"])
+fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
+    let header = Row::new(["", "NAME", "SPEC", "STATUS", "DETAIL"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = if snap.tunnels.is_empty() {
-        vec![Row::new(["", "(no tunnels configured)", "", ""])]
+        vec![Row::new(["", "", "(no tunnels configured)", "", ""])]
     } else {
-        snap.tunnels.iter().map(tunnel_row).collect()
+        snap.tunnels
+            .iter()
+            .enumerate()
+            .map(|(i, t)| tunnel_row(t, i == ui.selected))
+            .collect()
     };
     let widths = [
-        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Length(14),
         Constraint::Percentage(45),
         Constraint::Length(10),
-        Constraint::Percentage(30),
+        Constraint::Percentage(25),
     ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" Tunnels "));
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Tunnels  [↑/↓ select · Enter start/stop] "),
+    );
     frame.render_widget(table, area);
 }
 
-fn tunnel_row(t: &TunnelRow) -> Row<'static> {
-    Row::new(vec![
-        Cell::from(t.dir.label()),
+fn tunnel_row(t: &TunnelRow, selected: bool) -> Row<'static> {
+    let marker = if t.status.is_running() { "▶" } else { " " };
+    let cursor = if selected { "›" } else { " " };
+    let row = Row::new(vec![
+        Cell::from(format!("{cursor}{marker}")),
+        Cell::from(t.name.clone()),
         Cell::from(t.spec.clone()),
         Cell::from(Span::styled(
             t.status.label(),
             Style::default().fg(tunnel_color(t.status)),
         )),
         Cell::from(t.detail.clone()),
-    ])
+    ]);
+    if selected {
+        row.style(Style::default().add_modifier(Modifier::REVERSED))
+    } else {
+        row
+    }
 }
 
 fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
@@ -240,7 +257,7 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
     let lines: Vec<Line> = logs[start..end].iter().map(log_line).collect();
 
     let title = if scroll == 0 {
-        format!(" Logs ({total})  [q quit · ↑/↓ scroll · g/G top/bottom · d dump info] ")
+        format!(" Logs ({total})  [q quit · [/] or PgUp/PgDn scroll · g/G top/bottom · d dump] ")
     } else {
         format!(" Logs ({total})  [scrolled +{scroll}] ")
     };
@@ -295,9 +312,9 @@ fn conn_color(status: &ConnStatus) -> Color {
 
 fn tunnel_color(status: TunnelStatus) -> Color {
     match status {
-        TunnelStatus::Listening | TunnelStatus::Bound => Color::Green,
-        TunnelStatus::Pending => Color::Yellow,
-        TunnelStatus::Rejected | TunnelStatus::Error => Color::Red,
+        TunnelStatus::Listening => Color::Green,
+        TunnelStatus::Idle => Color::DarkGray,
+        TunnelStatus::Error => Color::Red,
     }
 }
 

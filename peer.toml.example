@@ -6,14 +6,18 @@
 # `duopipe peer` is interactive: on startup the TUI asks whether to connect to an
 # existing instance. The role (dial/listen), the target node id, and (if missing)
 # the auth token are answered there — they are NOT config keys. This file supplies
-# the rest: the shared auth token, forwards, relays, and tuning.
+# the rest: the shared auth token, tunnel requests, the allowlist, relays, tuning.
 #
-# Over the single connection, EITHER side may declare:
-#   - local forwards  (-L): this peer listens locally, the peer connects to dest
-#   - remote forwards (-R): the peer listens, forwarding back to our local dest
+# Tunnel model: each side always *requests* tunnels from the other. A [[request]]
+# binds a local listener and asks the peer to connect out to a remote 'source';
+# traffic is bridged between them. Requests do NOT start automatically — the TUI
+# lists them and you start/stop each one with Enter (set DUOPIPE_AUTOSTART_REQUESTS=1
+# to auto-start all on connect, e.g. for tests).
 #
-# Trust model: once token auth succeeds, the peer is fully trusted (there are no
-# per-destination allowlists). The iroh identity key is ephemeral (regenerated
+# Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
+# requests one of OUR sources we only honor addresses inside [allowed_sources]
+# (separate CIDR lists per protocol). Fail-closed: an empty or absent allowlist
+# rejects every incoming request. The iroh identity key is ephemeral (regenerated
 # every run), so a listening instance's node id changes between runs.
 
 # The shared auth token, presented by both sides. Optional: a fresh listening
@@ -40,28 +44,35 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # dns_server = "none"
 
 # ============================================================================
-# Local forwards (-L): this peer listens locally, the peer connects to dest.
-# The 'dest' scheme (tcp:// or udp://) selects the protocol.
+# Tunnel requests: ask the peer to connect out to 'source'; deliver traffic to a
+# local listener bound at 'listen'. The 'source' scheme (tcp:// or udp://) selects
+# the protocol. 'name' is the label shown in the TUI. Nothing starts until you
+# activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1).
 # ============================================================================
-[[local_forward]]
+[[request]]
+name = "db"
+source = "tcp://127.0.0.1:5678"
 listen = "127.0.0.1:15678"
-dest = "tcp://127.0.0.1:5678"
 
-[[local_forward]]
+[[request]]
+name = "cache"
+source = "tcp://127.0.0.1:5679"
 listen = "127.0.0.1:15679"
-dest = "tcp://127.0.0.1:5679"
 
 # ============================================================================
-# Remote forwards (-R): the peer binds 'bind' and forwards back to our 'dest'.
-# The 'bind' scheme (tcp:// or udp://) selects the protocol.
+# Allowed source networks the peer may request of US (CIDR notation).
+# Separate lists for TCP and UDP. Supports IPv4 and IPv6. Fail-closed: if a list
+# is empty, every incoming request for that protocol is rejected.
 # ============================================================================
-[[remote_forward]]
-bind = "tcp://0.0.0.0:6574"
-dest = "127.0.0.1:6574"
-
-[[remote_forward]]
-bind = "udp://127.0.0.1:5447"
-dest = "127.0.0.1:5447"
+[allowed_sources]
+tcp = [
+    "127.0.0.0/8",      # localhost
+    "192.168.0.0/16",   # private network
+    "::1/128",          # IPv6 localhost
+]
+udp = [
+    "10.0.0.0/8",       # private network
+]
 
 # ============================================================================
 # Encrypted Inline Secrets (Optional)
