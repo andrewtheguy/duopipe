@@ -166,7 +166,7 @@ graph TB
     subgraph "Listen Peer"
         A[duopipe peer<br/>answered no]
         B[iroh Endpoint<br/>ephemeral node id]
-        C[Accept Loop +<br/>Local/Remote Forwards]
+        C[Accept Loop +<br/>Request Listeners]
         D[Discovery<br/>Pkarr/DNS]
         E[Relay Server]
     end
@@ -174,7 +174,7 @@ graph TB
     subgraph "Dial Peer"
         F[duopipe peer<br/>answered yes]
         G[iroh Endpoint<br/>ephemeral node id]
-        H[Accept Loop +<br/>Local/Remote Forwards]
+        H[Accept Loop +<br/>Request Listeners]
         I[Discovery<br/>Pkarr/DNS]
         J[Relay Server]
     end
@@ -341,7 +341,7 @@ graph LR
 
 UDP forwarding reuses `forward_stream_to_udp_server` / `forward_stream_to_udp_client` / `forward_udp_to_stream` (`iroh_mode/helpers.rs`) and works in both directions. Each UDP forward uses a single bidirectional stream; packets are length-prefixed (see [UDP Packet Framing](#udp-packet-framing)).
 
-> **Note:** A hosted `-R` UDP forward inherits a single-peer-address reply limitation — the host tracks one external peer address per stream for return packets.
+> **Note:** A UDP request inherits a single-peer-address reply limitation — the connect side tracks one external peer address per stream for return packets.
 
 ```mermaid
 graph TB
@@ -526,9 +526,9 @@ graph TB
 
     F --> G{Plaintext auth_token in file?}
     G -->|Yes| H[Error: use auth_token_file, env, or ageenc:]
-    G -->|No| I{Forward addresses valid?}
+    G -->|No| I{Request + allowlist valid?}
 
-    I -->|No| J[Error: bad -L/-R address]
+    I -->|No| J[Error: bad request address or CIDR]
     I -->|Yes| K[Validation Success]
 
     style H fill:#FFCCBC
@@ -584,7 +584,7 @@ graph TB
         C --> D[Dial Peer Connects<br/>fixed ALPN mf/2]
         D --> E[Auth Token Validation]
         E --> F{Valid Token?}
-        F -->|Yes| G[Authenticated - FULL TRUST]
+        F -->|Yes| G[Authenticated<br/>requests gated by allowed_sources]
         F -->|No| H[Rejected]
     end
 
@@ -629,7 +629,7 @@ sequenceDiagram
     alt Token is valid
         A-->>L: true
         L->>D: AuthResponse {accepted: true}
-        Note over L,D: Connection authenticated — full trust
+        Note over L,D: Connection authenticated — requests gated by allowed_sources
     else Token is invalid
         A-->>L: false
         L->>D: AuthResponse {accepted: false, reason}
@@ -668,7 +668,7 @@ graph TB
     subgraph "User Responsibility"
         G[node id Verification<br/>Trust on first use]
         H[Auth Token Security<br/>Treat the token like a password]
-        I[Full Trust After Auth<br/>peers can reach any dest/bind]
+        I[Source Allowlist<br/>scope each peer with allowed_sources CIDRs]
     end
 
     style A fill:#C8E6C9
@@ -731,8 +731,8 @@ graph TB
     end
 
     subgraph "Connect Side (dials target)"
-        H[Read StreamHello + route]
-        I[Connect to dest / local dest]
+        H[Read StreamHello + check allowed_sources]
+        I[Connect out to source]
         J[StreamAck + Async Read/Write]
     end
     
@@ -911,7 +911,7 @@ has its own internal reconnect loop; the process only exits on fatal errors.
 |------|----------|---------|
 | 0 | Success | Normal termination |
 | 1 | General error | Unexpected/uncategorized failures |
-| 2 | Configuration | Missing/invalid node id, invalid token format, bad `-L`/`-R` address |
+| 2 | Configuration | Missing/invalid node id, invalid token format, bad request address or `allowed_sources` CIDR |
 | 3 | Authentication | Token rejected by peer, auth response timeout |
 | 10 | Connection failed | Relay timeout, endpoint offline, peer unreachable |
 | 11 | Connection lost | QUIC connection closed after tunnel was established |
@@ -936,9 +936,9 @@ Retry guidance:
 
 | Feature | Support |
 |---------|---------|
-| Bidirectional tunnels | **Yes** — `-L` and `-R` on either peer over one connection |
+| Bidirectional tunnels | **Yes** — either peer may request tunnels of the other over one connection |
 | Multi-Session | **Yes** — many concurrent data streams per connection (`max_sessions`) |
-| Dynamic destinations | **Yes** — each `-L`/`-R` names its own `dest`/`bind` |
+| Per-tunnel addresses | **Yes** — each `[[request]]` names its own `remote_source` / `local_listen` |
 | Encryption | QUIC/TLS 1.3 |
 | Platform | Linux, macOS, Windows |
 

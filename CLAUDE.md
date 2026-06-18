@@ -24,6 +24,6 @@ harness can wire up the dialing side. The iroh identity key is always ephemeral
 (regenerated every run), so the node id changes between runs.
 
 Tunnel model: a peer always *requests* tunnels from the other party. Each
-`[[request]]` binds a local `listen` address and asks the peer to connect out to a
-remote `source`. The serving side gates incoming requests with `[allowed_sources]`
+`[[request]]` binds a local `local_listen` address and asks the peer to connect out
+to a `remote_source`. The serving side gates incoming requests with `[allowed_sources]`
 CIDR lists (`tcp`/`udp`); an empty/absent allowlist rejects everything (fail-closed).

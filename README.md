@@ -13,7 +13,7 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 **Features:**
 - **No account or registration required** — Just download and run
 - **No publicly accessible IPs or port forwarding required** — Automatic NAT hole punching
-- **One connection, many tunnels in both directions** — A single P2P link carries any number of local (`-L`) and remote (`-R`) forwards at once
+- **One connection, many tunnels in both directions** — A single P2P link carries any number of requested tunnels at once, in either direction
 - **Full TCP and UDP support** — Seamlessly tunnel any TCP or UDP traffic
 - **Cross-platform** — Works on Linux, macOS, and Windows
 - **No root required** — Runs as unprivileged user
@@ -36,7 +36,7 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 
 ## Overview
 
-duopipe runs as a single symmetric command: `duopipe peer`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once** — combining SSH's `-L` (local forward) and `-R` (remote forward).
+duopipe runs as a single symmetric command: `duopipe peer`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
@@ -45,20 +45,22 @@ On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the 
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
 
-Once the connection is established and authenticated, tunnels flow both ways: **either** peer may declare local and remote forwards. iroh provides NAT traversal with relay fallback and automatic discovery.
+Once the connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
 
-### Forwards at a glance
+### Tunnel requests at a glance
 
-| Type | SSH analog | CLI | Behavior |
-|------|-----------|-----|----------|
-| Local forward | `-L` | `-L LISTEN=DEST` | **This** peer listens locally; the **other** peer connects out to `DEST`. The `DEST` scheme (`tcp://` / `udp://`) selects the protocol. |
-| Remote forward | `-R` | `-R BIND=DEST` | The **other** peer binds `BIND` and forwards connections back to **our** local `DEST`. The `BIND` scheme (`tcp://` / `udp://`) selects the protocol. |
+Every tunnel is a **request** (SSH `-L`–style, pull direction): a peer declares `[[request]]` entries in config, and activating one binds a local listener and asks the other peer to connect out to a remote source.
 
-Both TCP and UDP are supported in both directions and may be freely mixed on the same connection. Forward flags are repeatable.
+| Field | Meaning |
+|-------|---------|
+| `remote_source` | Origin on the **other** peer to connect out to (`tcp://host:port` or `udp://host:port`; the scheme selects the protocol). |
+| `local_listen` | Local address on **this** peer where the tunnel is exposed (`host:port`). |
 
-> **Note:** UDP `-R` (remote forward) uses a single-peer-address reply model. This is fine for single-client UDP services.
+To expose one of **your** services, the **other** peer requests it from you — there is no separate "remote forward". The serving side gates every incoming request against its `[allowed_sources]` CIDR allowlist (separate `tcp` / `udp` lists), which is **fail-closed**: an empty or absent list rejects every request. Both TCP and UDP are supported and may be mixed on one connection. Nothing forwards until you start a request in the TUI.
+
+> **Note:** UDP requests use a single-peer-address reply model. This is fine for single-client UDP services.
 
 ## Installation
 
@@ -204,7 +206,7 @@ The connection role (listen vs dial) and the dialer's target node id are chosen 
 
 ## Architecture
 
-A single iroh connection carries requested tunnels. Each side *requests* a tunnel: it binds a local listener and asks the peer to connect out to a remote `source`. For example, a request for the peer's SSH server:
+A single iroh connection carries requested tunnels. Each side *requests* a tunnel: it binds a local listener and asks the peer to connect out to a remote source. For example, a request for the peer's SSH server:
 
 ```
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
@@ -220,11 +222,11 @@ For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe peer` on both machines and answer a prompt in the TUI. Forwards, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
+duopipe is **interactive-first**: you run `duopipe peer` on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
 
 ### 1. Start the listening instance
 
-On the first machine, point at a config that declares the forwards (see [Configuration Files](#configuration-files)) and run:
+On the first machine, point at a config that declares the requests (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
 duopipe peer -c ./peer.toml
@@ -236,7 +238,7 @@ When the TUI asks **"Connect to an existing instance?"**, answer **No**. This in
 
 ### 2. Start the dialing instance
 
-On the second machine (also pointed at a config that declares its forwards):
+On the second machine (also pointed at a config that declares its requests):
 
 ```bash
 duopipe peer -c ./peer.toml
@@ -297,7 +299,7 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ### peer
 
-`duopipe peer` launches the interactive TUI. It takes only config-selection flags; everything else (forwards, relays, DNS, max-sessions, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
+`duopipe peer` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-sessions, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -326,7 +328,7 @@ Use `--default-config` to load from the default location, or `-c <path>` for a c
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-The config file holds the forwards, auth token, relays, DNS, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
+The config file holds the tunnel requests, auth token, relays, DNS, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
 
 ### Encrypted Config Values
 
@@ -519,5 +521,5 @@ done
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
 6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response
    - *If authentication fails, the connection is closed and the following steps do not occur*
-7. **Full trust:** once authenticated, the peer is fully trusted; either side may declare local (`-L`) and remote (`-R`) forwards
-8. Forwards are negotiated over the single connection and traffic flows in both directions
+7. **Auth, then a fail-closed allowlist:** once authenticated, either side may *request* tunnels of the other; each requested source is checked against the serving peer's `[allowed_sources]` CIDR lists before it connects out (fail-closed — an empty/absent list rejects everything)
+8. Requested tunnels are negotiated over the single connection and traffic flows in both directions
