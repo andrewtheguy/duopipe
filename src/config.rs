@@ -40,8 +40,8 @@ pub struct PeerConfig {
     /// Requires at least one entry in `relay_urls`.
     pub relay_only: Option<bool>,
     pub dns_server: Option<String>,
-    /// Maximum concurrent data streams per connection (default: 100).
-    pub max_sessions: Option<usize>,
+    /// Maximum concurrent forwarded streams across all tunnels (default: 100).
+    pub max_streams: Option<usize>,
     /// The shared authentication token, used by both sides of the connection.
     /// Optional: when starting a fresh (listening) instance without one, a token
     /// is generated and shown in the TUI. Prefer `auth_token_file` or an
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn parses_toml_config() {
         let toml = r#"
-max_sessions = 100
+max_streams = 100
 
 [[request]]
 name = "db"
@@ -490,7 +490,7 @@ congestion_controller = "bbr"
 receive_window = 67108864
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
-        assert_eq!(cfg.max_sessions, Some(100));
+        assert_eq!(cfg.max_streams, Some(100));
         assert_eq!(cfg.request.len(), 1);
         assert_eq!(cfg.request[0].name, "db");
         assert_eq!(cfg.allowed_sources.tcp.len(), 2);

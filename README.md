@@ -305,7 +305,7 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ### peer
 
-`duopipe peer` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-sessions, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
+`duopipe peer` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -392,7 +392,7 @@ auth_token_file = "~/.config/duopipe/auth_token.txt"
 # relay_urls = ["https://relay.example.com"]
 # relay_only = false           # requires at least one relay_urls entry
 dns_server = "https://dns.example.com/pkarr"
-max_sessions = 100
+max_streams = 100   # max concurrent forwarded connections across all tunnels
 
 # Tunnel requests: bind locally, ask the peer to connect out to source.
 [[request]]
@@ -486,6 +486,7 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 | 1 | General/unexpected error | Use judgment |
 | 2 | Configuration error (invalid arguments, bad token format, missing fields) | No — fix configuration |
 | 3 | Authentication failure (token rejected, auth timeout) | No — fix credentials |
+| 4 | Rejected: the listener's session is bound to a different node id | No — unbind/restart the listener, or dial from the bound node |
 | 10 | Connection establishment failed (timeout, relay failure, peer unreachable) | Only if it worked before |
 | 11 | Connection lost after tunnels were established | Yes — always retry |
 

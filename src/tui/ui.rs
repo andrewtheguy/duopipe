@@ -98,8 +98,8 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
                 snap.role.label(),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  sessions: "),
-            Span::raw(format!("{}/{}", snap.sessions_used, snap.sessions_max)),
+            Span::raw("  streams: "),
+            Span::raw(format!("{}/{}", snap.streams_used, snap.streams_max)),
         ]),
         Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
     ];
@@ -272,7 +272,8 @@ fn tunnel_row(t: &TunnelRow, selected: bool) -> Row<'static> {
 
 fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
     let title = match snap.role {
-        Role::Listen => " Connected peers ",
+        // The session binds to the first peer; `u` clears that binding.
+        Role::Listen => " Connected peers  [u unbind] ",
         Role::Dial => " Connection ",
     };
     let header = Row::new(["REMOTE ID", "SINCE", "PATH"])
@@ -280,10 +281,18 @@ fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
 
     let rows: Vec<Row> = match snap.role {
         Role::Listen => {
-            if snap.peers.is_empty() {
-                vec![Row::new(["", "(waiting for peers)", ""])]
-            } else {
+            if !snap.peers.is_empty() {
                 snap.peers.iter().map(peer_row).collect()
+            } else if let Some(bound) = &snap.bound_peer {
+                // Bound but disconnected: the session is reserved for this node id
+                // until it reconnects or the operator presses `u`.
+                vec![Row::new(vec![
+                    Cell::from(short_id(bound)),
+                    Cell::from("(bound — waiting)"),
+                    Cell::from("press u to unbind"),
+                ])]
+            } else {
+                vec![Row::new(["", "(waiting for peers)", ""])]
             }
         }
         Role::Dial => {

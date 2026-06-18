@@ -41,7 +41,7 @@ pub struct TuiLaunch {
     pub relay_urls: Vec<String>,
     pub relay_only: bool,
     pub dns_server: Option<String>,
-    pub max_sessions: Option<usize>,
+    pub max_streams: Option<usize>,
     pub transport: TransportTuning,
     /// Print the bound node id + token to stderr (non-interactive/test mode).
     pub announce_endpoint: bool,
@@ -154,7 +154,7 @@ fn build_peer_config(
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),
-        max_sessions: launch.max_sessions,
+        max_streams: launch.max_streams,
         transport: launch.transport.clone(),
         announce_endpoint: launch.announce_endpoint,
         status: state,
@@ -197,8 +197,9 @@ async fn run_setup(
 ///
 /// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
 /// stop the selected tunnel; `a` opens the add-request modal; `h` hides the
-/// generated-token banner. Logs scroll with `PageUp`/`PageDown` and `[`/`]`.
-/// A double `Esc` quits (or `Ctrl-C`).
+/// generated-token banner; `u` (listen role) unbinds the session so a new peer may
+/// connect. Logs scroll with `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits
+/// (or `Ctrl-C`).
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     // Ctrl-C is an always-available emergency quit, even with the modal open.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -231,6 +232,12 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         }
         KeyCode::Char('h') => {
             ui.token_banner_hidden = true;
+        }
+        KeyCode::Char('u') if state.role == Role::Listen => {
+            // Clear the sticky session binding so a different node id may bind next
+            // (e.g. after the original dialer is gone for good).
+            state.unbind_session();
+            log::info!("Session unbound; a new peer may now connect");
         }
         KeyCode::Up | KeyCode::Char('k') => {
             ui.selected = ui.selected.saturating_sub(1);
@@ -364,11 +371,7 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
     }
-    let _ = writeln!(
-        out,
-        "sessions:  {}/{}",
-        snap.sessions_used, snap.sessions_max
-    );
+    let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
 
     let _ = writeln!(out, "\nTunnels:");
     if snap.tunnels.is_empty() {
