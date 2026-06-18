@@ -73,6 +73,10 @@ const AUTH_TIMEOUT_CODE: u32 = 2;
 /// retries with backoff rather than treating it as fatal.
 const PEER_BUSY_CODE: u32 = 3;
 
+/// Connection close code for a clean local shutdown (Ctrl-C). "No error" by
+/// convention; the peer just sees the connection go away.
+const SHUTDOWN_CODE: u32 = 0;
+
 /// Maximum reconnect backoff for the dialing peer.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -381,8 +385,18 @@ async fn handle_connection(
         }
     }
 
-    // Run until the connection closes, then tear everything down.
-    let reason = conn.closed().await;
+    // Run until the connection closes or a local shutdown is requested, then tear
+    // everything down. Observing `shutdown` here is essential for the dial role:
+    // `run_dial` awaits this function inline (not in an abortable task), so without
+    // this branch a Ctrl-C while connected would block forever on `conn.closed()`
+    // (keep-alive prevents the idle timeout from ever firing).
+    let reason = tokio::select! {
+        reason = conn.closed() => reason,
+        _ = config.status.shutdown.cancelled() => {
+            conn.close(SHUTDOWN_CODE.into(), b"shutdown");
+            ConnectionError::LocallyClosed
+        }
+    };
     log::info!("Connection to {} closed: {}", remote_id, reason);
     if is_dialer {
         config.status.set_conn_status(ConnStatus::Closed);
@@ -869,8 +883,11 @@ async fn expect_ack(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iroh_mode::endpoint::create_endpoint_builder;
+    use crate::logging::LogBuffer;
     use bytes::Bytes;
-    use iroh::endpoint::VarInt;
+    use iroh::endpoint::{RelayMode, VarInt};
+    use iroh::Endpoint;
 
     fn app_close(code: u32) -> ConnectionError {
         ConnectionError::ApplicationClosed(ApplicationClose {
@@ -887,5 +904,104 @@ mod tests {
         assert!(!is_peer_busy_close(&app_close(AUTH_TIMEOUT_CODE)));
         // A non-application close (transport-level) is never peer-busy.
         assert!(!is_peer_busy_close(&ConnectionError::LocallyClosed));
+    }
+
+    fn test_peer_config(role: Role, token: &str) -> Arc<PeerConfig> {
+        let status = AppState::new(role, false, LogBuffer::new(16), vec![]);
+        Arc::new(PeerConfig {
+            role,
+            peer_node_id: None,
+            allowed_sources: AllowedSources::default(),
+            autostart_requests: false,
+            auth_token: token.to_string(),
+            relay_urls: vec![],
+            relay_only: false,
+            dns_server: Some("none".to_string()),
+            max_sessions: None,
+            transport: TransportTuning::default(),
+            announce_endpoint: false,
+            status,
+        })
+    }
+
+    async fn hermetic_endpoint() -> Endpoint {
+        // Relay disabled + DNS off: a fully local, direct-only endpoint. The shared
+        // transport config still applies keep-alive (15s) and a 300s idle timeout,
+        // so a connection between two of these stays alive for the whole test.
+        create_endpoint_builder(RelayMode::Disabled, false, Some("none"), None, None)
+            .expect("endpoint builder")
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind endpoint")
+    }
+
+    /// Regression test: a dialer parked on an established connection must return
+    /// promptly when the shutdown token is cancelled. `run_dial` awaits
+    /// `handle_connection` inline (not in an abortable task), so before the fix a
+    /// Ctrl-C while connected blocked forever on `conn.closed()` — keep-alive keeps
+    /// the connection up, so the idle timeout never rescues it.
+    #[tokio::test]
+    async fn dial_handle_connection_returns_on_shutdown() {
+        let token = "shutdown-test-token";
+        let server_ep = hermetic_endpoint().await;
+        let client_ep = hermetic_endpoint().await;
+
+        // Wait until the server publishes a direct address we can dial.
+        let server_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server_ep.addr();
+                if addr.ip_addrs().next().is_some() {
+                    break addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server direct address ready");
+
+        // Listener side: run the real handler so the dialer's auth completes and it
+        // reaches the post-auth connection wait (the path under test).
+        let server_cfg = test_peer_config(Role::Listen, token);
+        let server_ep2 = server_ep.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("accept connection");
+            let _ = handle_connection(conn, server_cfg, false).await;
+        });
+
+        // Dialer side: the system under test.
+        let client_conn = client_ep
+            .connect(server_addr, ALPN)
+            .await
+            .expect("dial connect");
+        let client_cfg = test_peer_config(Role::Dial, token);
+        let client_status = client_cfg.status.clone();
+        let client_task = tokio::spawn(handle_connection(client_conn, client_cfg, true));
+
+        // Wait until the dialer has authenticated (parked on the connection).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client_status.snapshot().conn_status != ConnStatus::Connected {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("dialer authenticated");
+
+        // Cancel shutdown; the fix must unblock the connection wait.
+        client_status.shutdown.cancel();
+
+        let joined = tokio::time::timeout(Duration::from_secs(5), client_task)
+            .await
+            .expect("dialer hung after shutdown cancel");
+        assert!(joined.is_ok(), "dialer task panicked");
+        assert!(
+            joined.unwrap().is_ok(),
+            "handle_connection should return Ok on shutdown"
+        );
+
+        server_task.abort();
+        client_ep.close().await;
+        server_ep.close().await;
     }
 }
