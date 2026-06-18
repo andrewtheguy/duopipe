@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::logging::LogBuffer;
 
 /// Connection role for this peer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Dial,
     Listen,
@@ -155,7 +155,9 @@ pub struct PeerRow {
 /// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
 pub struct AppState {
     pub role: Role,
-    pub dial_hint: RwLock<Option<String>>,
+    /// The shared auth token, shown in the listen-role dashboard so the dialer
+    /// can copy it (it may be freshly generated each run).
+    auth_token: RwLock<Option<String>>,
     endpoint_id: RwLock<Option<String>>,
     conn_status: RwLock<ConnStatus>,
     path: RwLock<PathInfo>,
@@ -172,7 +174,7 @@ impl AppState {
     pub fn new(role: Role, logs: Arc<LogBuffer>) -> Arc<Self> {
         Arc::new(Self {
             role,
-            dial_hint: RwLock::new(None),
+            auth_token: RwLock::new(None),
             endpoint_id: RwLock::new(None),
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
@@ -189,8 +191,8 @@ impl AppState {
         *self.endpoint_id.write() = Some(id);
     }
 
-    pub fn set_dial_hint(&self, hint: String) {
-        *self.dial_hint.write() = Some(hint);
+    pub fn set_auth_token(&self, token: String) {
+        *self.auth_token.write() = Some(token);
     }
 
     pub fn set_conn_status(&self, status: ConnStatus) {
@@ -256,7 +258,7 @@ impl AppState {
         AppSnapshot {
             role: self.role,
             endpoint_id: self.endpoint_id.read().clone(),
-            dial_hint: self.dial_hint.read().clone(),
+            auth_token: self.auth_token.read().clone(),
             conn_status: self.conn_status.read().clone(),
             path: self.path.read().clone(),
             peers: self.peers.read().clone(),
@@ -271,7 +273,7 @@ impl AppState {
 pub struct AppSnapshot {
     pub role: Role,
     pub endpoint_id: Option<String>,
-    pub dial_hint: Option<String>,
+    pub auth_token: Option<String>,
     pub conn_status: ConnStatus,
     pub path: PathInfo,
     pub peers: Vec<PeerRow>,

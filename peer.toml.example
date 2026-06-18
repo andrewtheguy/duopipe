@@ -3,48 +3,35 @@
 # Usage: duopipe peer -c peer.toml
 #        duopipe peer --default-config   # loads ~/.config/duopipe/peer.toml
 #
-# One peer DIALS (connect = "dial"), the other LISTENS (connect = "listen").
+# `duopipe peer` is interactive: on startup the TUI asks whether to connect to an
+# existing instance. The role (dial/listen), the target node id, and (if missing)
+# the auth token are answered there — they are NOT config keys. This file supplies
+# the rest: the shared auth token, forwards, relays, and tuning.
+#
 # Over the single connection, EITHER side may declare:
 #   - local forwards  (-L): this peer listens locally, the peer connects to dest
 #   - remote forwards (-R): the peer listens, forwarding back to our local dest
 #
-# Trust model: once ALPN + token auth succeeds, the peer is fully trusted (there
-# are no per-destination allowlists). CLI flags take precedence over this file.
+# Trust model: once token auth succeeds, the peer is fully trusted (there are no
+# per-destination allowlists). The iroh identity key is ephemeral (regenerated
+# every run), so a listening instance's node id changes between runs.
 
-# Connection role: "dial" or "listen".
-connect = "dial"
-
-# --- when connect = "dial" ---
-# EndpointId of the peer to dial. Get it from the listening peer's startup log
-# or via: duopipe show-id --secret-file peer.key
-peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
-
-# Auth token presented to the listening peer.
-# Generate with: duopipe generate-auth-token
+# The shared auth token, presented by both sides. Optional: a fresh listening
+# instance generates one if absent (shown in the TUI). Generate with:
+#   duopipe generate-auth-token
 # SECURITY: Plaintext 'auth_token' is not allowed in config files. Use
 # 'auth_token_file' (recommended), DUOPIPE_AUTH_TOKEN, or an age-encrypted value.
 auth_token_file = "~/.config/duopipe/token.txt"
-
-# --- when connect = "listen" (comment out the dial fields above) ---
-# Stable identity so the dialing peer can reach this one.
-# Generate with: duopipe generate-key --output peer.key
-# secret_file = "./peer.key"
-#
-# Accepted auth tokens (one per line, # comments allowed).
-# auth_tokens_file = "/etc/duopipe/auth_tokens.txt"
-
-# ALPN token (REQUIRED for both roles). Pre-shared token embedded in the QUIC
-# ALPN identifier; rejects unknown peers at the handshake before any stream opens.
-# Both peers must use the same token. Generate with: duopipe generate-alpn-token
-# SECURITY: Plaintext 'alpn_token' is not allowed in config files. Use
-# 'alpn_token_file' (recommended), DUOPIPE_ALPN_TOKEN, or an age-encrypted value.
-alpn_token_file = "~/.config/duopipe/alpn_token.txt"
 
 # Maximum concurrent data streams per connection (default: 100).
 # max_sessions = 100
 
 # Custom relay server URL(s) for failover. Defaults to iroh's public relays.
 # relay_urls = ["https://relay1.example.com", "https://relay2.example.com"]
+
+# Force all traffic through the relay (disables direct P2P). Requires at least
+# one entry in relay_urls (the public relay is rate-limited and not allowed here).
+# relay_only = true
 
 # Custom DNS server URL for iroh endpoint discovery (pkarr), or "none" to disable
 # DNS discovery. NOT system DNS; does not affect destination resolution.
@@ -93,7 +80,6 @@ dest = "127.0.0.1:5447"
 # encryption_recipient = "age1..."
 #
 # auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
-# alpn_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
 
 # ============================================================================
 # Transport Tuning (Optional)

@@ -2,11 +2,12 @@
 //!
 //! A single symmetric peer config with all keys at the top level.
 //!
-//! `connect` selects the connection role ("dial" or "listen"). Over one
-//! established connection a peer can run many tunnels in both directions:
-//! local forwards (`-L`, `[[local_forward]]`) and remote forwards
-//! (`-R`, `[[remote_forward]]`). `validate()` checks required fields and
-//! address formats at parse time.
+//! The connection role is chosen interactively at startup (or via env vars for
+//! tests), not in the config. Over one established connection a peer can run
+//! many tunnels in both directions: local forwards (`-L`, `[[local_forward]]`)
+//! and remote forwards (`-R`, `[[remote_forward]]`). `validate()` checks
+//! address formats at parse time. The single `auth_token` is the shared secret
+//! used by both sides.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -20,43 +21,26 @@ use std::path::{Path, PathBuf};
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
-    /// Connection role: "dial" (connect out to `peer_node_id`) or "listen" (accept).
-    pub connect: Option<ConnectRole>,
-    /// EndpointId of the peer to dial (required when `connect = "dial"`).
-    pub peer_node_id: Option<String>,
     /// Local forwards (-L): this peer listens locally and forwards to the peer's `dest`.
     #[serde(default)]
     pub local_forward: Vec<LocalForward>,
     /// Remote forwards (-R): ask the peer to bind `bind` and forward back to our `dest`.
     #[serde(default)]
     pub remote_forward: Vec<RemoteForward>,
-    /// Path to secret key file for persistent identity (required when listening).
-    pub secret_file: Option<PathBuf>,
-    /// Base64-encoded secret key for persistent identity.
-    /// Prefer `secret_file` in production; inline secrets are best kept to testing or
-    /// special cases due to VCS/log exposure risk. Secret files should be 0600 on Unix.
-    pub secret: Option<String>,
     pub relay_urls: Option<Vec<String>>,
+    /// Force all traffic through the relay server (disables direct P2P).
+    /// Requires at least one entry in `relay_urls`.
+    pub relay_only: Option<bool>,
     pub dns_server: Option<String>,
     /// Maximum concurrent data streams per connection (default: 100).
     pub max_sessions: Option<usize>,
-    /// Authentication tokens accepted from dialing peers (used when listening).
-    /// Prefer `auth_tokens_file` in production; inline tokens are best kept to testing or
-    /// special cases due to VCS/log exposure risk.
-    pub auth_tokens: Option<Vec<String>>,
-    /// Path to file containing accepted authentication tokens (used when listening).
-    /// One token per line, # comments allowed.
-    pub auth_tokens_file: Option<PathBuf>,
-    /// Authentication token presented to the peer (used when dialing).
-    /// Prefer `auth_token_file` in production to avoid exposing tokens in config files.
+    /// The shared authentication token, used by both sides of the connection.
+    /// Optional: when starting a fresh (listening) instance without one, a token
+    /// is generated and shown in the TUI. Prefer `auth_token_file` or an
+    /// age-encrypted value in production to avoid exposing it in config files.
     pub auth_token: Option<String>,
-    /// Path to file containing the authentication token (used when dialing).
+    /// Path to file containing the authentication token.
     pub auth_token_file: Option<PathBuf>,
-    /// ALPN token for QUIC handshake-level filtering.
-    /// Both peers must use the same token.
-    pub alpn_token: Option<String>,
-    /// Path to file containing the ALPN token.
-    pub alpn_token_file: Option<PathBuf>,
     /// Path to age identity (private key) file for decrypting age-encrypted values.
     pub encryption_key_file: Option<PathBuf>,
     /// Age public key (recipient) for encrypting values in this config.
@@ -70,9 +54,7 @@ pub struct PeerConfig {
 }
 
 impl PeerConfig {
-    /// Reject plaintext sensitive fields when config is loaded from a file.
-    ///
-    /// Checked fields: `auth_token`, `auth_tokens`, `alpn_token`, `secret`.
+    /// Reject a plaintext `auth_token` when config is loaded from a file.
     ///
     /// Age-encrypted values (detected by `ageenc:` prefix) are allowed through;
     /// they will be decrypted later via `decrypt_secrets()`.
@@ -82,31 +64,6 @@ impl PeerConfig {
             anyhow::bail!(
                 "Plaintext 'auth_token' is not allowed in config files. \
                  Use 'auth_token_file', set DUOPIPE_AUTH_TOKEN env var, \
-                 or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        if self
-            .auth_tokens
-            .as_ref()
-            .is_some_and(|vs| vs.iter().any(|v| !is_age_encrypted(v)))
-        {
-            anyhow::bail!(
-                "Plaintext 'auth_tokens' is not allowed in config files. \
-                 Use 'auth_tokens_file', set DUOPIPE_AUTH_TOKENS env var, \
-                 or use age-encrypted values. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        if self.alpn_token.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
-            anyhow::bail!(
-                "Plaintext 'alpn_token' is not allowed in config files. \
-                 Use 'alpn_token_file', set DUOPIPE_ALPN_TOKEN env var, \
-                 or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        if self.secret.as_ref().is_some_and(|v| !is_age_encrypted(v)) {
-            anyhow::bail!(
-                "Plaintext 'secret' is not allowed in config files. \
-                 Use 'secret_file', set DUOPIPE_SECRET env var, \
                  or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
             );
         }
@@ -123,16 +80,7 @@ impl PeerConfig {
         let has_encrypted = self
             .auth_token
             .as_ref()
-            .is_some_and(|v| is_age_encrypted(v))
-            || self
-                .alpn_token
-                .as_ref()
-                .is_some_and(|v| is_age_encrypted(v))
-            || self.secret.as_ref().is_some_and(|v| is_age_encrypted(v))
-            || self
-                .auth_tokens
-                .as_ref()
-                .is_some_and(|vs| vs.iter().any(|v| is_age_encrypted(v)));
+            .is_some_and(|v| is_age_encrypted(v));
 
         if !has_encrypted {
             return Ok(());
@@ -141,7 +89,7 @@ impl PeerConfig {
         let key_path = encryption_key_file.ok_or_else(|| {
             anyhow::anyhow!(
                 "Age-encrypted values found but no encryption key file specified.\n\
-                 Set encryption_key_file in config, use --encryption-key-file, \
+                 Set encryption_key_file in config \
                  or set DUOPIPE_ENCRYPTION_KEY_FILE env var."
             )
         })?;
@@ -151,43 +99,9 @@ impl PeerConfig {
                 self.auth_token =
                     Some(decrypt_value(v, key_path).context("Failed to decrypt auth_token")?);
             }
-        if let Some(ref v) = self.alpn_token
-            && is_age_encrypted(v) {
-                self.alpn_token =
-                    Some(decrypt_value(v, key_path).context("Failed to decrypt alpn_token")?);
-            }
-        if let Some(ref v) = self.secret
-            && is_age_encrypted(v) {
-                self.secret =
-                    Some(decrypt_value(v, key_path).context("Failed to decrypt secret")?);
-            }
-        if let Some(ref vs) = self.auth_tokens {
-            let mut decrypted = Vec::with_capacity(vs.len());
-            for (i, v) in vs.iter().enumerate() {
-                if is_age_encrypted(v) {
-                    decrypted.push(
-                        decrypt_value(v, key_path)
-                            .with_context(|| format!("Failed to decrypt auth_tokens[{}]", i))?,
-                    );
-                } else {
-                    decrypted.push(v.clone());
-                }
-            }
-            self.auth_tokens = Some(decrypted);
-        }
 
         Ok(())
     }
-}
-
-/// Connection role: who establishes the QUIC connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConnectRole {
-    /// Dial out to `peer_node_id`. Identity may be ephemeral.
-    Dial,
-    /// Accept incoming connections. Requires a stable secret.
-    Listen,
 }
 
 /// Local forward (-L): this peer binds `listen` locally and the peer connects to `dest`.
@@ -427,25 +341,16 @@ pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Res
 impl PeerConfig {
     /// Validate config structure and address formats.
     ///
-    /// Note: the connection role (dial/listen) and its required fields
-    /// (`peer_node_id` for dial, secret for listen) are resolved and enforced in
-    /// `main.rs` after merging CLI/env overrides, since those can supply the values.
+    /// Note: the connection role (dial/listen) and the target node id are
+    /// resolved interactively at startup (or via env vars for tests), so they
+    /// are not part of the config and not checked here.
     pub fn validate(&self, source: ConfigSource) -> Result<()> {
         let iroh = self;
         if source == ConfigSource::File {
             iroh.reject_plaintext_secrets()?;
         }
-        if iroh.secret.is_some() && iroh.secret_file.is_some() {
-            anyhow::bail!("Use only one of 'secret' or 'secret_file'.");
-        }
-        if iroh.auth_tokens.is_some() && iroh.auth_tokens_file.is_some() {
-            anyhow::bail!("Use only one of 'auth_tokens' or 'auth_tokens_file'.");
-        }
         if iroh.auth_token.is_some() && iroh.auth_token_file.is_some() {
             anyhow::bail!("Use only one of 'auth_token' or 'auth_token_file'.");
-        }
-        if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
-            anyhow::bail!("Use only one of 'alpn_token' or 'alpn_token_file'.");
         }
         validate_forward_specs(&iroh.local_forward, &iroh.remote_forward)?;
         validate_transport_tuning(&iroh.transport, "transport")?;
@@ -518,8 +423,6 @@ mod tests {
     #[test]
     fn parses_toml_config() {
         let toml = r#"
-connect = "dial"
-peer_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
 max_sessions = 100
 
 [[local_forward]]
@@ -535,7 +438,6 @@ congestion_controller = "bbr"
 receive_window = 67108864
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
-        assert_eq!(cfg.connect, Some(ConnectRole::Dial));
         assert_eq!(cfg.max_sessions, Some(100));
         assert_eq!(cfg.local_forward.len(), 1);
         assert_eq!(cfg.remote_forward.len(), 1);
@@ -549,14 +451,14 @@ receive_window = 67108864
 
     #[test]
     fn rejects_unknown_field() {
-        // A leftover `mode = "iroh"` (or any unknown top-level key) must now error.
+        // Any unknown top-level key (e.g. a removed `connect`) must now error.
         // Avoid unwrap_err so PeerConfig need not derive Debug (it holds secrets).
-        let toml = "connect = \"dial\"\nmode = \"iroh\"\n";
+        let toml = "connect = \"dial\"\n";
         let err = match toml::from_str::<PeerConfig>(toml) {
             Ok(_) => panic!("expected unknown-field error"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("mode"), "error was: {err}");
+        assert!(err.contains("connect"), "error was: {err}");
     }
 
     #[test]
@@ -579,58 +481,15 @@ receive_window = 67108864
         assert!(err.to_string().contains("Plaintext 'auth_token'"));
     }
 
-    #[test]
-    fn rejects_plaintext_auth_tokens_from_file() {
-        let cfg = peer_config(PeerConfig {
-            auth_tokens: Some(vec!["tok1".into()]),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'auth_tokens'"));
-    }
-
-    #[test]
-    fn rejects_plaintext_alpn_token_from_file() {
-        let cfg = peer_config(PeerConfig {
-            alpn_token: Some("alpn123".into()),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'alpn_token'"));
-    }
-
-    #[test]
-    fn rejects_plaintext_secret_from_file() {
-        let cfg = peer_config(PeerConfig {
-            secret: Some("base64secret".into()),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'secret'"));
-    }
-
     const FAKE_AGE_ENCRYPTED: &str = "ageenc:YWdlLWVuY3J5cHRpb24=";
 
     #[test]
     fn allows_age_encrypted_secrets_from_file() {
         let cfg = peer_config(PeerConfig {
             auth_token: Some(FAKE_AGE_ENCRYPTED.into()),
-            auth_tokens: Some(vec![FAKE_AGE_ENCRYPTED.into()]),
-            alpn_token: Some(FAKE_AGE_ENCRYPTED.into()),
-            secret: Some(FAKE_AGE_ENCRYPTED.into()),
             ..Default::default()
         });
         assert!(cfg.validate(ConfigSource::File).is_ok());
-    }
-
-    #[test]
-    fn rejects_mixed_plaintext_age_auth_tokens_from_file() {
-        let cfg = peer_config(PeerConfig {
-            auth_tokens: Some(vec![FAKE_AGE_ENCRYPTED.into(), "plaintext".into()]),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'auth_tokens'"));
     }
 
     #[test]

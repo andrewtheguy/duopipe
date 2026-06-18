@@ -11,29 +11,28 @@ mod error;
 mod iroh_mode;
 mod logging;
 mod net;
-mod secret;
+mod peer_params;
 mod signaling;
 mod tui;
 
-use ::iroh::SecretKey;
+use ::iroh::EndpointId;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::time::Duration;
-use crate::app_state::{AppState, Role};
+use crate::app_state::Role;
 use crate::error::{ErrorCategory, TunnelError};
+use crate::peer_params::ResolvedPeer;
+use crate::tui::TuiLaunch;
 
 /// Capacity of the in-memory log ring buffer shown in the TUI.
 const LOG_CAPACITY: usize = 2000;
 
 use crate::config::{
     expand_tilde, load_peer_config, validate_forward_specs, validate_transport_tuning,
-    ConfigSource, ConnectRole, LocalForward, PeerConfig, RemoteForward, TransportTuning,
+    ConfigSource, PeerConfig,
 };
-use crate::iroh_mode::endpoint::{
-    load_secret, load_secret_from_string, secret_to_endpoint_id,
-};
+use crate::iroh_mode::endpoint::validate_relay_only;
 
 #[derive(Parser)]
 #[command(name = "duopipe")]
@@ -45,15 +44,14 @@ struct Args {
 }
 
 #[derive(Subcommand)]
-// The `Peer` variant carries many CLI flags; boxing individual clap fields would
-// hurt readability for no real benefit on a short-lived, single-instance enum.
-#[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Run a peer: one connection, many tunnels in both directions.
+    /// Run a peer (interactive TUI): one connection, many tunnels both ways.
     ///
-    /// One peer dials (`--connect dial --peer-node-id <ID>`), the other listens
-    /// (`--connect listen --secret-file <KEY>`). Over the single connection, each
-    /// side can declare local forwards (-L) and remote forwards (-R).
+    /// On startup the TUI asks whether to connect to an existing instance.
+    /// Choosing "no" starts a listening instance (generating an auth token if
+    /// none is configured); choosing "yes" prompts for the existing instance's
+    /// node id and, if not configured, its auth token. Forwards, relays, and
+    /// other options come from the config file.
     Peer {
         /// Path to config file
         #[arg(short, long)]
@@ -62,98 +60,13 @@ enum Command {
         /// Load config from default location (~/.config/duopipe/peer.toml)
         #[arg(long)]
         default_config: bool,
-
-        /// Connection role: "dial" (connect out) or "listen" (accept).
-        #[arg(long)]
-        connect: Option<String>,
-
-        /// EndpointId of the peer to dial (required when --connect dial)
-        #[arg(short = 'n', long)]
-        peer_node_id: Option<String>,
-
-        /// Local forward (-L), repeatable: LISTEN=DEST
-        /// E.g. -L 127.0.0.1:15678=tcp://127.0.0.1:5678
-        #[arg(short = 'L', value_name = "LISTEN=DEST")]
-        local_forward: Vec<String>,
-
-        /// Remote forward (-R), repeatable: BIND=DEST
-        /// E.g. -R tcp://0.0.0.0:6574=127.0.0.1:6574
-        #[arg(short = 'R', value_name = "BIND=DEST")]
-        remote_forward: Vec<String>,
-
-        /// Maximum concurrent data streams per connection (default: 100)
-        #[arg(long)]
-        max_sessions: Option<usize>,
-
-        /// Path to secret key file for persistent identity (required when listening)
-        #[arg(long)]
-        secret_file: Option<PathBuf>,
-
-        /// Custom relay server URL(s) for failover
-        #[arg(long = "relay-url")]
-        relay_urls: Vec<String>,
-
-        /// Force all connections through the relay server (disables direct P2P).
-        #[arg(long)]
-        relay_only: bool,
-
-        /// Custom DNS server URL for peer discovery, or "none" to disable DNS discovery.
-        /// mDNS for local network discovery is unaffected.
-        #[arg(long)]
-        dns_server: Option<String>,
-
-        /// Path to file containing the authentication token presented when dialing
-        #[arg(long)]
-        auth_token_file: Option<PathBuf>,
-
-        /// Path to file containing accepted authentication tokens when listening
-        /// (one per line, # comments allowed).
-        #[arg(long, value_name = "FILE")]
-        auth_tokens_file: Option<PathBuf>,
-
-        /// Path to file containing ALPN token
-        #[arg(long)]
-        alpn_token_file: Option<PathBuf>,
-
-        /// Path to age identity file for decrypting age-encrypted config values
-        #[arg(long)]
-        encryption_key_file: Option<PathBuf>,
-    },
-    /// Generate a private key for a peer's persistent identity
-    ///
-    /// The private key gives the listening peer a stable EndpointId that the
-    /// dialing peer connects to. Use show-id to display the public EndpointId.
-    GenerateKey {
-        /// Path where to save the private key file
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Overwrite existing file if it exists
-        #[arg(long)]
-        force: bool,
-    },
-    /// Show the public EndpointId derived from a private key
-    ///
-    /// The dialing peer uses this EndpointId with --peer-node-id to connect.
-    ShowId {
-        /// Path to the private key file
-        #[arg(short, long)]
-        secret_file: PathBuf,
     },
     /// Generate an authentication token
     ///
-    /// Tokens authenticate the dialing peer (like API keys). The listening peer
-    /// configures accepted tokens via DUOPIPE_AUTH_TOKENS env var or --auth-tokens-file.
+    /// The auth token is the shared secret presented by both sides. Put it in a
+    /// config `auth_token`/`auth_token_file`, or set DUOPIPE_AUTH_TOKEN. A fresh
+    /// listening instance generates one automatically if none is provided.
     GenerateAuthToken {
-        /// Number of tokens to generate (default: 1)
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
-    /// Generate an ALPN token (14-char Base64URL)
-    ///
-    /// Shared between both peers for pre-handshake QUIC ALPN filtering.
-    /// Configure via DUOPIPE_ALPN_TOKEN env var or --alpn-token-file.
-    GenerateAlpnToken {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
         count: usize,
@@ -199,209 +112,78 @@ fn env_var_opt(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn normalize_optional_endpoint(value: Option<String>) -> Option<String> {
-    value.and_then(|v| if v.trim().is_empty() { None } else { Some(v) })
+fn env_truthy(name: &str) -> bool {
+    env_var_opt(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
-/// Resolved iroh parameters for a peer, after merging CLI, env, and config.
-/// CLI values take precedence over config file values.
-struct PeerIrohParams {
-    connect: Option<ConnectRole>,
-    peer_node_id: Option<String>,
-    local_forwards: Vec<LocalForward>,
-    remote_forwards: Vec<RemoteForward>,
-    max_sessions: Option<usize>,
-    secret: Option<String>,
-    secret_file: Option<PathBuf>,
-    relay_urls: Vec<String>,
-    dns_server: Option<String>,
-    auth_token: Option<String>,
-    auth_token_file: Option<PathBuf>,
-    auth_tokens: Vec<String>,
-    auth_tokens_file: Option<PathBuf>,
-    alpn_token: Option<String>,
-    alpn_token_file: Option<PathBuf>,
-    transport: TransportTuning,
-}
+/// Resolve the shared auth token from env (`DUOPIPE_AUTH_TOKEN`), then config
+/// `auth_token`, then `auth_token_file`. Validates the token's CRC when present.
+/// Returns `None` when none is configured (a fresh listening instance will
+/// generate one).
+fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
+    let token = if let Some(t) = env_var_opt("DUOPIPE_AUTH_TOKEN") {
+        Some(t)
+    } else if let Some(t) = &cfg.auth_token {
+        Some(t.clone())
+    } else if let Some(file) = &cfg.auth_token_file {
+        let expanded = expand_tilde(file);
+        Some(auth::load_auth_token_from_file(&expanded)?)
+    } else {
+        None
+    };
 
-fn parse_connect_role(value: &str) -> Result<ConnectRole> {
-    match value.trim().to_lowercase().as_str() {
-        "dial" => Ok(ConnectRole::Dial),
-        "listen" => Ok(ConnectRole::Listen),
-        other => anyhow::bail!("Invalid --connect '{}'. Use 'dial' or 'listen'.", other),
+    if let Some(t) = &token {
+        auth::validate_token(t).context(
+            "Invalid auth token format. Generate a valid token with: duopipe generate-auth-token",
+        )?;
     }
+    Ok(token)
 }
 
-fn parse_local_forward(spec: &str) -> Result<LocalForward> {
-    let (listen, dest) = spec.split_once('=').ok_or_else(|| {
-        anyhow::anyhow!(
-            "Invalid -L '{}'. Expected LISTEN=DEST, e.g. 127.0.0.1:15678=tcp://127.0.0.1:5678",
-            spec
-        )
-    })?;
-    Ok(LocalForward {
-        listen: listen.trim().to_string(),
-        dest: dest.trim().to_string(),
-    })
-}
+/// Detect a non-interactive (test) preset from environment variables.
+///
+/// Requires `DUOPIPE_NONINTERACTIVE` to be truthy. Role is inferred from
+/// `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial (parse the id), absent ⇒ Listen. The
+/// auth token comes from `config_auth_token` (already resolved/validated), or is
+/// generated for Listen. Evaluated before the TUI starts so failures print
+/// plainly and exit.
+fn detect_env_preset(config_auth_token: Option<String>) -> Result<Option<ResolvedPeer>> {
+    if !env_truthy("DUOPIPE_NONINTERACTIVE") {
+        return Ok(None);
+    }
 
-fn parse_remote_forward(spec: &str) -> Result<RemoteForward> {
-    let (bind, dest) = spec.split_once('=').ok_or_else(|| {
-        anyhow::anyhow!(
-            "Invalid -R '{}'. Expected BIND=DEST, e.g. tcp://0.0.0.0:6574=127.0.0.1:6574",
-            spec
-        )
-    })?;
-    Ok(RemoteForward {
-        bind: bind.trim().to_string(),
-        dest: dest.trim().to_string(),
-    })
-}
-
-/// Resolve iroh peer parameters from CLI and config.
-/// Env vars take precedence over config for sensitive fields.
-fn resolve_peer_iroh_params(
-    cli: &Command,
-    iroh_cfg: Option<&crate::config::PeerConfig>,
-) -> Result<PeerIrohParams> {
-    let cfg = iroh_cfg.cloned().unwrap_or_default();
-
-    let Command::Peer {
-        connect,
-        peer_node_id,
-        local_forward,
-        remote_forward,
-        max_sessions,
-        secret_file,
-        relay_urls,
-        dns_server,
-        auth_token_file,
-        auth_tokens_file,
-        alpn_token_file,
-        encryption_key_file: _,
-        ..
-    } = cli
-    else {
-        unreachable!("resolve_peer_iroh_params called with non-peer command");
-    };
-
-    let connect = match connect {
-        Some(s) => Some(parse_connect_role(s)?),
-        None => cfg.connect,
-    };
-
-    let local_forwards = if local_forward.is_empty() {
-        cfg.local_forward.clone()
-    } else {
-        local_forward
-            .iter()
-            .map(|s| parse_local_forward(s))
-            .collect::<Result<Vec<_>>>()?
-    };
-    let remote_forwards = if remote_forward.is_empty() {
-        cfg.remote_forward.clone()
-    } else {
-        remote_forward
-            .iter()
-            .map(|s| parse_remote_forward(s))
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    let env_secret = env_var_opt("DUOPIPE_SECRET");
-    let (secret, secret_file) = if env_secret.is_some() || secret_file.is_some() {
-        (env_secret, secret_file.clone())
-    } else {
-        (cfg.secret.clone(), cfg.secret_file.clone())
-    };
-
-    let env_auth_token = env_var_opt("DUOPIPE_AUTH_TOKEN");
-    let (auth_token, auth_token_file) = if env_auth_token.is_some() || auth_token_file.is_some() {
-        (env_auth_token, auth_token_file.clone())
-    } else {
-        (cfg.auth_token.clone(), cfg.auth_token_file.clone())
-    };
-
-    let env_auth_tokens: Vec<String> = env_var_opt("DUOPIPE_AUTH_TOKENS")
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let env_alpn_token = env_var_opt("DUOPIPE_ALPN_TOKEN");
-
-    Ok(PeerIrohParams {
-        connect,
-        peer_node_id: normalize_optional_endpoint(peer_node_id.clone())
-            .or_else(|| normalize_optional_endpoint(cfg.peer_node_id.clone())),
-        local_forwards,
-        remote_forwards,
-        max_sessions: max_sessions.or(cfg.max_sessions),
-        secret,
-        secret_file,
-        relay_urls: if relay_urls.is_empty() {
-            cfg.relay_urls.clone().unwrap_or_default()
-        } else {
-            relay_urls.clone()
-        },
-        dns_server: dns_server.clone().or(cfg.dns_server.clone()),
-        auth_token,
-        auth_token_file,
-        auth_tokens: if !env_auth_tokens.is_empty() {
-            env_auth_tokens
-        } else {
-            cfg.auth_tokens.clone().unwrap_or_default()
-        },
-        auth_tokens_file: auth_tokens_file.clone().or(cfg.auth_tokens_file.clone()),
-        alpn_token: if env_alpn_token.is_some() {
-            env_alpn_token
-        } else if alpn_token_file.is_some() {
-            None
-        } else {
-            cfg.alpn_token.clone()
-        },
-        alpn_token_file: if alpn_token_file.is_some() {
-            alpn_token_file.clone()
-        } else {
-            cfg.alpn_token_file.clone()
-        },
-        transport: cfg.transport.clone(),
-    })
-}
-
-/// Resolve an optional iroh secret. Returns None when neither inline nor file is given
-/// (the dialing peer may use an ephemeral identity).
-fn resolve_optional_secret(
-    secret: Option<String>,
-    secret_file: Option<PathBuf>,
-) -> Result<Option<SecretKey>> {
-    match (secret, secret_file) {
-        (Some(_), Some(_)) => {
-            anyhow::bail!(
-                "Cannot combine DUOPIPE_SECRET with --secret-file (or secret and secret_file in config)."
-            );
+    match env_var_opt("DUOPIPE_PEER_NODE_ID") {
+        Some(node) => {
+            let id: EndpointId = node.parse().map_err(|_| {
+                anyhow::anyhow!("DUOPIPE_PEER_NODE_ID is not a valid node id.")
+            })?;
+            let auth_token = config_auth_token.context(
+                "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN or auth_token in the config.",
+            )?;
+            Ok(Some(ResolvedPeer {
+                role: Role::Dial,
+                peer_node_id: Some(id),
+                auth_token,
+            }))
         }
-        (Some(secret), None) => {
-            let trimmed = secret.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!("Inline secret is empty. Provide a base64-encoded secret key.");
-            }
-            let secret = load_secret_from_string(trimmed)
-                .context("Invalid inline secret key (expected base64)")?;
-            log::info!("Loaded identity from inline secret");
-            log::info!("EndpointId: {}", secret_to_endpoint_id(&secret));
-            Ok(Some(secret))
+        None => {
+            let auth_token = match config_auth_token {
+                Some(t) => t,
+                None => {
+                    let t = auth::generate_token();
+                    // Printed before TUI init so non-interactive tests can capture it.
+                    eprintln!("auth_token: {t}");
+                    t
+                }
+            };
+            Ok(Some(ResolvedPeer {
+                role: Role::Listen,
+                peer_node_id: None,
+                auth_token,
+            }))
         }
-        (None, Some(path)) => {
-            let expanded = expand_tilde(&path);
-            let secret = load_secret(&expanded)?;
-            log::info!("Loaded identity from: {}", expanded.display());
-            log::info!("EndpointId: {}", secret_to_endpoint_id(&secret));
-            Ok(Some(secret))
-        }
-        (None, None) => Ok(None),
     }
 }
 
@@ -472,9 +254,6 @@ async fn run_inner() -> Result<()> {
         Command::Peer {
             config,
             default_config,
-            relay_only,
-            encryption_key_file,
-            ..
         } => {
             let (mut cfg, source) = resolve_peer_config(config.clone(), *default_config)?;
 
@@ -482,179 +261,50 @@ async fn run_inner() -> Result<()> {
                 cfg.validate(source).map_err(TunnelError::config)?;
             }
 
-            // Decrypt age-encrypted values if present
-            let enc_key = encryption_key_file
-                .clone()
-                .or_else(|| env_var_opt("DUOPIPE_ENCRYPTION_KEY_FILE").map(PathBuf::from))
+            // Decrypt age-encrypted values if present.
+            let enc_key = env_var_opt("DUOPIPE_ENCRYPTION_KEY_FILE")
+                .map(PathBuf::from)
                 .or_else(|| cfg.encryption_key_file.clone())
                 .map(|p| expand_tilde(&p));
             cfg.decrypt_secrets(enc_key.as_deref())?;
 
-            let params = resolve_peer_iroh_params(&command, Some(&cfg))
+            // Forwards, relays, and transport now come from config only.
+            validate_forward_specs(&cfg.local_forward, &cfg.remote_forward)
+                .map_err(TunnelError::config)?;
+            validate_transport_tuning(&cfg.transport, "transport")
                 .map_err(TunnelError::config)?;
 
-            // Validate forward address formats (covers CLI-supplied -L/-R too).
-            validate_forward_specs(&params.local_forwards, &params.remote_forwards)
-                .map_err(TunnelError::config)?;
+            let relay_urls = cfg.relay_urls.clone().unwrap_or_default();
+            let relay_only = cfg.relay_only.unwrap_or(false);
+            validate_relay_only(relay_only, &relay_urls).map_err(TunnelError::config)?;
 
-            let connect = params.connect.ok_or_else(|| {
-                TunnelError::config(anyhow::anyhow!(
-                    "Connection role is required. Pass --connect dial|listen or set connect in the config."
-                ))
-            })?;
+            // Resolve the shared auth token (env > config) and any non-interactive
+            // preset, both before the TUI starts so failures print plainly.
+            let config_auth_token =
+                resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
+            let preset =
+                detect_env_preset(config_auth_token.clone()).map_err(TunnelError::config)?;
 
-            let relay_only = *relay_only;
-
-            let secret = resolve_optional_secret(params.secret, params.secret_file)?;
-
-            // Resolve the auth token presented when dialing (optional for listen).
-            let auth_token = match (params.auth_token, params.auth_token_file) {
-                (Some(_), Some(_)) => {
-                    return Err(TunnelError::config(anyhow::anyhow!(
-                        "Cannot combine DUOPIPE_AUTH_TOKEN with --auth-token-file (or auth_token and auth_token_file in config)."
-                    )).into());
-                }
-                (Some(token), None) => Some(token),
-                (None, Some(file)) => {
-                    let expanded = expand_tilde(&file);
-                    Some(auth::load_auth_token_from_file(&expanded).map_err(TunnelError::config)?)
-                }
-                (None, None) => None,
-            };
-            if let Some(ref token) = auth_token {
-                auth::validate_token(token)
-                    .context("Invalid auth token format. Generate a valid token with: duopipe generate-auth-token")
-                    .map_err(TunnelError::config)?;
-            }
-
-            // Resolve the auth tokens accepted when listening (optional for dial).
-            let auth_tokens_file_expanded =
-                params.auth_tokens_file.as_ref().map(|p| expand_tilde(p));
-            let auth_tokens = auth::load_auth_tokens(
-                &params.auth_tokens,
-                auth_tokens_file_expanded.as_deref(),
-            )
-            .map_err(TunnelError::config)?;
-
-            // Resolve ALPN token from env var or file (required for both roles).
-            let alpn_token = match (params.alpn_token, params.alpn_token_file) {
-                (Some(_), Some(_)) => {
-                    return Err(TunnelError::config(anyhow::anyhow!(
-                        "Cannot combine DUOPIPE_ALPN_TOKEN with --alpn-token-file (or alpn_token and alpn_token_file in config)."
-                    )).into());
-                }
-                (Some(token), None) => token,
-                (None, Some(file)) => {
-                    let expanded = expand_tilde(&file);
-                    auth::load_alpn_token_from_file(&expanded).map_err(TunnelError::config)?
-                }
-                (None, None) => {
-                    return Err(TunnelError::config(anyhow::anyhow!(
-                        "ALPN token is required. Set DUOPIPE_ALPN_TOKEN environment variable or use --alpn-token-file.\n\
-                        Generate one with: duopipe generate-alpn-token"
-                    )).into());
-                }
-            };
-            auth::validate_alpn_token(&alpn_token)
-                .context("Invalid ALPN token format. Generate a valid token with: duopipe generate-alpn-token")
-                .map_err(TunnelError::config)?;
-
-            // Enforce role-specific requirements.
-            match connect {
-                ConnectRole::Dial => {
-                    if params.peer_node_id.is_none() {
-                        return Err(TunnelError::config(anyhow::anyhow!(
-                            "--connect dial requires --peer-node-id (or peer_node_id in the config)."
-                        )).into());
-                    }
-                    if auth_token.is_none() {
-                        return Err(TunnelError::config(anyhow::anyhow!(
-                            "--connect dial requires an auth token. Set DUOPIPE_AUTH_TOKEN or use --auth-token-file."
-                        )).into());
-                    }
-                }
-                ConnectRole::Listen => {
-                    if secret.is_none() {
-                        return Err(TunnelError::config(anyhow::anyhow!(
-                            "--connect listen requires a secret identity. Generate one with:\n  \
-                             duopipe generate-key --output ./peer.key\n\
-                             then pass --secret-file ./peer.key or set secret_file in the config."
-                        )).into());
-                    }
-                    if auth_tokens.is_empty() {
-                        return Err(TunnelError::config(anyhow::anyhow!(
-                            "--connect listen requires at least one accepted auth token. Set DUOPIPE_AUTH_TOKENS or use --auth-tokens-file."
-                        )).into());
-                    }
-                    log::info!("Auth tokens: {} token(s) configured", auth_tokens.len());
-                }
-            }
-
-            // Validate transport tuning window sizes
-            validate_transport_tuning(&params.transport, "iroh.transport")
-                .map_err(TunnelError::config)?;
-
-            let role = match connect {
-                ConnectRole::Dial => Role::Dial,
-                ConnectRole::Listen => Role::Listen,
-            };
             let log_buffer = log_buffer.expect("peer command initializes the TUI log buffer");
-            let state = AppState::new(role, log_buffer);
-
-            let cfg = iroh_mode::PeerConfig {
-                connect,
-                peer_node_id: params.peer_node_id,
-                secret,
-                local_forwards: params.local_forwards,
-                remote_forwards: params.remote_forwards,
-                auth_token,
-                auth_tokens,
-                alpn_token,
-                relay_urls: params.relay_urls,
+            let launch = TuiLaunch {
+                logs: log_buffer,
+                local_forwards: cfg.local_forward.clone(),
+                remote_forwards: cfg.remote_forward.clone(),
+                relay_urls,
                 relay_only,
-                dns_server: params.dns_server,
-                max_sessions: params.max_sessions,
-                transport: params.transport,
-                status: state.clone(),
+                dns_server: cfg.dns_server.clone(),
+                max_sessions: cfg.max_sessions,
+                transport: cfg.transport.clone(),
+                announce_endpoint: preset.is_some(),
+                config_auth_token,
+                preset,
             };
 
-            // Run the peer runtime alongside the TUI. The first to finish stops
-            // the other: a fatal runtime error tears down the TUI (restoring the
-            // terminal before the error prints); pressing `q` cancels the shared
-            // shutdown token so the runtime closes its endpoint cleanly.
-            let mut runtime = tokio::spawn(iroh_mode::run_peer(cfg));
-            let tui_fut = tui::run_tui(state.clone());
-            tokio::pin!(tui_fut);
-
-            tokio::select! {
-                r = &mut runtime => {
-                    state.shutdown.cancel();
-                    tui_fut.await;
-                    match r {
-                        Ok(inner) => inner,
-                        Err(e) => Err(anyhow::anyhow!("peer task failed: {e}")),
-                    }
-                }
-                _ = &mut tui_fut => {
-                    state.shutdown.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(2), runtime).await;
-                    Ok(())
-                }
-            }
+            tui::run_tui(launch).await
         }
-        Command::GenerateKey { output, force } => {
-            secret::generate_secret(expand_tilde(output), *force)
-        }
-        Command::ShowId { secret_file } => secret::show_id(expand_tilde(secret_file)),
         Command::GenerateAuthToken { count } => {
             for _ in 0..*count {
                 println!("{}", auth::generate_token());
-            }
-            Ok(())
-        }
-        Command::GenerateAlpnToken { count } => {
-            for _ in 0..*count {
-                println!("{}", auth::generate_alpn_token());
             }
             Ok(())
         }

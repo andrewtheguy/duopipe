@@ -1,7 +1,7 @@
 //! Symmetric iroh peer: one connection, many tunnels in both directions.
 //!
-//! A peer either dials another peer (`ConnectRole::Dial`) or listens for one
-//! (`ConnectRole::Listen`). Connection *setup* is asymmetric (QUIC needs a dialer
+//! A peer either dials another peer (`Role::Dial`) or listens for one
+//! (`Role::Listen`). Connection *setup* is asymmetric (QUIC needs a dialer
 //! and an acceptor), but once a connection is established either side can open
 //! streams, so tunnels flow both ways:
 //!
@@ -11,8 +11,8 @@
 //!   forward connections back to a destination *we* connect out to.
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
-//! it without positional assumptions. Trust model: once ALPN + token auth passes,
-//! the peer is fully trusted — there are no per-destination allowlists.
+//! it without positional assumptions. Trust model: once token auth passes, the
+//! peer is fully trusted — there are no per-destination allowlists.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -21,14 +21,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iroh::{EndpointId, SecretKey};
+use iroh::EndpointId;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::app_state::{AppState, ConnStatus, TunnelDir, TunnelRow, TunnelStatus};
+use crate::app_state::{AppState, ConnStatus, Role, TunnelDir, TunnelRow, TunnelStatus};
 use crate::auth::is_token_valid;
-use crate::config::{ConnectRole, LocalForward, RemoteForward, TransportTuning};
+use crate::config::{LocalForward, RemoteForward, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::net::{
     bind_udp_for_targets, extract_addr_from_source, resolve_all_target_addrs, resolve_listen_addrs,
@@ -36,8 +36,8 @@ use crate::net::{
 };
 
 use crate::iroh_mode::endpoint::{
-    build_multi_alpn, connect_to_server, create_client_endpoint, create_server_endpoint,
-    validate_relay_only, watch_connection_paths,
+    connect_to_server, create_client_endpoint, create_server_endpoint, validate_relay_only,
+    watch_connection_paths, ALPN,
 };
 use crate::iroh_mode::helpers::{
     bridge_streams, forward_stream_to_udp_client, forward_stream_to_udp_server,
@@ -82,22 +82,16 @@ type RemoteForwardMap = Arc<Mutex<HashMap<u64, String>>>;
 /// Runtime configuration for a symmetric peer.
 pub struct PeerConfig {
     /// Connection role (dial out or listen).
-    pub connect: ConnectRole,
+    pub role: Role,
     /// EndpointId of the peer to dial (required for `Dial`).
-    pub peer_node_id: Option<String>,
-    /// Iroh secret key (required for `Listen`, optional for `Dial`).
-    /// **Sensitive field - redacted in Debug output.**
-    pub secret: Option<SecretKey>,
+    pub peer_node_id: Option<EndpointId>,
     /// Local forwards (-L) hosted by this peer.
     pub local_forwards: Vec<LocalForward>,
     /// Remote forwards (-R) this peer requests from the other peer.
     pub remote_forwards: Vec<RemoteForward>,
-    /// Auth token presented when dialing. **Sensitive - redacted in Debug.**
-    pub auth_token: Option<String>,
-    /// Auth tokens accepted when listening. **Sensitive - redacted in Debug.**
-    pub auth_tokens: HashSet<String>,
-    /// ALPN token for QUIC handshake-level filtering. **Sensitive - redacted in Debug.**
-    pub alpn_token: String,
+    /// The shared auth token (presented when dialing, required when listening).
+    /// **Sensitive - redacted in Debug.**
+    pub auth_token: String,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -108,6 +102,10 @@ pub struct PeerConfig {
     pub max_sessions: Option<usize>,
     /// Transport layer tuning.
     pub transport: TransportTuning,
+    /// When true (non-interactive/test mode), print the bound node id + token to
+    /// stderr so a test harness can wire up the dialing side. The interactive TUI
+    /// shows them in its header instead and leaves this false.
+    pub announce_endpoint: bool,
     /// Shared state surfaced by the TUI.
     pub status: Arc<AppState>,
 }
@@ -115,19 +113,17 @@ pub struct PeerConfig {
 impl std::fmt::Debug for PeerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerConfig")
-            .field("connect", &self.connect)
+            .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
-            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
             .field("local_forwards", &self.local_forwards)
             .field("remote_forwards", &self.remote_forwards)
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "[REDACTED]"))
-            .field("auth_tokens", &format!("[{} tokens]", self.auth_tokens.len()))
-            .field("alpn_token", &"[REDACTED]")
+            .field("auth_token", &"[REDACTED]")
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
             .field("max_sessions", &self.max_sessions)
             .field("transport", &self.transport)
+            .field("announce_endpoint", &self.announce_endpoint)
             .field("status", &"<present>")
             .finish()
     }
@@ -136,11 +132,10 @@ impl std::fmt::Debug for PeerConfig {
 /// Run a symmetric peer: dial or listen, then serve tunnels in both directions.
 pub async fn run_peer(config: PeerConfig) -> Result<()> {
     validate_relay_only(config.relay_only, &config.relay_urls)?;
-    let alpn = build_multi_alpn(&config.alpn_token);
 
-    match config.connect {
-        ConnectRole::Listen => run_listen(config, alpn).await,
-        ConnectRole::Dial => run_dial(config, alpn).await,
+    match config.role {
+        Role::Listen => run_listen(config).await,
+        Role::Dial => run_dial(config).await,
     }
 }
 
@@ -148,34 +143,31 @@ pub async fn run_peer(config: PeerConfig) -> Result<()> {
 // Listen role
 // ============================================================================
 
-async fn run_listen(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
-    let secret = config
-        .secret
-        .clone()
-        .context("listen role requires a secret identity")?;
-
+async fn run_listen(config: PeerConfig) -> Result<()> {
     log::info!("Symmetric Peer - Listen Mode");
     log::info!("============================");
 
     let endpoint = create_server_endpoint(
         &config.relay_urls,
         config.relay_only,
-        Some(secret),
+        None,
         config.dns_server.as_deref(),
-        &alpn,
+        ALPN,
         Some(&config.transport),
     )
     .await?;
 
     let endpoint_id = endpoint.id();
     config.status.set_endpoint_id(endpoint_id.to_string());
-    config.status.set_dial_hint(format!(
-        "duopipe peer --connect dial --peer-node-id {}",
-        endpoint_id
-    ));
+    config.status.set_auth_token(config.auth_token.clone());
+    if config.announce_endpoint {
+        // Non-interactive mode: surface both on stderr for a test harness.
+        eprintln!("node_id: {endpoint_id}");
+        eprintln!("auth_token: {}", config.auth_token);
+    }
     log::info!("EndpointId: {}", endpoint_id);
     log::info!(
-        "Dial this peer with: duopipe peer --connect dial --peer-node-id {}",
+        "Connect to this instance with node id {} and the auth token shown above.",
         endpoint_id
     );
     log::info!("Waiting for peers to connect...");
@@ -227,14 +219,10 @@ async fn run_listen(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
 // Dial role
 // ============================================================================
 
-async fn run_dial(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
-    let peer_id_str = config
+async fn run_dial(config: PeerConfig) -> Result<()> {
+    let peer_id: EndpointId = config
         .peer_node_id
-        .clone()
         .context("dial role requires peer_node_id")?;
-    let peer_id: EndpointId = peer_id_str
-        .parse()
-        .context("Invalid EndpointId format. Should be a 52-character base32 string.")?;
 
     log::info!("Symmetric Peer - Dial Mode");
     log::info!("==========================");
@@ -243,7 +231,7 @@ async fn run_dial(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
         &config.relay_urls,
         config.relay_only,
         config.dns_server.as_deref(),
-        config.secret.as_ref(),
+        None,
         Some(&config.transport),
     )
     .await?;
@@ -263,7 +251,7 @@ async fn run_dial(config: PeerConfig, alpn: Vec<u8>) -> Result<()> {
                 peer_id,
                 &config.relay_urls,
                 config.relay_only,
-                &alpn,
+                ALPN,
             ) => connect,
         };
 
@@ -318,15 +306,13 @@ async fn handle_connection(
 
     // Phase 1: authenticate.
     if is_dialer {
-        let token = config
-            .auth_token
-            .as_deref()
-            .context("dial role requires an auth token")?;
         config.status.set_conn_status(ConnStatus::Authenticating);
-        auth_as_dialer(&conn, token).await?;
+        auth_as_dialer(&conn, &config.auth_token).await?;
         config.status.set_conn_status(ConnStatus::Connected);
     } else {
-        auth_as_listener(&conn, &config.auth_tokens).await?;
+        let accepted: HashSet<String> =
+            std::iter::once(config.auth_token.clone()).collect();
+        auth_as_listener(&conn, &accepted).await?;
         config.status.add_peer(remote_id.to_string());
         log::info!("Peer {} authenticated successfully", remote_id);
     }

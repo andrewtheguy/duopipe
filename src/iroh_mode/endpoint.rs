@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use crate::error::TunnelError;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures::StreamExt;
 use iroh::{
     address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
@@ -16,7 +15,6 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use noq_proto::congestion::{Bbr3Config, CubicConfig, NewRenoConfig};
 use log::{info, warn};
 use tokio::task::JoinHandle;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use crate::app_state::{AppState, PathInfo, PathKind, Role};
@@ -27,14 +25,11 @@ use url::Url;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build the ALPN protocol identifier with an embedded pre-shared token.
+/// Fixed ALPN protocol identifier for duopipe connections.
 ///
-/// The ALPN acts as a lightweight "port knock" — connections from clients that
-/// don't know the token fail at the QUIC handshake level before any application
-/// streams are opened.
-pub fn build_multi_alpn(alpn_token: &str) -> Vec<u8> {
-    format!("mf/2/{}", alpn_token).into_bytes()
-}
+/// Both peers advertise this; a mismatch fails at the QUIC handshake. Access
+/// control is handled by the shared `auth_token`, not the ALPN.
+pub const ALPN: &[u8] = b"mf/2";
 
 /// QUIC keep-alive interval for tunnel connections.
 ///
@@ -72,34 +67,6 @@ fn create_congestion_controller_factory(
         CongestionController::Bbr => Arc::new(Bbr3Config::default()),
         CongestionController::NewReno => Arc::new(NewRenoConfig::default()),
     }
-}
-
-/// Load secret key from file (base64 encoded).
-pub fn load_secret(path: &Path) -> Result<SecretKey> {
-    if !path.exists() {
-        anyhow::bail!(
-            "Secret key file not found: {}\nGenerate one with: duopipe generate-key --output {}",
-            path.display(),
-            path.display()
-        );
-    }
-
-    let content = std::fs::read_to_string(path).context("Failed to read secret key file")?;
-    load_secret_from_string(content.trim())
-}
-
-/// Load secret key from a base64-encoded string.
-pub fn load_secret_from_string(base64_key: &str) -> Result<SecretKey> {
-    let bytes = BASE64
-        .decode(base64_key)
-        .context("Invalid base64 in secret key")?;
-
-    SecretKey::try_from(&bytes[..]).context("Invalid secret key (must be 32 bytes)")
-}
-
-/// Get public key (EndpointId) from secret key.
-pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
-    secret.public()
 }
 
 /// Parse relay URL strings into a RelayMode.

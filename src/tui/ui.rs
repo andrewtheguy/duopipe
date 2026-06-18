@@ -59,10 +59,18 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
             Span::raw("   path: "),
             Span::raw(snap.path.describe()),
         ]));
-    } else if let Some(hint) = &snap.dial_hint {
+    } else {
+        // Listen role: surface the ephemeral node id + token the dialer needs.
+        // Both change each run, so show the token plainly for copying.
+        let token = snap.auth_token.as_deref().unwrap_or("(pending)");
         lines.push(Line::from(vec![
-            Span::raw("dial with: "),
-            Span::styled(hint.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw("token: "),
+            Span::styled(
+                token.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
 
