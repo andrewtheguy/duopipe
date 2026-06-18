@@ -927,6 +927,7 @@ has its own internal reconnect loop; the process only exits on fatal errors.
 | 1 | General error | Unexpected/uncategorized failures |
 | 2 | Configuration | Missing/invalid node id, invalid token format, bad request address or `allowed_sources` CIDR |
 | 3 | Authentication | Token rejected by peer, auth response timeout |
+| 4 | Rejected | A different node id tried to bind a session already bound to another peer (`WRONG_PEER_CODE`). Fatal — the dialer stops rather than retrying, since its node id can't match until the listener unbinds or restarts |
 | 10 | Connection failed | Relay timeout, endpoint offline, peer unreachable |
 | 11 | Connection lost | QUIC connection closed after tunnel was established |
 
