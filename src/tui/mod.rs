@@ -17,7 +17,7 @@ use futures::StreamExt;
 use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 
-use crate::app_state::{AppState, Role};
+use crate::app_state::{AppSnapshot, AppState, Role};
 use crate::config::{LocalForward, RemoteForward, TransportTuning};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
@@ -209,7 +209,78 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         }
         KeyCode::Char('g') => ui.log_scroll = total,
         KeyCode::Char('G') => ui.log_scroll = 0,
+        KeyCode::Char('d') => match dump_connection_info(&state.snapshot()) {
+            Ok(path) => log::info!("Wrote connection info (no auth token) to {path}"),
+            Err(e) => log::warn!("Failed to write connection info: {e}"),
+        },
         _ => {}
     }
     false
+}
+
+/// Write the current connection info to a timestamped file in the system temp
+/// directory (`/tmp` on Linux) and return its path. The auth token is
+/// deliberately excluded so the dump is safe to share. Used by the `d` shortcut.
+fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
+    use std::fmt::Write as _;
+
+    let now = jiff::Zoned::now();
+    let path =
+        std::env::temp_dir().join(format!("duopipe-conn-{}.txt", now.strftime("%Y%m%d-%H%M%S")));
+
+    let mut out = String::new();
+    let _ = writeln!(out, "duopipe connection info");
+    let _ = writeln!(out, "generated: {}", now.strftime("%Y-%m-%d %H:%M:%S"));
+    let _ = writeln!(out, "host:      {}", snap.hostname);
+    let _ = writeln!(out, "role:      {}", snap.role.label());
+    let _ = writeln!(
+        out,
+        "node id:   {}",
+        snap.endpoint_id.as_deref().unwrap_or("(pending)")
+    );
+    if snap.role == Role::Dial {
+        let _ = writeln!(out, "status:    {}", snap.conn_status.label());
+        let _ = writeln!(out, "path:      {}", snap.path.describe());
+    }
+    let _ = writeln!(
+        out,
+        "sessions:  {}/{}",
+        snap.sessions_used, snap.sessions_max
+    );
+
+    let _ = writeln!(out, "\nTunnels:");
+    if snap.tunnels.is_empty() {
+        let _ = writeln!(out, "  (none configured)");
+    } else {
+        for t in &snap.tunnels {
+            let _ = writeln!(
+                out,
+                "  {:<2} {:<40} {:<10} {}",
+                t.dir.label(),
+                t.spec,
+                t.status.label(),
+                t.detail
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\nConnected peers:");
+    if snap.peers.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    } else {
+        for p in &snap.peers {
+            let _ = writeln!(
+                out,
+                "  {}  up {}s  {}",
+                p.remote_id,
+                p.connected_since.elapsed().as_secs(),
+                p.path.describe()
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\n(auth token intentionally omitted)");
+
+    std::fs::write(&path, out)?;
+    Ok(path.display().to_string())
 }

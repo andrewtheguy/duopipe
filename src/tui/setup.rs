@@ -228,8 +228,14 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     }
 
     lines.push(Line::raw(""));
+    // `q` quits only at the y/n prompt; in the text fields it's literal input,
+    // so don't advertise it there.
+    let footer = match state.phase {
+        SetupPhase::ConnectExisting => "Ctrl-C / q quit",
+        SetupPhase::NodeId | SetupPhase::AuthToken => "Esc back · Ctrl-C quit",
+    };
     lines.push(Line::from(Span::styled(
-        "Esc back · Ctrl-C / q quit",
+        footer,
         Style::default().fg(Color::DarkGray),
     )));
 

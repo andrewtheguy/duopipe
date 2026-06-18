@@ -240,7 +240,7 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
     let lines: Vec<Line> = logs[start..end].iter().map(log_line).collect();
 
     let title = if scroll == 0 {
-        format!(" Logs ({total})  [q quit · ↑/↓ scroll · g/G top/bottom] ")
+        format!(" Logs ({total})  [q quit · ↑/↓ scroll · g/G top/bottom · d dump info] ")
     } else {
         format!(" Logs ({total})  [scrolled +{scroll}] ")
     };
