@@ -27,5 +27,4 @@ Tunnel model: a peer always *requests* tunnels from the other party. Each
 `[[request]]` binds a local `local_listen` address and asks the peer to connect out
 to a `remote_source`. The serving side gates incoming requests with `[allowed_sources]`
 CIDR lists (`tcp`/`udp`); an empty/absent `tcp` list defaults to dual-stack localhost
-(`127.0.0.0/8`, `::1/128`), while an empty/absent `udp` list rejects everything
-(fail-closed).
+(`127.0.0.0/8`, `::1/128`), and an empty/absent `udp` list uses the same default.

@@ -8,11 +8,10 @@
 //! `source` on the peer to connect out to and a local `listen` address where
 //! the traffic is delivered. Requests are activated interactively (nothing
 //! starts automatically). When the peer requests one of *our* sources, the
-//! `[allowed_sources]` CIDR lists gate what we are willing to expose. An empty or
-//! absent TCP list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); an
-//! empty or absent UDP list rejects everything (fail-closed). `validate()` checks
-//! address and CIDR formats at parse time. The single `auth_token` is the shared
-//! secret used by both sides.
+//! `[allowed_sources]` CIDR lists gate what we are willing to expose. Empty or
+//! absent protocol lists default to dual-stack localhost (`127.0.0.0/8`,
+//! `::1/128`). `validate()` checks address and CIDR formats at parse time. The
+//! single `auth_token` is the shared secret used by both sides.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -32,8 +31,8 @@ pub struct PeerConfig {
     #[serde(default)]
     pub request: Vec<RequestEntry>,
     /// Source networks (CIDR) this peer is willing to expose when the other party
-    /// requests one of *our* sources. Runtime defaulting fills an empty TCP list
-    /// with dual-stack localhost; an empty UDP list rejects all UDP.
+    /// requests one of *our* sources. Runtime defaulting fills empty protocol
+    /// lists with dual-stack localhost.
     #[serde(default)]
     pub allowed_sources: AllowedSources,
     pub relay_urls: Option<Vec<String>>,
@@ -133,9 +132,8 @@ pub struct RequestEntry {
 }
 
 /// Source networks (CIDR) we will expose when the peer requests one of our
-/// sources. Separate lists for TCP and UDP. An empty TCP list defaults to
-/// dual-stack localhost (see [`AllowedSources::with_localhost_tcp_default`]); an
-/// empty UDP list ⇒ reject all UDP (fail-closed).
+/// sources. Separate lists for TCP and UDP. Empty protocol lists default to
+/// dual-stack localhost (see [`AllowedSources::with_localhost_defaults`]).
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AllowedSources {
@@ -147,8 +145,8 @@ pub struct AllowedSources {
     pub udp: Vec<String>,
 }
 
-/// Dual-stack localhost networks used to default an empty TCP allowlist.
-pub const DEFAULT_LOCALHOST_TCP: [&str; 2] = ["127.0.0.0/8", "::1/128"];
+/// Dual-stack localhost networks used to default empty allowlists.
+pub const DEFAULT_LOCALHOST_SOURCES: [&str; 2] = ["127.0.0.0/8", "::1/128"];
 
 impl AllowedSources {
     /// True when no networks are configured for either protocol.
@@ -156,12 +154,18 @@ impl AllowedSources {
         self.tcp.is_empty() && self.udp.is_empty()
     }
 
-    /// Fill an empty TCP allowlist with dual-stack localhost. An empty TCP list
-    /// otherwise rejects everything (fail-closed), which is useless for the common
-    /// loopback-tunnel case. UDP is left untouched (empty UDP still rejects all).
-    pub fn with_localhost_tcp_default(mut self) -> Self {
+    /// Fill empty protocol allowlists with dual-stack localhost. Empty lists
+    /// otherwise reject everything, which is surprising for the common
+    /// loopback-tunnel case.
+    pub fn with_localhost_defaults(mut self) -> Self {
         if self.tcp.is_empty() {
-            self.tcp = DEFAULT_LOCALHOST_TCP
+            self.tcp = DEFAULT_LOCALHOST_SOURCES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+        if self.udp.is_empty() {
+            self.udp = DEFAULT_LOCALHOST_SOURCES
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -605,34 +609,41 @@ tcp = ["not-a-cidr"]
     }
 
     #[test]
-    fn with_localhost_tcp_default_fills_empty_tcp_only() {
-        // Empty TCP -> dual-stack localhost; UDP untouched.
-        let filled = AllowedSources::default().with_localhost_tcp_default();
+    fn with_localhost_defaults_fills_empty_protocol_lists() {
+        // Empty lists -> dual-stack localhost for both protocols.
+        let filled = AllowedSources::default().with_localhost_defaults();
         assert_eq!(
             filled.tcp,
             vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
         );
-        assert!(filled.udp.is_empty());
+        assert_eq!(
+            filled.udp,
+            vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
+        );
 
         // Empty TCP but explicit UDP -> TCP defaulted, UDP preserved.
-        let with_udp = AllowedSources {
+        let with_explicit_udp = AllowedSources {
             tcp: vec![],
             udp: vec!["10.0.0.0/8".to_string()],
         }
-        .with_localhost_tcp_default();
+        .with_localhost_defaults();
         assert_eq!(
-            with_udp.tcp,
+            with_explicit_udp.tcp,
             vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
         );
-        assert_eq!(with_udp.udp, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(with_explicit_udp.udp, vec!["10.0.0.0/8".to_string()]);
 
-        // Non-empty TCP -> left verbatim (no localhost added).
+        // Non-empty TCP and empty UDP -> TCP preserved, UDP defaulted.
         let explicit = AllowedSources {
             tcp: vec!["192.168.0.0/16".to_string()],
             udp: vec![],
         }
-        .with_localhost_tcp_default();
+        .with_localhost_defaults();
         assert_eq!(explicit.tcp, vec!["192.168.0.0/16".to_string()]);
+        assert_eq!(
+            explicit.udp,
+            vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
+        );
     }
 
     #[test]

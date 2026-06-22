@@ -7,17 +7,19 @@ use anyhow::{Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use std::future::poll_fn;
 use std::io::{self, IoSlice};
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::buffer::uninitialized_vec;
 use crate::net::{
-    STREAM_OPEN_BASE_DELAY_MS, STREAM_OPEN_MAX_ATTEMPTS, order_udp_addresses, retry_with_backoff,
-    tune_tcp_stream,
+    STREAM_OPEN_BASE_DELAY_MS, STREAM_OPEN_MAX_ATTEMPTS, connect_udp_to_target,
+    order_udp_addresses, retry_with_backoff, tune_tcp_stream,
 };
 
 /// Read exactly enough bytes to fill `read_buf` to its capacity from a QUIC
@@ -241,8 +243,7 @@ pub(super) async fn forward_udp_to_stream(
 /// - Aggregates errors if all addresses fail
 pub(super) async fn forward_stream_to_udp_server(
     mut recv_stream: iroh::endpoint::RecvStream,
-    mut send_stream: iroh::endpoint::SendStream,
-    udp_socket: Arc<UdpSocket>,
+    send_stream: iroh::endpoint::SendStream,
     target_addrs: Arc<Vec<SocketAddr>>,
 ) -> Result<()> {
     if target_addrs.is_empty() {
@@ -251,62 +252,47 @@ pub(super) async fn forward_stream_to_udp_server(
 
     // Order addresses for connection attempts
     let ordered_addrs = order_udp_addresses(&target_addrs);
+    let (response_tx, response_rx) = mpsc::channel::<Bytes>(32);
+    let writer_task = tokio::spawn(write_udp_responses_to_stream(send_stream, response_rx));
 
-    let udp_clone = udp_socket.clone();
-    let response_task = tokio::spawn(async move {
-        let mut storage = uninitialized_vec(65535);
-        loop {
-            let mut read_buf = ReadBuf::uninit(&mut storage);
-            if poll_fn(|cx| udp_clone.poll_recv_from(cx, &mut read_buf))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            let data = read_buf.filled();
-            let len = data.len();
-            let frame_len = (len as u16).to_be_bytes();
-            if send_stream.write_all(&frame_len).await.is_err() {
-                break;
-            }
-            if send_stream.write_all(data).await.is_err() {
-                break;
-            }
-            log::debug!("-> Sent {} bytes back to client", len);
-        }
-    });
-
+    let mut active_session: Option<UdpTargetSession> = None;
     let mut active_addr_idx = 0;
     let mut logged_active = false;
     let mut storage = uninitialized_vec(u16::MAX as usize);
 
-    loop {
-        // Track errors for each address for aggregate reporting - fresh for each packet
-        let mut errors: Vec<(SocketAddr, std::io::Error)> = Vec::new();
-        let mut len_buf = [0u8; 2];
-        match recv_stream.read_exact(&mut len_buf).await {
-            Ok(()) => {}
-            Err(iroh::endpoint::ReadExactError::FinishedEarly(_)) => {
-                // Clean EOF - stream finished at frame boundary
-                break;
-            }
-            Err(e) => {
-                log::warn!("Failed to read frame length: {}", e);
-                break;
-            }
-        }
-        let len = u16::from_be_bytes(len_buf) as usize;
-
-        let mut read_buf = ReadBuf::uninit(&mut storage[..len]);
-        read_exact_uninit(&mut recv_stream, &mut read_buf).await?;
-        let payload = read_buf.filled();
+    while let Some(payload) = read_next_udp_frame(&mut recv_stream, &mut storage).await? {
+        let len = payload.len();
 
         // Try to send to current address, falling back on error
         let mut sent = false;
+        let mut errors: Vec<(SocketAddr, String)> = Vec::new();
         while active_addr_idx < ordered_addrs.len() {
             let target_addr = ordered_addrs[active_addr_idx];
+            if active_session
+                .as_ref()
+                .is_none_or(|session| session.addr != target_addr)
+            {
+                active_session = match UdpTargetSession::connect(
+                    target_addr,
+                    response_tx.clone(),
+                )
+                .await
+                {
+                    Ok(session) => Some(session),
+                    Err(e) => {
+                        log::warn!("UDP connect to {} failed: {}", target_addr, e);
+                        errors.push((target_addr, e.to_string()));
+                        active_addr_idx += 1;
+                        logged_active = false;
+                        continue;
+                    }
+                };
+            }
 
-            match udp_socket.send_to(payload, target_addr).await {
+            let session = active_session
+                .as_ref()
+                .expect("active UDP target session should exist");
+            match session.socket.send(&payload).await {
                 Ok(_) => {
                     if !logged_active {
                         if active_addr_idx > 0 {
@@ -324,7 +310,8 @@ pub(super) async fn forward_stream_to_udp_server(
                 }
                 Err(e) => {
                     log::warn!("UDP send to {} failed: {}", target_addr, e);
-                    errors.push((target_addr, e));
+                    errors.push((target_addr, e.to_string()));
+                    active_session = None;
                     active_addr_idx += 1;
                     logged_active = false;
                 }
@@ -355,7 +342,107 @@ pub(super) async fn forward_stream_to_udp_server(
         }
     }
 
-    response_task.abort();
+    drop(active_session);
+    drop(response_tx);
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("UDP response writer error: {}", e),
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => log::warn!("UDP response writer task failed: {}", e),
+    }
+    Ok(())
+}
+
+struct UdpTargetSession {
+    addr: SocketAddr,
+    socket: Arc<UdpSocket>,
+    response_task: JoinHandle<()>,
+}
+
+impl UdpTargetSession {
+    async fn connect(addr: SocketAddr, response_tx: mpsc::Sender<Bytes>) -> Result<Self> {
+        let socket = Arc::new(connect_udp_to_target(addr).await?);
+        let response_task = spawn_udp_response_task(socket.clone(), addr, response_tx);
+        Ok(Self {
+            addr,
+            socket,
+            response_task,
+        })
+    }
+}
+
+impl Drop for UdpTargetSession {
+    fn drop(&mut self) {
+        self.response_task.abort();
+    }
+}
+
+async fn read_next_udp_frame(
+    recv_stream: &mut iroh::endpoint::RecvStream,
+    storage: &mut [MaybeUninit<u8>],
+) -> Result<Option<Bytes>> {
+    let mut len_buf = [0u8; 2];
+    match recv_stream.read_exact(&mut len_buf).await {
+        Ok(()) => {}
+        Err(iroh::endpoint::ReadExactError::FinishedEarly(_)) => {
+            // Clean EOF - stream finished at frame boundary
+            return Ok(None);
+        }
+        Err(e) => {
+            log::warn!("Failed to read frame length: {}", e);
+            return Ok(None);
+        }
+    }
+    let len = u16::from_be_bytes(len_buf) as usize;
+
+    let mut read_buf = ReadBuf::uninit(&mut storage[..len]);
+    read_exact_uninit(recv_stream, &mut read_buf).await?;
+    Ok(Some(Bytes::copy_from_slice(read_buf.filled())))
+}
+
+fn spawn_udp_response_task(
+    socket: Arc<UdpSocket>,
+    target_addr: SocketAddr,
+    response_tx: mpsc::Sender<Bytes>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut storage = uninitialized_vec(65535);
+        loop {
+            let mut read_buf = ReadBuf::uninit(&mut storage);
+            if let Err(e) = poll_fn(|cx| socket.poll_recv(cx, &mut read_buf)).await {
+                log::warn!("UDP receive from {} failed: {}", target_addr, e);
+                break;
+            }
+            let data = read_buf.filled();
+            if response_tx
+                .send(Bytes::copy_from_slice(data))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            log::debug!("-> Sent {} bytes back to client from {}", data.len(), target_addr);
+        }
+    })
+}
+
+async fn write_udp_responses_to_stream(
+    mut send_stream: iroh::endpoint::SendStream,
+    mut response_rx: mpsc::Receiver<Bytes>,
+) -> Result<()> {
+    while let Some(data) = response_rx.recv().await {
+        let frame_len = (data.len() as u16).to_be_bytes();
+        send_stream
+            .write_all(&frame_len)
+            .await
+            .context("Failed to write UDP response frame length")?;
+        send_stream
+            .write_all(&data)
+            .await
+            .context("Failed to write UDP response frame payload")?;
+        log::debug!("-> Sent {} bytes back to client", data.len());
+    }
+
     Ok(())
 }
 

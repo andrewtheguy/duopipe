@@ -16,10 +16,9 @@
 #
 # Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
-# (separate CIDR lists per protocol). Empty/absent TCP defaults to dual-stack
-# localhost; empty/absent UDP rejects every incoming UDP request. The iroh
-# identity key is ephemeral (regenerated every run), so a listening instance's
-# node id changes between runs.
+# (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
+# dual-stack localhost. The iroh identity key is ephemeral (regenerated every
+# run), so a listening instance's node id changes between runs.
 
 # The shared auth token, presented by both sides. Optional: a fresh listening
 # instance generates one if absent (shown in the TUI). Generate with:
@@ -64,8 +63,7 @@ local_listen = "127.0.0.1:15679"
 # ============================================================================
 # Allowed source networks the peer may request of US (CIDR notation).
 # Separate lists for TCP and UDP. Supports IPv4 and IPv6.
-# An empty/omitted `tcp` list defaults to dual-stack localhost (127.0.0.0/8, ::1/128).
-# An empty/omitted `udp` list is fail-closed: every incoming UDP request is rejected.
+# Empty/omitted lists default to dual-stack localhost (127.0.0.0/8, ::1/128).
 # ============================================================================
 [allowed_sources]
 tcp = [
