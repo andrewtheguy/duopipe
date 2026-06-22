@@ -1,6 +1,6 @@
 [package]
 name = "duopipe"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 description = "TCP/UDP port forwarding through iroh P2P connections"
 
