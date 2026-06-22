@@ -40,7 +40,7 @@ duopipe runs as a single symmetric command: `duopipe start`, which launches an i
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
-- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to the other side.
+- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to the other side. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
 - Answer **Yes** → this peer **dials**. The TUI prompts for the existing instance's node id, and for the auth token if one isn't already in config or the environment. Both are validated (node id parse, auth-token CRC16) before connecting.
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
@@ -172,7 +172,7 @@ Generate auth tokens with: `duopipe generate-auth-token`
 
 ### Token Management
 
-When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. You can also mint tokens ahead of time:
+When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id for 10 minutes, or until you press `h` to hide it. You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token
@@ -238,7 +238,7 @@ On the first machine, point at a config that declares the requests (see [Configu
 duopipe start -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step.
+When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step. The token hides automatically after 10 minutes, or immediately when you press `h`.
 
 > **Important:** The node id is regenerated on every run (the identity is ephemeral), so re-copy it each time you start the listener.
 

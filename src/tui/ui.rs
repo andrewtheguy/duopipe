@@ -1,5 +1,7 @@
 //! Rendering for the duopipe TUI. Pure functions over an [`AppSnapshot`].
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -20,9 +22,13 @@ pub struct UiState {
     pub selected: usize,
     /// When `Some`, the "add request" modal is open and captures all keystrokes.
     pub add_form: Option<AddRequestForm>,
-    /// Set once the user presses `h`, or once a peer has connected: hides the
-    /// generated-token banner in the header for the rest of the session.
+    /// Set once the user presses `h`, once a peer has connected, or once the
+    /// auto-hide timeout expires: hides the generated-token banner for the rest
+    /// of the session.
     pub token_banner_hidden: bool,
+    /// Deadline for auto-hiding a freshly generated auth token. Set by the
+    /// dashboard loop, not by rendering.
+    pub token_banner_auto_hide_at: Option<Instant>,
     /// First Esc of a double-Esc quit has been seen; the next Esc quits. Cleared
     /// by any other key. Drives the "press Esc again" hint.
     pub quit_armed: bool,
@@ -158,7 +164,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  (generated — press h to hide)",
+                "  (hides after 10m, h to hide now)",
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
