@@ -186,7 +186,8 @@ async fn run_setup(
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
 ///
 /// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
-/// stop the selected tunnel; `a` opens the add-request modal; `h` hides the
+/// stop the selected tunnel; `a` opens the add-request modal; `x`/`Del` removes the
+/// selected tunnel from the session (config is untouched); `h` hides the
 /// generated-token banner; `u` (listen role) unbinds the session so a new peer may
 /// connect. Logs scroll with `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits
 /// (or `Ctrl-C`).
@@ -238,8 +239,16 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
             }
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if ui.selected < tunnels {
-                state.toggle_tunnel(ui.selected);
+            if let Some(id) = state.tunnel_id_at(ui.selected) {
+                state.toggle_tunnel(id);
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Delete => {
+            if let Some(id) = state.tunnel_id_at(ui.selected) {
+                state.delete_request(id);
+                // The row is gone; keep the cursor on a valid row (clamp to the last
+                // remaining one, or 0 when the list is now empty).
+                ui.selected = ui.selected.min(state.tunnel_count().saturating_sub(1));
             }
         }
         KeyCode::Char(']') => {
@@ -342,9 +351,10 @@ fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     };
     match validate_request_specs(std::slice::from_ref(&req)) {
         Ok(()) => {
-            let idx = state.add_request(req);
-            state.send_command(TunnelCommand::Start(idx));
-            ui.selected = idx;
+            let id = state.add_request(req);
+            state.send_command(TunnelCommand::Start(id));
+            // The new row is appended last; point the cursor at it.
+            ui.selected = state.tunnel_count().saturating_sub(1);
             ui.add_form = None;
         }
         Err(e) => {
@@ -453,9 +463,10 @@ mod tests {
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
 
         assert!(ui.add_form.is_none(), "form closes on successful submit");
-        assert_eq!(st.request_count(), 1);
+        assert_eq!(st.tunnel_count(), 1);
         assert_eq!(ui.selected, 0);
-        let req = st.get_request(0).unwrap();
+        let id = st.tunnel_id_at(0).unwrap();
+        let req = st.get_request(id).unwrap();
         assert_eq!(req.name, "ssh");
         assert_eq!(req.remote_source, "tcp://127.0.0.1:22");
         assert_eq!(req.local_listen, "127.0.0.1:2222");
@@ -478,7 +489,8 @@ mod tests {
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
 
         assert!(ui.add_form.is_none());
-        let req = st.get_request(0).unwrap();
+        let id = st.tunnel_id_at(0).unwrap();
+        let req = st.get_request(id).unwrap();
         assert_eq!(req.remote_source, "udp://127.0.0.1:53");
     }
 
@@ -499,7 +511,41 @@ mod tests {
 
         let form = ui.add_form.as_ref().expect("form stays open on error");
         assert!(form.error.is_some());
-        assert_eq!(st.request_count(), 0, "no request added on invalid input");
+        assert_eq!(st.tunnel_count(), 0, "no request added on invalid input");
+    }
+
+    fn req(name: &str, src: &str, listen: &str) -> RequestEntry {
+        RequestEntry {
+            name: name.into(),
+            remote_source: src.into(),
+            local_listen: listen.into(),
+        }
+    }
+
+    #[test]
+    fn delete_key_removes_selected_tunnel_and_clamps_cursor() {
+        let st = state();
+        st.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        st.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        let mut ui = UiState {
+            selected: 1,
+            ..Default::default()
+        };
+
+        // `x` deletes the selected (last) tunnel and clamps the cursor onto the
+        // remaining row.
+        assert!(!handle_key(key(KeyCode::Char('x')), &mut ui, &st));
+        assert_eq!(st.tunnel_count(), 1);
+        assert_eq!(ui.selected, 0);
+        assert_eq!(st.tunnel_id_at(0).and_then(|id| st.get_request(id)).unwrap().name, "a");
+
+        // `Delete` removes the last remaining tunnel; cursor clamps to 0.
+        assert!(!handle_key(key(KeyCode::Delete), &mut ui, &st));
+        assert_eq!(st.tunnel_count(), 0);
+        assert_eq!(ui.selected, 0);
+        // Pressing delete on an empty list is a harmless no-op.
+        assert!(!handle_key(key(KeyCode::Char('x')), &mut ui, &st));
+        assert_eq!(st.tunnel_count(), 0);
     }
 
     #[test]
@@ -554,6 +600,6 @@ mod tests {
         type_str(&mut ui, &st, "x");
         handle_add_form(key(KeyCode::Esc), &mut ui, &st);
         assert!(ui.add_form.is_none());
-        assert_eq!(st.request_count(), 0);
+        assert_eq!(st.tunnel_count(), 0);
     }
 }

@@ -306,7 +306,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
     let table = Table::new(rows, widths).header(header).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Tunnels  [↑/↓ select · Enter start/stop · a add] "),
+            .title(" Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] "),
     );
     frame.render_widget(table, area);
 }

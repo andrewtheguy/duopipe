@@ -7,6 +7,7 @@
 //! live [`Semaphore`] so it can never drift from the real limiter.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::RwLock;
@@ -20,12 +21,25 @@ use crate::logging::LogBuffer;
 /// only bounds how far a lagging connection supervisor may fall behind).
 const TUNNEL_COMMAND_CAPACITY: usize = 64;
 
-/// A request to start or stop a configured tunnel, addressed by its index in the
-/// configured request list. Sent by the TUI, consumed by the connection supervisor.
+/// Stable identity for a tunnel request, allocated once when the request is added
+/// (config-seeded or runtime) and unchanged for the life of the session, including
+/// across reconnect reseeds. Identity is decoupled from the vec position so requests
+/// can be removed without disturbing the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TunnelId(u64);
+
+impl std::fmt::Display for TunnelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// A request to start or stop a configured tunnel, addressed by its stable
+/// [`TunnelId`]. Sent by the TUI, consumed by the connection supervisor.
 #[derive(Debug, Clone, Copy)]
 pub enum TunnelCommand {
-    Start(usize),
-    Stop(usize),
+    Start(TunnelId),
+    Stop(TunnelId),
 }
 
 /// Connection role for this peer.
@@ -132,10 +146,13 @@ impl TunnelStatus {
     }
 }
 
-/// A configured tunnel request and its current status. Rows are kept in config
-/// order, so a row's position is its request index (used to start/stop it).
+/// A configured tunnel request and its current status. Carries the request's stable
+/// [`TunnelId`]; rows are kept in display order, but the id (not the position) is the
+/// identity used to start/stop/delete it.
 #[derive(Clone)]
 pub struct TunnelRow {
+    /// Stable identity of the underlying request.
+    pub id: TunnelId,
     /// Display label from the request's `name`.
     pub name: String,
     /// Human-readable "LISTEN <- SOURCE" description.
@@ -145,12 +162,20 @@ pub struct TunnelRow {
     pub detail: String,
 }
 
+/// A configured tunnel request paired with its stable id. The authoritative spec
+/// list (`AppState::requests`) is seeded from config and appended to at runtime.
+struct Request {
+    id: TunnelId,
+    entry: RequestEntry,
+}
+
 /// Build the `Idle` tunnel row for a request (centralizes the spec format used by
 /// both seeding and runtime additions).
-fn tunnel_row_for(req: &RequestEntry) -> TunnelRow {
+fn tunnel_row_for(id: TunnelId, entry: &RequestEntry) -> TunnelRow {
     TunnelRow {
-        name: req.name.clone(),
-        spec: format!("{} <- {}", req.local_listen, req.remote_source),
+        id,
+        name: entry.name.clone(),
+        spec: format!("{} <- {}", entry.local_listen, entry.remote_source),
         status: TunnelStatus::Idle,
         detail: String::new(),
     }
@@ -212,10 +237,12 @@ pub struct AppState {
     /// flag is the concurrency guard that stops a second live connection from
     /// duplicating tunnel binds while one is already active.
     session: RwLock<SessionBinding>,
+    /// Monotonic allocator for [`TunnelId`]s. Never reused within a session.
+    next_id: AtomicU64,
     /// Authoritative tunnel-request list, seeded from config and appended to at
-    /// runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this, so a
-    /// row's position is its request index (used to start/stop it).
-    requests: RwLock<Vec<RequestEntry>>,
+    /// runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this (same
+    /// order), but identity is the [`TunnelId`], not the vec position.
+    requests: RwLock<Vec<Request>>,
     tunnels: RwLock<Vec<TunnelRow>>,
     /// Live stream limiter; `used = max - available_permits()`. Caps concurrent
     /// forwarded connections across all tunnels in the one session.
@@ -235,6 +262,17 @@ impl AppState {
         requests: Vec<RequestEntry>,
     ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
+        // Assign a stable id to each config-seeded request; runtime adds continue
+        // from the same counter via `alloc_id`.
+        let requests: Vec<Request> = requests
+            .into_iter()
+            .enumerate()
+            .map(|(i, entry)| Request {
+                id: TunnelId(i as u64),
+                entry,
+            })
+            .collect();
+        let next_id = AtomicU64::new(requests.len() as u64);
         Arc::new(Self {
             role,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -245,6 +283,7 @@ impl AppState {
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
             session: RwLock::new(SessionBinding::default()),
+            next_id,
             requests: RwLock::new(requests),
             tunnels: RwLock::new(Vec::new()),
             semaphore: RwLock::new(None),
@@ -266,17 +305,23 @@ impl AppState {
         let _ = self.tunnel_tx.send(cmd);
     }
 
-    /// Toggle the tunnel at `idx`: stop it if running, otherwise (re)start it.
-    pub fn toggle_tunnel(&self, idx: usize) {
+    /// Allocate a fresh, never-reused tunnel id.
+    fn alloc_id(&self) -> TunnelId {
+        TunnelId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Toggle the tunnel `id`: stop it if running, otherwise (re)start it.
+    pub fn toggle_tunnel(&self, id: TunnelId) {
         let running = self
             .tunnels
             .read()
-            .get(idx)
+            .iter()
+            .find(|t| t.id == id)
             .is_some_and(|t| t.status.is_running());
         let cmd = if running {
-            TunnelCommand::Stop(idx)
+            TunnelCommand::Stop(id)
         } else {
-            TunnelCommand::Start(idx)
+            TunnelCommand::Start(id)
         };
         self.send_command(cmd);
     }
@@ -361,38 +406,61 @@ impl AppState {
         self.peers.write().retain(|p| p.remote_id != remote_id);
     }
 
-    /// Rebuild the tunnel table from the current request list (all `Idle`). Called
-    /// once per (re)connection; runtime additions persist because they live in
-    /// `requests`.
+    /// Rebuild the tunnel table from the current request list (all `Idle`), carrying
+    /// each request's stable id. Called once per (re)connection; runtime additions
+    /// and deletions persist because they live in `requests`.
     pub fn seed_tunnels_from_requests(&self) {
-        let rows = self.requests.read().iter().map(tunnel_row_for).collect();
+        let rows = self
+            .requests
+            .read()
+            .iter()
+            .map(|r| tunnel_row_for(r.id, &r.entry))
+            .collect();
         *self.tunnels.write() = rows;
     }
 
-    /// The request at `idx`, cloned (used by the connection supervisor on `Start`).
-    pub fn get_request(&self, idx: usize) -> Option<RequestEntry> {
-        self.requests.read().get(idx).cloned()
+    /// The request with `id`, cloned (used by the connection supervisor on `Start`).
+    pub fn get_request(&self, id: TunnelId) -> Option<RequestEntry> {
+        self.requests
+            .read()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.entry.clone())
     }
 
-    /// Number of tunnel requests (config + runtime-added).
-    pub fn request_count(&self) -> usize {
-        self.requests.read().len()
+    /// Ids of all configured tunnel requests, in display order (used by the autostart
+    /// path to start each one).
+    pub fn request_ids(&self) -> Vec<TunnelId> {
+        self.requests.read().iter().map(|r| r.id).collect()
     }
 
     /// Append a new tunnel request at runtime and its matching `Idle` row. Returns
-    /// the new index. Appends only, so existing indices never shift.
-    pub fn add_request(&self, req: RequestEntry) -> usize {
-        let row = tunnel_row_for(&req);
+    /// its freshly allocated id.
+    pub fn add_request(&self, entry: RequestEntry) -> TunnelId {
+        let id = self.alloc_id();
+        let row = tunnel_row_for(id, &entry);
         // Hold both locks for the duration so `requests` and `tunnels` are never
-        // observed out of sync (e.g. request_count() vs tunnel_count()). Lock order
-        // is requests-then-tunnels, matching `seed_tunnels_from_requests`; no site
-        // takes them the other way, so this can't deadlock.
+        // observed out of sync. Lock order is requests-then-tunnels, matching
+        // `seed_tunnels_from_requests`; no site takes them the other way, so this
+        // can't deadlock.
         let mut requests = self.requests.write();
         let mut tunnels = self.tunnels.write();
-        let idx = requests.len();
-        requests.push(req);
+        requests.push(Request { id, entry });
         tunnels.push(row);
-        idx
+        id
+    }
+
+    /// Remove the tunnel `id` from the session (config is never touched). If it is
+    /// running, a `Stop` is broadcast first so the supervisor cancels its task and
+    /// frees the bound local port; the row is then dropped from both lists.
+    pub fn delete_request(&self, id: TunnelId) {
+        // Free the port if running. `Stop` for a non-running id is a harmless no-op in
+        // the supervisor, so we send unconditionally.
+        self.send_command(TunnelCommand::Stop(id));
+        let mut requests = self.requests.write();
+        let mut tunnels = self.tunnels.write();
+        requests.retain(|r| r.id != id);
+        tunnels.retain(|t| t.id != id);
     }
 
     /// Number of configured tunnel rows (used to clamp the TUI selection cursor).
@@ -400,10 +468,17 @@ impl AppState {
         self.tunnels.read().len()
     }
 
-    /// Update the status/detail of the tunnel at request index `idx`.
-    pub fn update_tunnel(&self, idx: usize, status: TunnelStatus, detail: impl Into<String>) {
+    /// The id of the tunnel at display position `pos`, if any. Resolves the TUI's
+    /// transient cursor position to a stable id at action time.
+    pub fn tunnel_id_at(&self, pos: usize) -> Option<TunnelId> {
+        self.tunnels.read().get(pos).map(|t| t.id)
+    }
+
+    /// Update the status/detail of the tunnel `id` (no-op if it has been deleted, so a
+    /// late update from a just-stopped task is harmless).
+    pub fn update_tunnel(&self, id: TunnelId, status: TunnelStatus, detail: impl Into<String>) {
         let mut tunnels = self.tunnels.write();
-        if let Some(row) = tunnels.get_mut(idx) {
+        if let Some(row) = tunnels.iter_mut().find(|t| t.id == id) {
             row.status = status;
             row.detail = detail.into();
         }
@@ -472,26 +547,52 @@ mod tests {
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed);
         // Rows mirror the requests only after seeding.
         state.seed_tunnels_from_requests();
-        assert_eq!(state.request_count(), 1);
+        assert_eq!(state.request_ids().len(), 1);
         assert_eq!(state.tunnel_count(), 1);
+        let db_id = state.tunnel_id_at(0).expect("seeded id");
 
-        let idx = state.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
-        assert_eq!(idx, 1, "append returns the new index");
-        assert_eq!(state.request_count(), 2);
+        let id = state.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
+        assert_ne!(id, db_id, "append allocates a fresh id");
+        assert_eq!(state.request_ids().len(), 2);
         assert_eq!(state.tunnel_count(), 2);
 
         // The request round-trips and the row is Idle with the right spec.
-        let got = state.get_request(idx).expect("request present");
+        let got = state.get_request(id).expect("request present");
         assert_eq!(got.remote_source, "tcp://127.0.0.1:22");
-        let row = &state.snapshot().tunnels[idx];
+        let row = state.snapshot().tunnels[1].clone();
+        assert_eq!(row.id, id);
         assert_eq!(row.name, "ssh");
         assert_eq!(row.spec, "127.0.0.1:2222 <- tcp://127.0.0.1:22");
         assert_eq!(row.status, TunnelStatus::Idle);
 
-        // A second append keeps incrementing without shifting existing indices.
-        let idx2 = state.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
-        assert_eq!(idx2, 2);
-        assert_eq!(state.get_request(0).unwrap().name, "db");
+        // A second append keeps allocating distinct ids.
+        let id2 = state.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
+        assert_ne!(id2, id);
+        assert_eq!(state.get_request(db_id).unwrap().name, "db");
+    }
+
+    #[test]
+    fn delete_request_drops_row_and_preserves_other_ids() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        let a = state.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        let b = state.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        let c = state.add_request(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
+        assert_eq!(state.tunnel_count(), 3);
+
+        // Delete the middle tunnel.
+        state.delete_request(b);
+        assert_eq!(state.tunnel_count(), 2);
+        assert!(state.get_request(b).is_none(), "deleted request is gone");
+
+        // The survivors keep their ids and shift up by one position.
+        assert_eq!(state.get_request(a).unwrap().name, "a");
+        assert_eq!(state.get_request(c).unwrap().name, "c");
+        assert_eq!(state.tunnel_id_at(0), Some(a));
+        assert_eq!(state.tunnel_id_at(1), Some(c));
+
+        // Deleting an unknown id is a no-op.
+        state.delete_request(b);
+        assert_eq!(state.tunnel_count(), 2);
     }
 
     #[test]
