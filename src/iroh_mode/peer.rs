@@ -27,7 +27,9 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::app_state::{AppState, ConnStatus, PeerAdmission, Role, TunnelCommand, TunnelStatus};
+use crate::app_state::{
+    AppState, ConnStatus, PeerAdmission, Role, TunnelCommand, TunnelId, TunnelStatus,
+};
 use crate::auth::is_token_valid;
 use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
@@ -401,8 +403,8 @@ async fn handle_connection(
 
     // Optionally autostart every configured request (non-interactive/test mode).
     if config.autostart_requests {
-        for i in 0..config.status.request_count() {
-            config.status.send_command(TunnelCommand::Start(i));
+        for id in config.status.request_ids() {
+            config.status.send_command(TunnelCommand::Start(id));
         }
     }
 
@@ -465,21 +467,21 @@ async fn request_supervisor(
     status: Arc<AppState>,
     mut command_rx: broadcast::Receiver<TunnelCommand>,
 ) {
-    let mut running: HashMap<usize, CancellationToken> = HashMap::new();
-    // Tasks report their own index here when they end on their own (error/EOF),
-    // so the supervisor can drop the stale token and allow a restart.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<usize>();
+    let mut running: HashMap<TunnelId, CancellationToken> = HashMap::new();
+    // Tasks report their own id here when they end on their own (error/EOF), so the
+    // supervisor can drop the stale token and allow a restart.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TunnelId>();
 
     loop {
         tokio::select! {
             cmd = command_rx.recv() => match cmd {
-                Ok(TunnelCommand::Start(idx)) => {
-                    if running.contains_key(&idx) {
+                Ok(TunnelCommand::Start(id)) => {
+                    if running.contains_key(&id) {
                         continue; // already running
                     }
-                    let Some(req) = status.get_request(idx) else { continue };
+                    let Some(req) = status.get_request(id) else { continue };
                     let token = CancellationToken::new();
-                    running.insert(idx, token.clone());
+                    running.insert(id, token.clone());
 
                     let conn = conn.clone();
                     let semaphore = semaphore.clone();
@@ -487,7 +489,7 @@ async fn request_supervisor(
                     let done_tx = done_tx.clone();
                     tokio::spawn(async move {
                         let outcome = tokio::select! {
-                            r = run_request(conn.clone(), req, semaphore, status.clone(), idx) => Some(r),
+                            r = run_request(conn.clone(), req, semaphore, status.clone(), id) => Some(r),
                             _ = token.cancelled() => None,
                             // Tie the listener's lifetime to the connection so it
                             // never outlives it (which would leak the bound port).
@@ -495,19 +497,19 @@ async fn request_supervisor(
                         };
                         match outcome {
                             Some(Err(e)) => {
-                                status.update_tunnel(idx, TunnelStatus::Error, e.to_string());
-                                log::warn!("Request {} ended: {}", idx, e);
+                                status.update_tunnel(id, TunnelStatus::Error, e.to_string());
+                                log::warn!("Request {} ended: {}", id, e);
                             }
                             // Stopped, connection closed, or the listen loop ended cleanly.
                             Some(Ok(())) | None => {
-                                status.update_tunnel(idx, TunnelStatus::Idle, String::new());
+                                status.update_tunnel(id, TunnelStatus::Idle, String::new());
                             }
                         }
-                        let _ = done_tx.send(idx);
+                        let _ = done_tx.send(id);
                     });
                 }
-                Ok(TunnelCommand::Stop(idx)) => {
-                    if let Some(token) = running.remove(&idx) {
+                Ok(TunnelCommand::Stop(id)) => {
+                    if let Some(token) = running.remove(&id) {
                         token.cancel();
                     }
                 }
@@ -516,8 +518,8 @@ async fn request_supervisor(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            Some(idx) = done_rx.recv() => {
-                running.remove(&idx);
+            Some(id) = done_rx.recv() => {
+                running.remove(&id);
             }
         }
     }
@@ -748,7 +750,7 @@ async fn run_request(
     req: RequestEntry,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
-    idx: usize,
+    id: TunnelId,
 ) -> Result<()> {
     let hello = StreamHello::local_forward(&req.remote_source);
     let listen_addrs = resolve_listen_addrs(&req.local_listen)
@@ -765,11 +767,11 @@ async fn run_request(
                 .with_context(|| format!("Failed to bind UDP listener on {}", listen_addr))?,
         );
         log::info!("Listening on UDP {} <- {}", listen_addr, req.remote_source);
-        status.update_tunnel(idx, TunnelStatus::Listening, listen_addr.to_string());
+        status.update_tunnel(id, TunnelStatus::Listening, listen_addr.to_string());
         udp_listen_side(&conn, hello, udp_socket).await
     } else {
         let listeners = bind_tcp_listeners(&listen_addrs, &req.remote_source).await?;
-        status.update_tunnel(idx, TunnelStatus::Listening, req.local_listen.clone());
+        status.update_tunnel(id, TunnelStatus::Listening, req.local_listen.clone());
         tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
     }
 }
