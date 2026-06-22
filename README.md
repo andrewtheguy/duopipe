@@ -40,7 +40,7 @@ duopipe runs as a single symmetric command: `duopipe start`, which launches an i
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
-- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to the other side.
+- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to the other side. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
 - Answer **Yes** → this peer **dials**. The TUI prompts for the existing instance's node id, and for the auth token if one isn't already in config or the environment. Both are validated (node id parse, auth-token CRC16) before connecting.
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
@@ -64,7 +64,7 @@ Every tunnel is a **request** (SSH `-L`–style, pull direction): a peer declare
 | `remote_source` | Origin on the **other** peer to connect out to (`tcp://host:port` or `udp://host:port`; the scheme selects the protocol). |
 | `local_listen` | Local address on **this** peer where the tunnel is exposed (`host:port`). |
 
-To expose one of **your** services, the **other** peer requests it from you — there is no separate "remote forward". The serving side gates every incoming request against its `[allowed_sources]` CIDR allowlist (separate `tcp` / `udp` lists). An empty or absent TCP list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); an empty or absent UDP list rejects every UDP request. Both TCP and UDP are supported and may be mixed on one connection. Nothing forwards until you start a request in the TUI.
+To expose one of **your** services, the **other** peer requests it from you — there is no separate "remote forward". The serving side gates every incoming request against its `[allowed_sources]` CIDR allowlist (separate `tcp` / `udp` lists). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Both TCP and UDP are supported and may be mixed on one connection. Nothing forwards until you start a request in the TUI.
 
 > **Note:** UDP requests use a single-peer-address reply model. This is fine for single-client UDP services.
 
@@ -168,11 +168,11 @@ The CRC16 checksum detects all single-byte errors in the token payload.
 Generate auth tokens with: `duopipe generate-auth-token`
 
 > [!IMPORTANT]
-> **Trust after auth, gated by the source allowlist.** Once the connection-level auth token passes, the peer may *request* tunnels, but when it asks us to connect out to one of our sources we only honor addresses inside our `[allowed_sources]` CIDR lists. Empty or absent TCP defaults to dual-stack localhost; empty or absent UDP rejects every UDP request. Requests are also activated interactively — nothing forwards until you start it. Only share the token with peers you trust, and keep `[allowed_sources]` as narrow as possible.
+> **Trust after auth, gated by the source allowlist.** Once the connection-level auth token passes, the peer may *request* tunnels, but when it asks us to connect out to one of our sources we only honor addresses inside our `[allowed_sources]` CIDR lists. Empty or absent TCP or UDP defaults to dual-stack localhost. Requests are also activated interactively — nothing forwards until you start it. Only share the token with peers you trust, and keep `[allowed_sources]` as narrow as possible.
 
 ### Token Management
 
-When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. You can also mint tokens ahead of time:
+When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id for 10 minutes, or until you press `h` to hide it. You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token
@@ -199,8 +199,7 @@ name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 
-# What the peer is allowed to request of us (TCP defaults to localhost if omitted;
-# UDP rejects all if omitted).
+# What the peer is allowed to request of us (defaults to localhost if omitted).
 [allowed_sources]
 tcp = ["127.0.0.0/8"]
 ```
@@ -239,7 +238,7 @@ On the first machine, point at a config that declares the requests (see [Configu
 duopipe start -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step.
+When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step. The token hides automatically after 10 minutes, or immediately when you press `h`.
 
 > **Important:** The node id is regenerated on every run (the identity is ephemeral), so re-copy it each time you start the listener.
 
@@ -401,8 +400,7 @@ name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 
-# Sources the peer may request of us (TCP defaults to localhost if omitted;
-# UDP rejects all if omitted).
+# Sources the peer may request of us (defaults to localhost if omitted).
 [allowed_sources]
 tcp = ["127.0.0.0/8"]
 ```
@@ -475,7 +473,7 @@ Output is a single-line `ageenc:` string ready to paste into TOML config values.
 - The node id is a public key that identifies the listening peer. Because the identity is ephemeral, it changes every run.
 - **Fixed ALPN:** The QUIC protocol identifier is a fixed constant (`mf/2`). It is not used for access control.
 - **Token Authentication:** The dialing peer authenticates immediately after the QUIC connection via a dedicated auth stream, presenting the shared auth token. An invalid token is rejected with an `AuthResponse` and the connection is closed with an error code. See [Architecture: Token Authentication](docs/ARCHITECTURE.md#token-authentication-iroh-mode).
-- **Source allowlist:** After auth the peer may *request* tunnels, but each requested source is checked against our `[allowed_sources]` CIDR lists before we connect out. Empty or absent TCP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); empty or absent UDP rejects every UDP request. Requests are also activated interactively — nothing forwards until started. Only share the token with peers you trust, and keep the allowlist narrow.
+- **Source allowlist:** After auth the peer may *request* tunnels, but each requested source is checked against our `[allowed_sources]` CIDR lists before we connect out. Empty or absent TCP or UDP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Requests are also activated interactively — nothing forwards until started. Only share the token with peers you trust, and keep the allowlist narrow.
 - Treat the auth token like a password
 
 ## Exit Codes
@@ -502,5 +500,5 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
 6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response
    - *If authentication fails, the connection is closed and the following steps do not occur*
-7. **Auth, then a source allowlist:** once authenticated, either side may *request* tunnels of the other; each requested source is checked against the serving peer's `[allowed_sources]` CIDR lists before it connects out. Empty or absent TCP defaults to dual-stack localhost; empty or absent UDP rejects every UDP request.
+7. **Auth, then a source allowlist:** once authenticated, either side may *request* tunnels of the other; each requested source is checked against the serving peer's `[allowed_sources]` CIDR lists before it connects out. Empty or absent TCP or UDP defaults to dual-stack localhost.
 8. Requested tunnels are negotiated over the single connection and traffic flows in both directions

@@ -1,7 +1,7 @@
 //! Shared networking utilities for duopipe.
 
 use anyhow::{Context, Result};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
@@ -270,11 +270,19 @@ pub fn tune_tcp_stream(stream: &TcpStream) {
 // UDP address ordering
 // ============================================================================
 
-/// Order UDP target addresses for connection attempts (Happy Eyeballs style).
-/// This is an alias for [`interleave_addresses`] for API compatibility.
+/// Order UDP target addresses for connection attempts.
+///
+/// UDP sends do not reliably tell us whether a service exists, so for loopback
+/// names like `localhost` we prefer IPv4 first for consistency with TCP and with
+/// common local-service bindings. Non-loopback addresses use Happy Eyeballs
+/// ordering.
 #[inline]
 pub fn order_udp_addresses(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-    interleave_addresses(addrs)
+    if addrs.iter().all(|addr| addr.ip().is_loopback()) {
+        order_by_loopback_preference(addrs.to_vec())
+    } else {
+        interleave_addresses(addrs)
+    }
 }
 
 // ============================================================================
@@ -400,21 +408,41 @@ where
 }
 
 // ============================================================================
-// UDP bind helper (kept for iroh compatibility)
+// UDP target socket helper
 // ============================================================================
 
-/// Bind a UDP socket for a set of target addresses, preferring dual-stack.
-pub async fn bind_udp_for_targets(target_addrs: &[SocketAddr]) -> Result<UdpSocket> {
-    // Prefer IPv6 wildcard if we have any IPv6 targets; it can accept IPv4 via v6-mapped.
-    let bind_addr = if target_addrs.iter().any(|addr| addr.is_ipv6()) {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
+fn udp_bind_addr_for_target(target_addr: SocketAddr) -> SocketAddr {
+    match target_addr {
+        SocketAddr::V4(addr) if addr.ip().is_loopback() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+        }
+        SocketAddr::V6(addr) if addr.ip().is_loopback() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
+        }
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
 
+/// Bind and connect a UDP socket to a specific target address.
+///
+/// Connected UDP sockets only receive datagrams from their connected peer. For
+/// loopback targets we also bind the local side to loopback instead of a wildcard
+/// address, so localhost tunnels do not create a publicly bound ephemeral socket.
+pub async fn connect_udp_to_target(target_addr: SocketAddr) -> Result<UdpSocket> {
+    let bind_addr = udp_bind_addr_for_target(target_addr);
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("Failed to bind UDP socket at {}", bind_addr))?;
+
+    socket
+        .connect(target_addr)
+        .await
+        .with_context(|| format!("Failed to connect UDP socket to {}", target_addr))?;
+
+    if let Ok(local_addr) = socket.local_addr() {
+        log::debug!("Connected UDP socket {} -> {}", local_addr, target_addr);
+    }
 
     Ok(socket)
 }
@@ -700,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_order_udp_addresses_is_alias() {
-        // Verify order_udp_addresses returns same result as interleave_addresses
+        // Non-loopback UDP addresses use Happy Eyeballs ordering.
         let addrs = vec![
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080),
             SocketAddr::new(
@@ -709,5 +737,91 @@ mod tests {
             ),
         ];
         assert_eq!(order_udp_addresses(&addrs), interleave_addresses(&addrs));
+    }
+
+    #[test]
+    fn test_order_udp_addresses_loopback_prefers_ipv4() {
+        let addrs = vec![
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+        ];
+
+        let result = order_udp_addresses(&addrs);
+        assert!(result[0].is_ipv4(), "IPv4 should be preferred for loopback");
+        assert!(result[1].is_ipv6(), "IPv6 should be second for loopback");
+    }
+
+    #[test]
+    fn udp_bind_addr_for_loopback_targets_is_loopback() {
+        let v4 = udp_bind_addr_for_target(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 42)),
+            53,
+        ));
+        assert_eq!(v4.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(v4.port(), 0);
+
+        let v6 = udp_bind_addr_for_target(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53));
+        assert_eq!(v6.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(v6.port(), 0);
+    }
+
+    #[test]
+    fn udp_bind_addr_for_non_loopback_targets_is_unspecified() {
+        let v4 =
+            udp_bind_addr_for_target(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53));
+        assert_eq!(v4.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(v4.port(), 0);
+
+        let v6 = udp_bind_addr_for_target(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            53,
+        ));
+        assert_eq!(v6.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(v6.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn connected_udp_target_binds_loopback_and_filters_other_senders() {
+        let target = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("target bind");
+        let target_addr = target.local_addr().expect("target local addr");
+
+        let client = connect_udp_to_target(target_addr)
+            .await
+            .expect("connected UDP client");
+        let client_addr = client.local_addr().expect("client local addr");
+        assert!(client_addr.ip().is_loopback());
+
+        let unrelated = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("unrelated bind");
+        unrelated
+            .send_to(b"wrong-source", client_addr)
+            .await
+            .expect("send unrelated datagram");
+
+        client.send(b"ping").await.expect("send target datagram");
+        let mut target_buf = [0u8; 16];
+        let (len, reply_addr) = target
+            .recv_from(&mut target_buf)
+            .await
+            .expect("target receive");
+        assert_eq!(&target_buf[..len], b"ping");
+
+        target
+            .send_to(b"pong", reply_addr)
+            .await
+            .expect("send target response");
+
+        let mut client_buf = [0u8; 16];
+        let len = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            client.recv(&mut client_buf),
+        )
+        .await
+        .expect("connected client should receive target response")
+        .expect("client receive");
+        assert_eq!(&client_buf[..len], b"pong");
     }
 }

@@ -36,7 +36,7 @@ The role is chosen **at startup**: the TUI asks "Connect to an existing instance
 Each peer declares **tunnel requests** in config (the connection role is chosen at startup, not here):
 
 - **`[[request]]`** (`name`, `remote_source`, `local_listen`): this peer binds a local listener at `local_listen`; each accepted connection asks the *other* peer to connect out to `remote_source`, then bridges the two. Requests are activated on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
-- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Empty or absent TCP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); empty or absent UDP rejects every UDP request.
+- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`).
 
 #### Non-interactive mode (testing)
 
@@ -264,7 +264,7 @@ graph TB
     A[accept_bi: new stream] --> B[Read StreamHello<br/>HELLO_TIMEOUT 10s]
     B --> C{LocalForward source}
 
-    C --> S{source in allowed_sources?<br/>TCP default localhost<br/>UDP fail-closed}
+    C --> S{source in allowed_sources?<br/>default localhost}
     S -->|no| R[Reply StreamAck rejected]
     S -->|yes| D[Acquire session permit]
     D --> E[Connect out to source<br/>tcp:// or udp://]
@@ -339,7 +339,7 @@ graph LR
 
 ### UDP Tunnel Data Flow
 
-UDP forwarding reuses `forward_stream_to_udp_server` / `forward_stream_to_udp_client` / `forward_udp_to_stream` (`iroh_mode/helpers.rs`) and works in both directions. Each UDP forward uses a single bidirectional stream; packets are length-prefixed (see [UDP Packet Framing](#udp-packet-framing)).
+UDP forwarding reuses `forward_stream_to_udp_server` / `forward_stream_to_udp_client` / `forward_udp_to_stream` (`iroh_mode/helpers.rs`) and works in both directions. Each UDP forward uses a single bidirectional stream; packets are length-prefixed (see [UDP Packet Framing](#udp-packet-framing)). On the connect side, UDP sockets are connected to the active target address so only datagrams from that target are returned over the stream; loopback targets also bind their local UDP socket to loopback.
 
 > **Note:** A UDP request inherits a single-peer-address reply limitation — the connect side tracks one external peer address per stream for return packets.
 
@@ -610,7 +610,7 @@ graph TB
 
 The binding persists even while no peer is connected. To admit a different node id, the operator either restarts the listener or presses `u` in the listen dashboard (`AppState::unbind_session`), which clears the binding so the next authenticated peer may bind.
 
-**Auth, then a source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the session binding admits the peer, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`); empty or absent UDP rejects every UDP request. Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
+**Auth, then a source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the session binding admits the peer, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 

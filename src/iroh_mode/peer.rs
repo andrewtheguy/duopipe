@@ -12,7 +12,7 @@
 //! it without positional assumptions. Trust model: once token auth passes, the
 //! peer is trusted, but the *acceptor* still gates each requested `source`
 //! against its `allowed_sources` CIDR allowlist before connecting. Empty TCP
-//! allowlists are defaulted to localhost at startup; empty UDP allowlists reject all.
+//! allowlists are defaulted to localhost at startup.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -34,8 +34,8 @@ use crate::auth::is_token_valid;
 use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::net::{
-    bind_udp_for_targets, check_source_allowed, extract_addr_from_source, resolve_all_target_addrs,
-    resolve_listen_addrs, try_connect_tcp, tune_tcp_stream,
+    check_source_allowed, extract_addr_from_source, resolve_all_target_addrs, resolve_listen_addrs,
+    try_connect_tcp, tune_tcp_stream,
 };
 
 use crate::iroh_mode::endpoint::{
@@ -95,7 +95,7 @@ pub struct PeerConfig {
     /// EndpointId of the peer to dial (required for `Dial`).
     pub peer_node_id: Option<EndpointId>,
     /// CIDR allowlist gating which of our sources the peer may request.
-    /// Empty TCP is defaulted to localhost in `run_peer`; empty UDP rejects all.
+    /// Empty protocol allowlists are defaulted to localhost in `run_peer`.
     pub allowed_sources: AllowedSources,
     /// When true, start every configured request as soon as a connection is up
     /// (set from `DUOPIPE_AUTOSTART_REQUESTS` in test mode; see `DUOPIPE_TEST_MODE`).
@@ -144,16 +144,9 @@ impl std::fmt::Debug for PeerConfig {
 pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
     validate_relay_only(config.relay_only, &config.relay_urls)?;
 
-    // An empty TCP allowlist defaults to dual-stack localhost (an empty list would
-    // otherwise reject everything, which is useless for the common loopback case).
-    config.allowed_sources = config.allowed_sources.with_localhost_tcp_default();
-
-    if config.allowed_sources.udp.is_empty() {
-        log::warn!(
-            "No UDP allowed_sources configured; all incoming UDP source requests from \
-             the peer will be rejected (fail-closed)."
-        );
-    }
+    // Empty allowlists default to dual-stack localhost; an empty list would
+    // otherwise reject the common loopback-tunnel case.
+    config.allowed_sources = config.allowed_sources.with_localhost_defaults();
 
     match config.role {
         Role::Listen => run_listen(config).await,
@@ -722,15 +715,10 @@ async fn connect_side(
         if target_addrs.is_empty() {
             anyhow::bail!("No target addresses resolved for '{}'", addr);
         }
-        let udp_socket = Arc::new(
-            bind_udp_for_targets(&target_addrs)
-                .await
-                .context("Failed to bind UDP socket")?,
-        );
         send.write_all(&encode_stream_ack(&StreamAck::accepted())?)
             .await?;
         log::info!("-> Forwarding UDP to {}", addr);
-        forward_stream_to_udp_server(recv, send, udp_socket, target_addrs).await?;
+        forward_stream_to_udp_server(recv, send, target_addrs).await?;
         log::info!("<- UDP forwarding to {} closed", addr);
     }
 

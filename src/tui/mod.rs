@@ -11,7 +11,7 @@ mod textinput;
 mod ui;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -30,6 +30,8 @@ use ui::{AddField, AddRequestForm, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
+/// How long to show a freshly generated auth token before hiding it automatically.
+const GENERATED_TOKEN_AUTO_HIDE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Everything the TUI needs to run setup and build the runtime `PeerConfig`.
 pub struct TuiLaunch {
@@ -90,8 +92,9 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                 // Once a peer has connected, the generated-token banner is no longer
                 // needed (the dialer already has it); hide it for the rest of the run.
                 if !snap.peers.is_empty() {
-                    ui_state.token_banner_hidden = true;
+                    hide_token_banner(&mut ui_state);
                 }
+                maybe_auto_hide_generated_token_banner(&mut ui_state, &snap, Instant::now());
                 let _ = terminal.draw(|f| {
                     ui::render(f, &snap, &logs, &ui_state);
                     if let Some(form) = &ui_state.add_form {
@@ -222,7 +225,7 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
             ui.add_form = Some(AddRequestForm::default());
         }
         KeyCode::Char('h') => {
-            ui.token_banner_hidden = true;
+            hide_token_banner(ui);
         }
         KeyCode::Char('u') if state.role == Role::Listen => {
             // Clear the sticky session binding so a different node id may bind next
@@ -272,6 +275,30 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         _ => {}
     }
     false
+}
+
+fn hide_token_banner(ui: &mut UiState) {
+    ui.token_banner_hidden = true;
+    ui.token_banner_auto_hide_at = None;
+}
+
+fn maybe_auto_hide_generated_token_banner(ui: &mut UiState, snap: &AppSnapshot, now: Instant) {
+    if ui.token_banner_hidden {
+        ui.token_banner_auto_hide_at = None;
+        return;
+    }
+
+    if snap.role != Role::Listen || !snap.token_generated {
+        ui.token_banner_auto_hide_at = None;
+        return;
+    }
+
+    let deadline = *ui
+        .token_banner_auto_hide_at
+        .get_or_insert(now + GENERATED_TOKEN_AUTO_HIDE_AFTER);
+    if now >= deadline {
+        hide_token_banner(ui);
+    }
 }
 
 /// Accept printable ASCII for the address fields (no spaces); `name` also allows
@@ -441,6 +468,10 @@ mod tests {
         AppState::new(Role::Dial, false, LogBuffer::new(16), Vec::new())
     }
 
+    fn listen_generated_state() -> Arc<AppState> {
+        AppState::new(Role::Listen, true, LogBuffer::new(16), Vec::new())
+    }
+
     fn type_str(ui: &mut UiState, st: &Arc<AppState>, s: &str) {
         for c in s.chars() {
             handle_add_form(key(KeyCode::Char(c)), ui, st);
@@ -570,6 +601,59 @@ mod tests {
         assert!(!ui.quit_armed);
         // So the next single Esc only re-arms rather than quitting.
         assert!(!handle_key(key(KeyCode::Esc), &mut ui, &st));
+    }
+
+    #[test]
+    fn generated_token_auto_hide_waits_until_deadline() {
+        let st = listen_generated_state();
+        let snap = st.snapshot();
+        let mut ui = UiState::default();
+        let now = Instant::now();
+
+        maybe_auto_hide_generated_token_banner(&mut ui, &snap, now);
+        assert!(!ui.token_banner_hidden);
+
+        let deadline = ui
+            .token_banner_auto_hide_at
+            .expect("generated token should set an auto-hide deadline");
+        assert_eq!(deadline.duration_since(now), GENERATED_TOKEN_AUTO_HIDE_AFTER);
+
+        maybe_auto_hide_generated_token_banner(
+            &mut ui,
+            &snap,
+            deadline - Duration::from_millis(1),
+        );
+        assert!(!ui.token_banner_hidden);
+        assert_eq!(ui.token_banner_auto_hide_at, Some(deadline));
+    }
+
+    #[test]
+    fn generated_token_auto_hide_uses_same_hidden_state_as_h() {
+        let st = listen_generated_state();
+        let snap = st.snapshot();
+        let mut ui = UiState::default();
+        let now = Instant::now();
+
+        maybe_auto_hide_generated_token_banner(&mut ui, &snap, now);
+        let deadline = ui.token_banner_auto_hide_at.expect("deadline set");
+        maybe_auto_hide_generated_token_banner(&mut ui, &snap, deadline);
+
+        assert!(ui.token_banner_hidden);
+        assert!(ui.token_banner_auto_hide_at.is_none());
+    }
+
+    #[test]
+    fn h_hides_generated_token_and_clears_auto_hide_deadline() {
+        let st = listen_generated_state();
+        let snap = st.snapshot();
+        let mut ui = UiState::default();
+        maybe_auto_hide_generated_token_banner(&mut ui, &snap, Instant::now());
+        assert!(ui.token_banner_auto_hide_at.is_some());
+
+        assert!(!handle_key(key(KeyCode::Char('h')), &mut ui, &st));
+
+        assert!(ui.token_banner_hidden);
+        assert!(ui.token_banner_auto_hide_at.is_none());
     }
 
     #[test]
