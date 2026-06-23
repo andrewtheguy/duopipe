@@ -1,6 +1,6 @@
 # duopipe
 
-**Cross-platform Secure Peer-to-Peer TCP/UDP port forwarding with NAT traversal, driven by an interactive TUI.**
+**Cross-platform secure P2P TCP/UDP port forwarding with NAT traversal, driven by an interactive TUI.**
 
 Duopipe enables you to forward TCP and UDP traffic between machines without requiring public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted connections between peers using modern P2P networking techniques. It is driven through an interactive terminal UI (TUI) launched with `duopipe start`, which walks you through connecting to a peer and managing tunnels.
 
