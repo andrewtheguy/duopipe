@@ -52,6 +52,13 @@ pub fn load_identity(path: &Path) -> Result<SecretKey> {
         match try_read_identity_file(path) {
             Ok(key) => return Ok(key),
             Err(e) => {
+                // A genuinely missing file won't appear by waiting; only the
+                // create-race empty/unparseable window is worth retrying.
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(e);
+                }
                 last_err = Some(e);
                 if attempt < RETRIES {
                     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -229,7 +236,12 @@ mod tests {
     fn test_load_identity_errors_when_missing() {
         let dir = std::env::temp_dir().join(format!("duopipe-id-missing-{}", rand::random::<u64>()));
         let path = dir.join("identity.key");
-        assert!(load_identity(&path).is_err());
+        let err = load_identity(&path).expect_err("missing file must error");
+        // Fail fast on NotFound rather than retrying the create-race window.
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().map(|io| io.kind()),
+            Some(std::io::ErrorKind::NotFound),
+        );
     }
 
     #[test]
