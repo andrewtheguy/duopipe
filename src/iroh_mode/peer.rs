@@ -88,6 +88,14 @@ const SHUTDOWN_CODE: u32 = 0;
 /// Maximum reconnect backoff for the dialing peer.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Maximum number of attempts to establish the *first* connection before giving
+/// up. Once a connection has been established and served at least once, the
+/// dialer reconnects without limit. This bounds the startup phase so a peer that
+/// is unreachable — or a node id already held by another live process (which
+/// leaves the dialer endlessly `peer_busy`) — fails fast instead of looping
+/// forever.
+const MAX_INITIAL_CONNECT_ATTEMPTS: u32 = 10;
+
 /// Runtime configuration for a symmetric peer.
 pub struct PeerConfig {
     /// Connection role (dial out or listen).
@@ -103,6 +111,10 @@ pub struct PeerConfig {
     /// The shared auth token (presented when dialing, required when listening).
     /// **Sensitive - redacted in Debug.**
     pub auth_token: String,
+    /// Optional persisted iroh identity. `Some` ⇒ stable node id (from a config
+    /// `identity_file` or the `DUOPIPE_SECRET_KEY` test var); `None` ⇒ ephemeral
+    /// identity (a fresh node id every run). **Sensitive - redacted in Debug.**
+    pub secret_key: Option<iroh::SecretKey>,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -129,6 +141,10 @@ impl std::fmt::Debug for PeerConfig {
             .field("allowed_sources", &self.allowed_sources)
             .field("autostart_requests", &self.autostart_requests)
             .field("auth_token", &"[REDACTED]")
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
@@ -165,7 +181,7 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     let endpoint = create_server_endpoint(
         &config.relay_urls,
         config.relay_only,
-        None,
+        config.secret_key.clone(),
         config.dns_server.as_deref(),
         ALPN,
         Some(&config.transport),
@@ -243,7 +259,7 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
         &config.relay_urls,
         config.relay_only,
         config.dns_server.as_deref(),
-        None,
+        config.secret_key.as_ref(),
         Some(&config.transport),
     )
     .await?;
@@ -253,6 +269,12 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
     let shutdown = config.status.shutdown.clone();
     let config = Arc::new(config);
     let mut backoff = Duration::from_secs(1);
+    // Until the first connection is fully established and served, cap retries (see
+    // `MAX_INITIAL_CONNECT_ATTEMPTS`). Once we have served a real session at least
+    // once, reconnect without limit so a transient outage doesn't kill a working
+    // peer relationship.
+    let mut established = false;
+    let mut attempts: u32 = 0;
 
     loop {
         config.status.set_conn_status(ConnStatus::Connecting);
@@ -269,18 +291,30 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
 
         match connect {
             Ok(conn) => {
-                backoff = Duration::from_secs(1);
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
                 match handle_connection(conn, config.clone(), true).await {
-                    Ok(()) => log::info!("Connection closed; will reconnect"),
+                    // `true` ⇒ a real session was served; `false` ⇒ the peer was
+                    // busy (its session is held by another connection) so nothing
+                    // was established this round.
+                    Ok(session_served) => {
+                        if session_served {
+                            established = true;
+                            attempts = 0;
+                            backoff = Duration::from_secs(1);
+                            log::info!("Connection closed; will reconnect");
+                        } else {
+                            log::warn!(
+                                "Peer is busy (its session is held by another connection)"
+                            );
+                        }
+                    }
                     Err(e) => {
-                        // Auth failures (bad token) and rejections (the listener's
-                        // session is bound to a different node id) are fatal —
-                        // reconnecting can't succeed: a bad token stays bad, and a
-                        // wrong-peer rejection won't change until the listener
-                        // unbinds or restarts. (A transient peer-busy close is NOT
-                        // surfaced as an error, so it falls through to a retry.)
+                        // Auth failures (bad token) and wrong-peer rejections (the
+                        // listener's session is bound to a different node id) are
+                        // fatal — reconnecting can't succeed: a bad token stays bad,
+                        // and a wrong-peer rejection won't change until the listener
+                        // unbinds or restarts.
                         if e.downcast_ref::<TunnelError>().is_some_and(|te| {
                             matches!(te.category, ErrorCategory::Auth | ErrorCategory::Rejected)
                         }) {
@@ -292,6 +326,21 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
                 }
             }
             Err(e) => log::warn!("Failed to connect to peer: {}", e),
+        }
+
+        // Bound the initial-connection phase. After the first established session
+        // this never trips (attempts is reset to 0 above).
+        if !established {
+            attempts += 1;
+            if attempts >= MAX_INITIAL_CONNECT_ATTEMPTS {
+                endpoint.close().await;
+                return Err(TunnelError::connection(anyhow::anyhow!(
+                    "could not establish a connection after {MAX_INITIAL_CONNECT_ATTEMPTS} \
+                     attempts; the peer may be unreachable, or another process may be using \
+                     this node id"
+                ))
+                .into());
+            }
         }
 
         config.status.set_conn_status(ConnStatus::Reconnecting {
@@ -313,11 +362,15 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
 // Connection handling (symmetric)
 // ============================================================================
 
+/// Handle one established connection. Returns `Ok(true)` when a real session was
+/// served, `Ok(false)` when the connection was rejected as transiently busy (the
+/// dialer should retry but not treat it as established). Fatal conditions (auth
+/// failure, wrong-peer rejection) return `Err`.
 async fn handle_connection(
     conn: iroh::endpoint::Connection,
     config: Arc<PeerConfig>,
     is_dialer: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let remote_id = conn.remote_id();
 
     // Phase 1: authenticate.
@@ -343,7 +396,7 @@ async fn handle_connection(
                     remote_id
                 );
                 conn.close(PEER_BUSY_CODE.into(), b"peer_busy");
-                return Ok(());
+                return Ok(false);
             }
             PeerAdmission::WrongPeer => {
                 log::warn!(
@@ -351,7 +404,7 @@ async fn handle_connection(
                     remote_id
                 );
                 conn.close(WRONG_PEER_CODE.into(), b"wrong_peer");
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -427,16 +480,19 @@ async fn handle_connection(
     // A dialer rejected because the listener's session is bound to a *different*
     // node id must NOT reconnect: its node id won't match until the listener
     // unbinds or restarts, so retrying can never succeed. Surface it as a fatal
-    // `Rejected` error so `run_dial` stops. A transient `peer_busy` close (the bound
-    // peer's own stale connection) is left to fall through to `Ok(())`, so the
-    // dialer reconnects with backoff and gets back in once the old one clears.
+    // `Rejected` error so `run_dial` stops.
     if is_dialer && is_wrong_peer_close(&reason) {
         return Err(TunnelError::rejected(anyhow::anyhow!(
             "Peer rejected connection: its session is bound to a different peer"
         ))
         .into());
     }
-    Ok(())
+
+    // A transient `peer_busy` close (the bound peer's own stale connection still
+    // tearing down, or another connection holding the single session) is reported
+    // as "not served" so the dialer retries with backoff — and, until it has ever
+    // established a session, counts against the initial-connection cap.
+    Ok(!(is_dialer && is_busy_close(&reason)))
 }
 
 /// Whether `reason` is the listener closing us out because its session is bound to
@@ -446,6 +502,17 @@ fn is_wrong_peer_close(reason: &ConnectionError) -> bool {
         reason,
         ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
             if u64::from(*error_code) == WRONG_PEER_CODE as u64
+    )
+}
+
+/// Whether `reason` is the listener closing us out because its single session is
+/// already held by another live connection (application close with
+/// [`PEER_BUSY_CODE`]). Transient: the dialer should retry.
+fn is_busy_close(reason: &ConnectionError) -> bool {
+    matches!(
+        reason,
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+            if u64::from(*error_code) == PEER_BUSY_CODE as u64
     )
 }
 
@@ -522,6 +589,7 @@ async fn request_supervisor(
 // Authentication
 // ============================================================================
 
+/// Authenticate as the dialer.
 async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<()> {
     let (mut send, mut recv) = open_bi_with_retry(conn).await?;
 
@@ -546,6 +614,7 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
     Ok(())
 }
 
+/// Authenticate as the listener.
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
     auth_tokens: &HashSet<String>,
@@ -932,6 +1001,7 @@ mod tests {
             allowed_sources: AllowedSources::default(),
             autostart_requests: false,
             auth_token: token.to_string(),
+            secret_key: None,
             relay_urls: vec![],
             relay_only: false,
             dns_server: Some("none".to_string()),

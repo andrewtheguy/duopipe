@@ -49,6 +49,11 @@ pub struct PeerConfig {
     pub auth_token: Option<String>,
     /// Path to file containing the authentication token.
     pub auth_token_file: Option<PathBuf>,
+    /// Path to a persisted iroh secret-identity file. When set (config-file mode
+    /// only), the node id is stable across runs: the file is read if present, or
+    /// generated and written (mode `0o600`) on first run. Absent ⇒ ephemeral
+    /// identity (a fresh node id every run, the default for configless setups).
+    pub identity_file: Option<PathBuf>,
     /// Path to age identity (private key) file for decrypting age-encrypted values.
     pub encryption_key_file: Option<PathBuf>,
     /// Age public key (recipient) for encrypting values in this config.
