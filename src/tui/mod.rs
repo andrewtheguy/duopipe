@@ -46,6 +46,8 @@ pub struct TuiLaunch {
     /// A valid auth token from config/env (pre-seeds the dial flow; used directly
     /// for listen). Pre-validated in main.
     pub config_auth_token: Option<String>,
+    /// Optional persisted iroh identity (stable node id). `None` ⇒ ephemeral.
+    pub secret_key: Option<iroh::SecretKey>,
 }
 
 /// Run the interactive setup, then the live dashboard, until the user quits or
@@ -144,6 +146,7 @@ fn build_peer_config(
         allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests: false,
         auth_token: resolved.auth_token.clone(),
+        secret_key: launch.secret_key.clone(),
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),

@@ -111,6 +111,10 @@ pub struct PeerConfig {
     /// The shared auth token (presented when dialing, required when listening).
     /// **Sensitive - redacted in Debug.**
     pub auth_token: String,
+    /// Optional persisted iroh identity. `Some` ⇒ stable node id (from a config
+    /// `identity_file` or the `DUOPIPE_SECRET_KEY` test var); `None` ⇒ ephemeral
+    /// identity (a fresh node id every run). **Sensitive - redacted in Debug.**
+    pub secret_key: Option<iroh::SecretKey>,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -137,6 +141,10 @@ impl std::fmt::Debug for PeerConfig {
             .field("allowed_sources", &self.allowed_sources)
             .field("autostart_requests", &self.autostart_requests)
             .field("auth_token", &"[REDACTED]")
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
@@ -173,7 +181,7 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     let endpoint = create_server_endpoint(
         &config.relay_urls,
         config.relay_only,
-        None,
+        config.secret_key.clone(),
         config.dns_server.as_deref(),
         ALPN,
         Some(&config.transport),
@@ -251,7 +259,7 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
         &config.relay_urls,
         config.relay_only,
         config.dns_server.as_deref(),
-        None,
+        config.secret_key.as_ref(),
         Some(&config.transport),
     )
     .await?;
@@ -581,6 +589,7 @@ async fn request_supervisor(
 // Authentication
 // ============================================================================
 
+/// Authenticate as the dialer.
 async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<()> {
     let (mut send, mut recv) = open_bi_with_retry(conn).await?;
 
@@ -605,6 +614,7 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
     Ok(())
 }
 
+/// Authenticate as the listener.
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
     auth_tokens: &HashSet<String>,
@@ -991,6 +1001,7 @@ mod tests {
             allowed_sources: AllowedSources::default(),
             autostart_requests: false,
             auth_token: token.to_string(),
+            secret_key: None,
             relay_urls: vec![],
             relay_only: false,
             dns_server: Some("none".to_string()),

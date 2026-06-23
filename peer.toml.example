@@ -17,15 +17,23 @@
 # Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
 # (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
-# dual-stack localhost. The iroh identity key is ephemeral (regenerated every
-# run), so a listening instance's node id changes between runs.
+# dual-stack localhost.
+#
+# Node id: by default the iroh identity key is ephemeral (regenerated every run),
+# so a listening instance's node id changes between runs. Set 'identity_file'
+# (below) to persist the key and keep a stable node id.
 
 # The shared auth token, presented by both sides. Optional: a fresh listening
 # instance generates one if absent (shown in the TUI). Generate with:
 #   duopipe generate-auth-token
-# SECURITY: Plaintext 'auth_token' is not allowed in config files. Use
-# 'auth_token_file' (recommended), DUOPIPE_AUTH_TOKEN, or an age-encrypted value.
+# Supply it via 'auth_token_file' (recommended) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/token.txt"
+
+# Persisted iroh identity for a STABLE node id (config-file mode only). When set,
+# the file is read if present; on first run, if it is missing, you are asked to
+# confirm before a new key is generated and written (mode 0o600). Leave unset for
+# an ephemeral identity (a fresh node id every run, the default).
+# identity_file = "~/.config/duopipe/identity.key"
 
 # Maximum concurrent data streams per connection (default: 100).
 # max_streams = 100
@@ -74,24 +82,6 @@ tcp = [
 udp = [
     "10.0.0.0/8",       # private network
 ]
-
-# ============================================================================
-# Encrypted Inline Secrets (Optional)
-# ============================================================================
-# Instead of _file variants, you can encrypt secrets directly in this config
-# using age encryption (useful for managing multiple configs with one key).
-#
-# 1. Generate a key: duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
-# 2. Encrypt a value: echo -n "token" | duopipe config-encryption encrypt-value --recipient age1...
-# 3. Paste the ageenc:... output as a TOML string value.
-#
-# encryption_key_file is required at runtime to decrypt ageenc: values.
-# encryption_recipient is only used by `encrypt-value` to select the public key.
-#
-# encryption_key_file = "~/.config/duopipe/age.key"
-# encryption_recipient = "age1..."
-#
-# auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
 
 # ============================================================================
 # Transport Tuning (Optional)
