@@ -1,5 +1,5 @@
 no backward compatibility is needed since it is still pre-release.
-run cargo clippy and cargo test -q after making changes.
+run cargo clippy and cargo test -q after making rust code changes.
 no cargo fmt
 
 # Usage model
