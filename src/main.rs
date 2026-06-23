@@ -221,9 +221,11 @@ impl TestEnv {
 
 /// Resolve the optional *stable* iroh identity key. Precedence: the
 /// `DUOPIPE_SECRET_KEY` test var wins (so tests can force a shared node id);
-/// otherwise, only when a config file is in use, an `identity_file` is loaded
-/// (or generated on first run). Configless/interactive runs get `None` ⇒
-/// ephemeral identity (a fresh node id every run).
+/// otherwise, only when a config file is in use, an `identity_file` is loaded.
+/// An existing file is read as-is; a *missing* one is generated only after the
+/// user confirms (so a long-lived identity is never minted by surprise). A
+/// headless test run creates it without prompting. Configless/interactive runs
+/// without `identity_file` get `None` ⇒ ephemeral identity (a fresh node id).
 fn resolve_identity_key(
     cfg: &PeerConfig,
     source: ConfigSource,
@@ -238,9 +240,38 @@ fn resolve_identity_key(
         && let Some(path) = &cfg.identity_file
     {
         let expanded = expand_tilde(path);
-        return identity::load_or_create_identity(&expanded).map(Some);
+        if expanded.exists() {
+            return identity::load_identity(&expanded).map(Some);
+        }
+        // Missing key: confirm before generating a brand-new one the user didn't
+        // explicitly create. Skip the prompt in headless test mode (no user).
+        if test_env.is_none() && !confirm_generate_identity(&expanded)? {
+            anyhow::bail!(
+                "Identity file {} does not exist and generation was declined. \
+                 Create it (or point identity_file at an existing key) and retry.",
+                expanded.display()
+            );
+        }
+        return identity::create_identity(&expanded).map(Some);
     }
     Ok(None)
+}
+
+/// Ask on the terminal before generating a new stable identity for a configured
+/// `identity_file` that does not exist yet. Defaults to "no" (empty/other input).
+fn confirm_generate_identity(path: &std::path::Path) -> Result<bool> {
+    use std::io::Write;
+    print!(
+        "Identity file {} does not exist. Generate a new stable identity there? [y/N] ",
+        path.display()
+    );
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("Failed to read confirmation from stdin")?;
+    let ans = line.trim();
+    Ok(ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes"))
 }
 
 /// Load peer config based on flags. Returns (config, source).

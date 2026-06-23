@@ -30,10 +30,12 @@ identity is configured (see below).
 
 # Identity (stable vs ephemeral node id)
 By default the iroh identity is ephemeral. A configured peer can opt into a stable
-node id by setting `identity_file` in the config: the file is read if present, or a
-new key is generated and written (`0o600`) on first run. This only applies in
-config-file mode; configless/interactive runs stay ephemeral. In test mode,
-`DUOPIPE_SECRET_KEY` takes precedence over `identity_file`.
+node id by setting `identity_file` in the config: the file is read if present; if it
+is missing, the user is prompted to confirm before a new key is generated and
+written (`0o600`) — so a long-lived identity is never minted by surprise. (Headless
+test mode skips the prompt and creates it.) This only applies in config-file mode;
+configless/interactive runs stay ephemeral. In test mode, `DUOPIPE_SECRET_KEY` takes
+precedence over `identity_file`.
 
 Because a stable identity can be copied to a second host (two processes, one node
 id), peers exchange a per-process `instance_id` in the auth handshake and over a

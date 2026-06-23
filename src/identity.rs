@@ -2,9 +2,10 @@
 //!
 //! By default duopipe generates an ephemeral iroh `SecretKey` each run, so the
 //! node id changes every time. A configured peer can opt into a *stable* node id
-//! via `identity_file` (config) — see [`load_or_create_identity`]. The key is
-//! stored base64-encoded in a `0o600` file, mirroring how `encryption_key_file`
-//! (an age identity) is handled in [`crate::encryption`].
+//! via `identity_file` (config) — [`load_identity`] reads an existing one and
+//! [`create_identity`] mints a new one. The key is stored base64-encoded in a
+//! `0o600` file, mirroring how `encryption_key_file` (an age identity) is handled
+//! in [`crate::encryption`].
 //!
 //! Separately, [`self_instance_id`] returns a random per-*process* nonce. It is
 //! independent of the iroh key: the key says "who I claim to be" (node id), the
@@ -36,46 +37,15 @@ pub fn parse_secret_key(s: &str) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&arr))
 }
 
-/// Load a stable identity from `path`, or generate and persist one on first run.
+/// Load an existing stable identity from `path`. Errors if the file is missing,
+/// empty, or invalid; use [`create_identity`] to mint a new one.
 ///
-/// The file holds the base64-encoded 32-byte secret on a single line. When it
-/// does not exist it is created with mode `0o600` (parent dirs created as
-/// needed). Comment lines (starting with `#`) and blank lines are ignored so the
-/// file format is forgiving.
-pub fn load_or_create_identity(path: &Path) -> Result<SecretKey> {
-    if path.exists() {
-        return read_identity_file(path);
-    }
-
-    let key = SecretKey::generate();
-    match write_identity_file(path, &key) {
-        Ok(()) => {
-            log::info!(
-                "Generated a new stable identity at {} (node id {})",
-                path.display(),
-                key.public()
-            );
-            Ok(key)
-        }
-        // Lost the creation race with a concurrent process (atomic `create_new`
-        // let exactly one win). Re-read the key the winner wrote so both processes
-        // converge on the same identity instead of each keeping its own.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            log::info!(
-                "Identity file {} was created concurrently; using the existing key",
-                path.display()
-            );
-            read_identity_file(path)
-        }
-        Err(e) => Err(anyhow::Error::new(e))
-            .with_context(|| format!("Failed to write identity file: {}", path.display())),
-    }
-}
-
-/// Read and parse the secret key from `path`. Tolerates a brief window where the
-/// race winner has created the file (so `create_new` failed for us) but not yet
-/// flushed its contents, by retrying on an empty/unparseable read for a short time.
-fn read_identity_file(path: &Path) -> Result<SecretKey> {
+/// The file holds the base64-encoded 32-byte secret on a single line; comment
+/// lines (starting with `#`) and blank lines are ignored, so the format is
+/// forgiving. Tolerates a brief window where a concurrent [`create_identity`] has
+/// created the file but not yet flushed its contents, by retrying on an
+/// empty/unparseable read for a short time.
+pub fn load_identity(path: &Path) -> Result<SecretKey> {
     const RETRIES: u32 = 20;
     let mut last_err = None;
     for attempt in 0..=RETRIES {
@@ -90,6 +60,35 @@ fn read_identity_file(path: &Path) -> Result<SecretKey> {
         }
     }
     Err(last_err.expect("at least one read attempt was made"))
+}
+
+/// Generate a new stable identity and persist it to `path` (mode `0o600`, parent
+/// dirs created as needed). Creation is atomic: if a concurrent process won the
+/// race, re-read its key via [`load_identity`] so both processes converge on one
+/// identity instead of each keeping its own.
+pub fn create_identity(path: &Path) -> Result<SecretKey> {
+    let key = SecretKey::generate();
+    match write_identity_file(path, &key) {
+        Ok(()) => {
+            log::info!(
+                "Generated a new stable identity at {} (node id {})",
+                path.display(),
+                key.public()
+            );
+            Ok(key)
+        }
+        // Lost the creation race with a concurrent process (atomic `create_new`
+        // let exactly one win). Re-read the key the winner wrote.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            log::info!(
+                "Identity file {} was created concurrently; using the existing key",
+                path.display()
+            );
+            load_identity(path)
+        }
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("Failed to write identity file: {}", path.display())),
+    }
 }
 
 /// Single read+parse attempt. Errors if the file is missing, empty, or invalid.
@@ -205,15 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn test_load_or_create_is_stable() {
+    fn test_create_then_load_is_stable() {
         let dir = std::env::temp_dir().join(format!("duopipe-id-test-{}", self_instance_id()));
         let path = dir.join("identity.key");
         let _ = std::fs::remove_file(&path);
 
-        let first = load_or_create_identity(&path).unwrap();
-        // Second call reads the same key back.
-        let second = load_or_create_identity(&path).unwrap();
-        assert_eq!(first.to_bytes(), second.to_bytes());
+        let created = create_identity(&path).unwrap();
+        // load_identity reads the same key back.
+        let loaded = load_identity(&path).unwrap();
+        assert_eq!(created.to_bytes(), loaded.to_bytes());
 
         #[cfg(unix)]
         {
@@ -227,22 +226,31 @@ mod tests {
     }
 
     #[test]
+    fn test_load_identity_errors_when_missing() {
+        let dir = std::env::temp_dir().join(format!("duopipe-id-missing-{}", rand::random::<u64>()));
+        let path = dir.join("identity.key");
+        assert!(load_identity(&path).is_err());
+    }
+
+    #[test]
     fn test_create_is_atomic_and_loser_reads_winner_key() {
-        // Simulate the creation race: the winner writes the file; a second atomic
-        // create must fail with AlreadyExists (not overwrite), and load_or_create
-        // must then converge on the winner's key rather than minting a new one.
+        // The creation race: the first create wins; a second create must not
+        // overwrite but converge on the winner's key (re-read via load_identity).
         let dir = std::env::temp_dir().join(format!("duopipe-id-race-{}", rand::random::<u64>()));
         let path = dir.join("identity.key");
 
-        let winner = SecretKey::generate();
-        write_identity_file(&path, &winner).expect("winner writes");
+        let winner = create_identity(&path).expect("winner creates");
+        let second = create_identity(&path).expect("second create converges");
+        assert_eq!(
+            second.to_bytes(),
+            winner.to_bytes(),
+            "a second create must re-read the winner's key, not mint a new one"
+        );
 
-        let loser = SecretKey::generate();
-        let err = write_identity_file(&path, &loser).expect_err("second create must fail");
+        // The underlying write is atomic (`create_new`): a direct second write fails.
+        let err =
+            write_identity_file(&path, &SecretKey::generate()).expect_err("second write must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-
-        let got = load_or_create_identity(&path).unwrap();
-        assert_eq!(got.to_bytes(), winner.to_bytes());
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -261,7 +269,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         // Reading a world-readable key must succeed but leave it owner-only.
-        let got = load_or_create_identity(&path).unwrap();
+        let got = load_identity(&path).unwrap();
         assert_eq!(got.to_bytes(), key.to_bytes());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "permissions should be tightened to 0o600");
