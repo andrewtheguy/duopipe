@@ -396,10 +396,14 @@ impl AppState {
             return PeerAdmission::WrongPeer;
         }
         if b.connected {
-            // A live connection holds the session. Same process (same instance) ⇒
-            // its previous connection is still tearing down: transient Busy. A
-            // different instance ⇒ a second live process with our key: Duplicate.
-            return if b.bound_instance == Some(instance_id) {
+            // A live connection still holds the session. If the binding was cleared
+            // by an unbind (TUI `u`), the duplicate check no longer applies — the
+            // bound instance belongs to a peer we deliberately released — so any
+            // newcomer just waits for the in-flight connection to end (transient
+            // Busy). Otherwise: same process (same instance) ⇒ its previous
+            // connection is still tearing down (Busy); a different instance ⇒ a
+            // second live process with our key (Duplicate).
+            return if b.bound_id.is_none() || b.bound_instance == Some(instance_id) {
                 PeerAdmission::Busy
             } else {
                 PeerAdmission::Duplicate
@@ -691,6 +695,26 @@ mod tests {
         // (e.g. a restart): not flagged as duplicate.
         state.disconnect_peer();
         assert_eq!(state.admit_peer("peer-a", CLONE), PeerAdmission::Admitted);
+    }
+
+    #[test]
+    fn admit_peer_after_unbind_while_connected_is_busy_not_duplicate() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        const A: u128 = 20;
+        const B: u128 = 21;
+
+        // peer-a is bound and live.
+        assert_eq!(state.admit_peer("peer-a", A), PeerAdmission::Admitted);
+
+        // Operator unbinds (TUI `u`) but the connection is still live: only bound_id
+        // is cleared, `connected` stays true. A different peer must see transient
+        // Busy (wait for the live connection to end), not a fatal Duplicate.
+        state.unbind_session();
+        assert_eq!(state.admit_peer("peer-b", B), PeerAdmission::Busy);
+
+        // Once the in-flight connection ends, the new peer may bind.
+        state.disconnect_peer();
+        assert_eq!(state.admit_peer("peer-b", B), PeerAdmission::Admitted);
     }
 
     #[test]
