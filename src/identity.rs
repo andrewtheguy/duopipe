@@ -44,32 +44,104 @@ pub fn parse_secret_key(s: &str) -> Result<SecretKey> {
 /// file format is forgiving.
 pub fn load_or_create_identity(path: &Path) -> Result<SecretKey> {
     if path.exists() {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read identity file: {}", path.display()))?;
-        let line = contents
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with('#'))
-            .with_context(|| format!("Identity file is empty: {}", path.display()))?;
-        return parse_secret_key(line)
-            .with_context(|| format!("Invalid identity file: {}", path.display()));
+        return read_identity_file(path);
     }
 
     let key = SecretKey::generate();
-    write_identity_file(path, &key)
-        .with_context(|| format!("Failed to write identity file: {}", path.display()))?;
-    log::info!(
-        "Generated a new stable identity at {} (node id {})",
-        path.display(),
-        key.public()
-    );
-    Ok(key)
+    match write_identity_file(path, &key) {
+        Ok(()) => {
+            log::info!(
+                "Generated a new stable identity at {} (node id {})",
+                path.display(),
+                key.public()
+            );
+            Ok(key)
+        }
+        // Lost the creation race with a concurrent process (atomic `create_new`
+        // let exactly one win). Re-read the key the winner wrote so both processes
+        // converge on the same identity instead of each keeping its own.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            log::info!(
+                "Identity file {} was created concurrently; using the existing key",
+                path.display()
+            );
+            read_identity_file(path)
+        }
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("Failed to write identity file: {}", path.display())),
+    }
 }
 
-/// Write the secret key to `path` with owner-only permissions (`0o600` on unix).
-fn write_identity_file(path: &Path, key: &SecretKey) -> Result<()> {
+/// Read and parse the secret key from `path`. Tolerates a brief window where the
+/// race winner has created the file (so `create_new` failed for us) but not yet
+/// flushed its contents, by retrying on an empty/unparseable read for a short time.
+fn read_identity_file(path: &Path) -> Result<SecretKey> {
+    const RETRIES: u32 = 20;
+    let mut last_err = None;
+    for attempt in 0..=RETRIES {
+        match try_read_identity_file(path) {
+            Ok(key) => return Ok(key),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one read attempt was made"))
+}
+
+/// Single read+parse attempt. Errors if the file is missing, empty, or invalid.
+fn try_read_identity_file(path: &Path) -> Result<SecretKey> {
+    ensure_owner_only(path)?;
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read identity file: {}", path.display()))?;
+    let line = contents
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .with_context(|| format!("Identity file is empty: {}", path.display()))?;
+    parse_secret_key(line).with_context(|| format!("Invalid identity file: {}", path.display()))
+}
+
+/// Ensure the identity file is not readable by group/other. A user-managed
+/// `identity_file` could be copied or restored with loose permissions (e.g.
+/// `0644`); a secret key must stay owner-only, so tighten it in place rather than
+/// silently reading a world-readable secret. No-op on non-unix.
+#[cfg(unix)]
+fn ensure_owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("Failed to stat identity file: {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        log::warn!(
+            "Identity file {} had insecure permissions {:#o}; tightening to 0o600",
+            path.display(),
+            mode
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || format!("Failed to tighten identity file permissions: {}", path.display()),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Atomically create and write the secret key to `path` with owner-only
+/// permissions (`0o600` on unix). Uses `create_new` so a concurrent first run
+/// can't have two processes each persist a different key: the loser gets
+/// [`std::io::ErrorKind::AlreadyExists`] and re-reads the winner's file.
+fn write_identity_file(path: &Path, key: &SecretKey) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create identity directory")?;
+        std::fs::create_dir_all(parent)?;
     }
     let content = format!(
         "# duopipe iroh identity (keep secret)\n# node id: {}\n{}\n",
@@ -77,27 +149,29 @@ fn write_identity_file(path: &Path, key: &SecretKey) -> Result<()> {
         encode_secret_key(key)
     );
 
+    use std::io::Write;
+
     #[cfg(unix)]
     {
-        use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let mut file = std::fs::OpenOptions::new()
-            .create(true)
             .write(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)
-            .context("Failed to open identity file")?;
-        file.write_all(content.as_bytes())
-            .context("Failed to write identity file")?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .context("Failed to set identity file permissions")?;
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
+        // `mode()` is subject to umask on creation; pin perms to exactly 0o600.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
 
     #[cfg(not(unix))]
     {
-        std::fs::write(path, content.as_bytes()).context("Failed to write identity file")?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(content.as_bytes())?;
     }
 
     Ok(())
@@ -147,6 +221,50 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_create_is_atomic_and_loser_reads_winner_key() {
+        // Simulate the creation race: the winner writes the file; a second atomic
+        // create must fail with AlreadyExists (not overwrite), and load_or_create
+        // must then converge on the winner's key rather than minting a new one.
+        let dir = std::env::temp_dir().join(format!("duopipe-id-race-{}", rand::random::<u64>()));
+        let path = dir.join("identity.key");
+
+        let winner = SecretKey::generate();
+        write_identity_file(&path, &winner).expect("winner writes");
+
+        let loser = SecretKey::generate();
+        let err = write_identity_file(&path, &loser).expect_err("second create must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let got = load_or_create_identity(&path).unwrap();
+        assert_eq!(got.to_bytes(), winner.to_bytes());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_tightens_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("duopipe-id-perm-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.key");
+
+        let key = SecretKey::generate();
+        std::fs::write(&path, format!("{}\n", encode_secret_key(&key))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Reading a world-readable key must succeed but leave it owner-only.
+        let got = load_or_create_identity(&path).unwrap();
+        assert_eq!(got.to_bytes(), key.to_bytes());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "permissions should be tightened to 0o600");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
