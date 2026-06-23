@@ -13,3 +13,6 @@ pub use codec::{
     StreamAck, StreamHello, decode_stream_ack, decode_stream_hello, encode_stream_ack,
     encode_stream_hello, read_length_prefixed,
 };
+
+// Liveness/identity control stream.
+pub use codec::{ControlMsg, decode_control_msg, encode_control_msg};

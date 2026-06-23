@@ -8,6 +8,7 @@ mod buffer;
 mod config;
 mod encryption;
 mod error;
+mod identity;
 mod iroh_mode;
 mod logging;
 mod net;
@@ -151,6 +152,10 @@ struct TestEnv {
     peer_node_id: Option<String>,
     /// `DUOPIPE_AUTOSTART_REQUESTS`: auto-start all requests once connected.
     autostart_requests: bool,
+    /// `DUOPIPE_SECRET_KEY`: base64 iroh secret key to force a *stable* node id.
+    /// Lets a test spawn two peers sharing one node id to exercise duplicate
+    /// detection. Absent ⇒ ephemeral identity (the usual test behavior).
+    secret_key: Option<String>,
 }
 
 impl TestEnv {
@@ -162,6 +167,7 @@ impl TestEnv {
         Some(TestEnv {
             peer_node_id: env_var_opt("DUOPIPE_PEER_NODE_ID"),
             autostart_requests: env_truthy("DUOPIPE_AUTOSTART_REQUESTS"),
+            secret_key: env_var_opt("DUOPIPE_SECRET_KEY"),
         })
     }
 
@@ -213,6 +219,30 @@ impl TestEnv {
     }
 }
 
+/// Resolve the optional *stable* iroh identity key. Precedence: the
+/// `DUOPIPE_SECRET_KEY` test var wins (so tests can force a shared node id);
+/// otherwise, only when a config file is in use, an `identity_file` is loaded
+/// (or generated on first run). Configless/interactive runs get `None` ⇒
+/// ephemeral identity (a fresh node id every run).
+fn resolve_identity_key(
+    cfg: &PeerConfig,
+    source: ConfigSource,
+    test_env: Option<&TestEnv>,
+) -> Result<Option<::iroh::SecretKey>> {
+    if let Some(s) = test_env.and_then(|t| t.secret_key.as_ref()) {
+        return identity::parse_secret_key(s)
+            .map(Some)
+            .context("DUOPIPE_SECRET_KEY is not a valid base64 secret key");
+    }
+    if source == ConfigSource::File
+        && let Some(path) = &cfg.identity_file
+    {
+        let expanded = expand_tilde(path);
+        return identity::load_or_create_identity(&expanded).map(Some);
+    }
+    Ok(None)
+}
+
 /// Load peer config based on flags. Returns (config, source).
 fn resolve_peer_config(
     config: Option<PathBuf>,
@@ -240,6 +270,7 @@ async fn run_peer_headless(
     relay_urls: Vec<String>,
     relay_only: bool,
     autostart_requests: bool,
+    secret_key: Option<::iroh::SecretKey>,
 ) -> Result<()> {
     let logs = logging::LogBuffer::new(LOG_CAPACITY);
     let state = AppState::new(
@@ -254,6 +285,7 @@ async fn run_peer_headless(
         allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests,
         auth_token: resolved.auth_token,
+        secret_key,
         relay_urls,
         relay_only,
         dns_server: cfg.dns_server.clone(),
@@ -290,6 +322,7 @@ async fn run() -> i32 {
                     ErrorCategory::Config => 2,
                     ErrorCategory::Auth => 3,
                     ErrorCategory::Rejected => 4,
+                    ErrorCategory::Duplicate => 5,
                     ErrorCategory::Connection => 10,
                     ErrorCategory::ConnectionLost => 11,
                 })
@@ -356,6 +389,11 @@ async fn run_inner() -> Result<()> {
             // failures print plainly.
             let config_auth_token = resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
 
+            // Resolve the optional stable identity key (config identity_file, or
+            // the DUOPIPE_SECRET_KEY test var). None ⇒ ephemeral node id.
+            let secret_key =
+                resolve_identity_key(&cfg, source, test_env.as_ref()).map_err(TunnelError::config)?;
+
             // Test mode: resolve the preset and run headless, no TUI.
             // Interactive mode: hand off to the TUI lifecycle.
             if let Some(test_env) = &test_env {
@@ -368,6 +406,7 @@ async fn run_inner() -> Result<()> {
                     relay_urls,
                     relay_only,
                     test_env.autostart_requests,
+                    secret_key,
                 )
                 .await;
             }
@@ -383,6 +422,7 @@ async fn run_inner() -> Result<()> {
                 max_streams: cfg.max_streams,
                 transport: cfg.transport.clone(),
                 config_auth_token,
+                secret_key,
             };
 
             tui::run_tui(launch).await

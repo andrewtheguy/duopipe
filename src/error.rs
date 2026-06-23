@@ -11,6 +11,9 @@ pub enum ErrorCategory {
     /// different node id — do not retry, since this node id can never match until
     /// the listener unbinds or restarts.
     Rejected,
+    /// A duplicate node id was detected — another live process is using this
+    /// identity key. Fatal: reconnecting can't help while the clone is live.
+    Duplicate,
     /// Connection establishment failed — retry only if it worked before.
     Connection,
     /// Connection lost after tunnel was established — always retry.
@@ -42,6 +45,13 @@ impl TunnelError {
     pub fn rejected(err: impl Into<anyhow::Error>) -> Self {
         Self {
             category: ErrorCategory::Rejected,
+            source: err.into(),
+        }
+    }
+
+    pub fn duplicate(err: impl Into<anyhow::Error>) -> Self {
+        Self {
+            category: ErrorCategory::Duplicate,
             source: err.into(),
         }
     }
@@ -96,6 +106,10 @@ mod tests {
         assert_eq!(
             TunnelError::rejected(anyhow::anyhow!("test")).category,
             ErrorCategory::Rejected
+        );
+        assert_eq!(
+            TunnelError::duplicate(anyhow::anyhow!("test")).category,
+            ErrorCategory::Duplicate
         );
         assert_eq!(
             TunnelError::connection(anyhow::anyhow!("test")).category,

@@ -3,8 +3,11 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Version 5: request-based protocol (single LocalForward stream kind, no remote forwards)
-pub const IROH_MULTI_VERSION: u16 = 5;
+/// Version 6: adds a per-process `instance_id` to the auth handshake and a
+/// `Control` stream kind carrying liveness heartbeats (Ping/Pong). The instance
+/// id lets a peer distinguish two processes sharing one node id (cloned identity
+/// key) from the same process reconnecting.
+pub const IROH_MULTI_VERSION: u16 = 6;
 
 /// Maximum length for rejection reason to prevent excessively large messages.
 pub const MAX_REJECT_REASON_LENGTH: usize = 512;
@@ -78,6 +81,10 @@ pub enum StreamHello {
     /// `source` against its `allowed_sources` allowlist, replies with a
     /// [`StreamAck`], and (if accepted) bridges traffic.
     LocalForward { version: u16, source: String },
+    /// Liveness/identity control stream. Long-lived; carries [`ControlMsg`]
+    /// Ping/Pong heartbeats so each side can detect a dead connection and
+    /// re-assert the peer's `instance_id`. There is at most one per connection.
+    Control { version: u16 },
 }
 
 impl StreamHello {
@@ -88,9 +95,16 @@ impl StreamHello {
         }
     }
 
+    pub fn control() -> Self {
+        StreamHello::Control {
+            version: IROH_MULTI_VERSION,
+        }
+    }
+
     fn version(&self) -> u16 {
         match self {
             StreamHello::LocalForward { version, .. } => *version,
+            StreamHello::Control { version } => *version,
         }
     }
 }
@@ -132,13 +146,18 @@ pub struct AuthRequest {
     pub version: u16,
     /// Authentication token for server validation
     pub auth_token: AuthToken,
+    /// Per-process random nonce of the dialer, independent of its node id. Two
+    /// processes sharing one identity key have the same node id but distinct
+    /// `instance_id`s, which is how the listener detects a cloned identity.
+    pub instance_id: u128,
 }
 
 impl AuthRequest {
-    pub fn new(auth_token: impl Into<String>) -> Self {
+    pub fn new(auth_token: impl Into<String>, instance_id: u128) -> Self {
         Self {
             version: IROH_MULTI_VERSION,
             auth_token: AuthToken::new(auth_token),
+            instance_id,
         }
     }
 }
@@ -153,24 +172,84 @@ pub struct AuthResponse {
     /// Reason for rejection (if rejected)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Per-process random nonce of the listener (see [`AuthRequest::instance_id`]).
+    /// The dialer records it so it can detect a cloned listener identity.
+    pub instance_id: u128,
 }
 
 impl AuthResponse {
-    pub fn accepted() -> Self {
+    pub fn accepted(instance_id: u128) -> Self {
         Self {
             version: IROH_MULTI_VERSION,
             accepted: true,
             reason: None,
+            instance_id,
         }
     }
 
     /// Create a rejection response with the given reason.
     /// The reason will be truncated if it exceeds [`MAX_REJECT_REASON_LENGTH`].
-    pub fn rejected(reason: impl Into<String>) -> Self {
+    pub fn rejected(reason: impl Into<String>, instance_id: u128) -> Self {
         Self {
             version: IROH_MULTI_VERSION,
             accepted: false,
             reason: Some(truncate_reason(reason.into(), MAX_REJECT_REASON_LENGTH)),
+            instance_id,
+        }
+    }
+}
+
+/// Heartbeat message exchanged on a [`StreamHello::Control`] stream. Each side
+/// pings periodically; the peer echoes a matching `Pong`. Both carry the
+/// sender's `instance_id` so a mid-connection identity change (which should be
+/// impossible on a single QUIC connection) is caught as defense-in-depth.
+///
+/// Uses the default (externally-tagged) serde representation rather than an
+/// internal `tag`, because serde_json buffers internally-tagged enums through a
+/// `Content` type that rejects the `u128` `instance_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ControlMsg {
+    Ping {
+        version: u16,
+        seq: u64,
+        instance_id: u128,
+    },
+    Pong {
+        version: u16,
+        seq: u64,
+        instance_id: u128,
+    },
+}
+
+impl ControlMsg {
+    pub fn ping(seq: u64, instance_id: u128) -> Self {
+        ControlMsg::Ping {
+            version: IROH_MULTI_VERSION,
+            seq,
+            instance_id,
+        }
+    }
+
+    pub fn pong(seq: u64, instance_id: u128) -> Self {
+        ControlMsg::Pong {
+            version: IROH_MULTI_VERSION,
+            seq,
+            instance_id,
+        }
+    }
+
+    fn version(&self) -> u16 {
+        match self {
+            ControlMsg::Ping { version, .. } | ControlMsg::Pong { version, .. } => *version,
+        }
+    }
+
+    /// The sender's instance id, regardless of variant.
+    pub fn instance_id(&self) -> u128 {
+        match self {
+            ControlMsg::Ping { instance_id, .. } | ControlMsg::Pong { instance_id, .. } => {
+                *instance_id
+            }
         }
     }
 }
@@ -296,6 +375,21 @@ pub fn decode_auth_response(data: &[u8]) -> Result<AuthResponse> {
     )
 }
 
+/// Encode a ControlMsg as length-prefixed JSON bytes.
+pub fn encode_control_msg(msg: &ControlMsg) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, "ControlMsg")
+}
+
+/// Decode a ControlMsg from length-prefixed JSON bytes.
+pub fn decode_control_msg(data: &[u8]) -> Result<ControlMsg> {
+    decode_length_prefixed(
+        data,
+        IROH_MULTI_VERSION,
+        |m: &ControlMsg| m.version(),
+        "ControlMsg",
+    )
+}
+
 /// Read a length-prefixed message from a stream.
 /// Returns the raw bytes including the length prefix.
 pub async fn read_length_prefixed<R: tokio::io::AsyncReadExt + Unpin>(
@@ -361,6 +455,7 @@ mod tests {
                 assert_eq!(version, IROH_MULTI_VERSION);
                 assert_eq!(source, "tcp://127.0.0.1:22");
             }
+            other => panic!("expected LocalForward, got {other:?}"),
         }
     }
 
@@ -375,6 +470,54 @@ mod tests {
         let decoded = decode_stream_ack(&encode_stream_ack(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
         assert_eq!(decoded.reason.as_deref(), Some("connect failed"));
+    }
+
+    #[test]
+    fn test_auth_request_carries_instance_id() {
+        let req = AuthRequest::new("tok", 0x1234_5678_9abc_def0_0fed_cba9_8765_4321);
+        let decoded = decode_auth_request(&encode_auth_request(&req).unwrap()).unwrap();
+        assert_eq!(decoded.version, IROH_MULTI_VERSION);
+        assert_eq!(decoded.auth_token.as_str(), "tok");
+        assert_eq!(decoded.instance_id, 0x1234_5678_9abc_def0_0fed_cba9_8765_4321);
+    }
+
+    #[test]
+    fn test_auth_response_carries_instance_id() {
+        let ok = AuthResponse::accepted(7);
+        let decoded = decode_auth_response(&encode_auth_response(&ok).unwrap()).unwrap();
+        assert!(decoded.accepted);
+        assert_eq!(decoded.instance_id, 7);
+
+        let rej = AuthResponse::rejected("nope", 9);
+        let decoded = decode_auth_response(&encode_auth_response(&rej).unwrap()).unwrap();
+        assert!(!decoded.accepted);
+        assert_eq!(decoded.reason.as_deref(), Some("nope"));
+        assert_eq!(decoded.instance_id, 9);
+    }
+
+    #[test]
+    fn test_stream_hello_control_roundtrip() {
+        let hello = StreamHello::control();
+        let decoded = decode_stream_hello(&encode_stream_hello(&hello).unwrap()).unwrap();
+        assert!(matches!(decoded, StreamHello::Control { version } if version == IROH_MULTI_VERSION));
+    }
+
+    #[test]
+    fn test_control_msg_ping_pong_roundtrip() {
+        let ping = ControlMsg::ping(42, 0xdead_beef);
+        let decoded = decode_control_msg(&encode_control_msg(&ping).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlMsg::Ping { seq: 42, instance_id: 0xdead_beef, .. }
+        ));
+        assert_eq!(decoded.instance_id(), 0xdead_beef);
+
+        let pong = ControlMsg::pong(42, 0xcafe);
+        let decoded = decode_control_msg(&encode_control_msg(&pong).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlMsg::Pong { seq: 42, instance_id: 0xcafe, .. }
+        ));
     }
 
     #[test]
@@ -528,30 +671,33 @@ mod tests {
 
     #[test]
     fn test_auth_request_roundtrip() {
-        let req = AuthRequest::new("my_secret_token");
+        let req = AuthRequest::new("my_secret_token", 42);
         let encoded = encode_auth_request(&req).unwrap();
         let decoded = decode_auth_request(&encoded).unwrap();
         assert_eq!(decoded.version, IROH_MULTI_VERSION);
         assert_eq!(decoded.auth_token.as_str(), "my_secret_token");
+        assert_eq!(decoded.instance_id, 42);
     }
 
     #[test]
     fn test_auth_response_accepted_roundtrip() {
-        let resp = AuthResponse::accepted();
+        let resp = AuthResponse::accepted(99);
         let encoded = encode_auth_response(&resp).unwrap();
         let decoded = decode_auth_response(&encoded).unwrap();
         assert_eq!(decoded.version, IROH_MULTI_VERSION);
         assert!(decoded.accepted);
         assert!(decoded.reason.is_none());
+        assert_eq!(decoded.instance_id, 99);
     }
 
     #[test]
     fn test_auth_response_rejected_roundtrip() {
-        let resp = AuthResponse::rejected("bad token");
+        let resp = AuthResponse::rejected("bad token", 7);
         let encoded = encode_auth_response(&resp).unwrap();
         let decoded = decode_auth_response(&encoded).unwrap();
         assert_eq!(decoded.version, IROH_MULTI_VERSION);
         assert!(!decoded.accepted);
         assert_eq!(decoded.reason.as_deref(), Some("bad token"));
+        assert_eq!(decoded.instance_id, 7);
     }
 }

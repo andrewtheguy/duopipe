@@ -197,6 +197,10 @@ struct SessionBinding {
     /// Node id bound on first successful auth; cleared only by
     /// [`AppState::unbind_session`] or process exit.
     bound_id: Option<String>,
+    /// The bound peer's per-process `instance_id`. Distinguishes the same process
+    /// reconnecting (same id) from a *different* process sharing the node id (a
+    /// cloned identity key — different id while still connected).
+    bound_instance: Option<u128>,
     /// Whether a connection from the bound peer is currently live (concurrency guard
     /// against a second connection duplicating tunnel binds).
     connected: bool,
@@ -207,12 +211,27 @@ struct SessionBinding {
 pub enum PeerAdmission {
     /// Admitted: the session is now bound to this peer and marked connected.
     Admitted,
-    /// A live connection already holds the session (same bound peer, old connection
-    /// still tearing down). Transient — the dialer should retry with backoff.
+    /// A live connection already holds the session (same bound peer + same process,
+    /// old connection still tearing down). Transient — the dialer should retry.
     Busy,
     /// The session is bound to a different node id. Sticky — the dialer must not
     /// retry (its node id won't match until the listener unbinds or restarts).
     WrongPeer,
+    /// Same node id, but a *different live process* than the one bound: a cloned
+    /// identity key. Fatal — the clone must abort.
+    Duplicate,
+}
+
+/// Tracks listener `instance_id`s a dialer has seen across reconnects, to detect a
+/// cloned *listener* identity. A clean listener restart only ever moves to a new
+/// id; a *reappearing* id (A→B→A) means the relay is bouncing us between two live
+/// processes that share the node id. See [`AppState::observe_listener_instance`].
+#[derive(Default)]
+struct ListenerInstanceTracker {
+    /// The instance id seen on the previous successful connection.
+    prev: Option<u128>,
+    /// Every instance id seen this run (small: one per distinct peer process).
+    seen: std::collections::HashSet<u128>,
 }
 
 /// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
@@ -237,6 +256,9 @@ pub struct AppState {
     /// flag is the concurrency guard that stops a second live connection from
     /// duplicating tunnel binds while one is already active.
     session: RwLock<SessionBinding>,
+    /// Dial role: tracks the listener's `instance_id` across reconnects to detect a
+    /// cloned listener identity. Unused in the listen role.
+    listener_instances: RwLock<ListenerInstanceTracker>,
     /// Monotonic allocator for [`TunnelId`]s. Never reused within a session.
     next_id: AtomicU64,
     /// Authoritative tunnel-request list, seeded from config and appended to at
@@ -283,6 +305,7 @@ impl AppState {
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
             session: RwLock::new(SessionBinding::default()),
+            listener_instances: RwLock::new(ListenerInstanceTracker::default()),
             next_id,
             requests: RwLock::new(requests),
             tunnels: RwLock::new(Vec::new()),
@@ -356,21 +379,49 @@ impl AppState {
         }
     }
 
-    /// Decide whether an authenticated `remote_id` may take the single session
-    /// (listen role). The write lock serializes simultaneous auths so exactly one
-    /// peer wins the bind. See [`PeerAdmission`]. On `Admitted` the session is bound
-    /// (first time) and marked connected; the caller owns the live connection.
-    pub fn admit_peer(&self, remote_id: &str) -> PeerAdmission {
+    /// Decide whether an authenticated `remote_id` (with per-process `instance_id`)
+    /// may take the single session (listen role). The write lock serializes
+    /// simultaneous auths so exactly one peer wins the bind. See [`PeerAdmission`].
+    /// On `Admitted` the session is bound (first time) and marked connected; the
+    /// caller owns the live connection.
+    ///
+    /// A connection with the bound node id but a *different* `instance_id` while the
+    /// bound one is still `connected` is a cloned identity key (two live processes
+    /// sharing one node id) ⇒ `Duplicate`. We rely on the bound connection's
+    /// liveness being kept accurate by the heartbeat / clean-shutdown close, so a
+    /// legitimate restart (old process gone ⇒ `connected == false`) re-binds instead.
+    pub fn admit_peer(&self, remote_id: &str, instance_id: u128) -> PeerAdmission {
         let mut b = self.session.write();
         if b.bound_id.as_deref().is_some_and(|id| id != remote_id) {
             return PeerAdmission::WrongPeer;
         }
         if b.connected {
-            return PeerAdmission::Busy;
+            // A live connection holds the session. Same process (same instance) ⇒
+            // its previous connection is still tearing down: transient Busy. A
+            // different instance ⇒ a second live process with our key: Duplicate.
+            return if b.bound_instance == Some(instance_id) {
+                PeerAdmission::Busy
+            } else {
+                PeerAdmission::Duplicate
+            };
         }
         b.bound_id.get_or_insert_with(|| remote_id.to_string());
+        b.bound_instance = Some(instance_id);
         b.connected = true;
         PeerAdmission::Admitted
+    }
+
+    /// Dial role: record the listener's `instance_id` for this connection and report
+    /// whether it indicates a cloned listener identity. Returns `true` when a
+    /// previously-seen instance reappears after a different one (an A→B→A pattern the
+    /// relay produces while bouncing us between two live processes that share the
+    /// node id). A clean listener restart only moves forward, so it returns `false`.
+    pub fn observe_listener_instance(&self, instance_id: u128) -> bool {
+        let mut t = self.listener_instances.write();
+        let duplicate = t.prev.is_some_and(|prev| prev != instance_id) && t.seen.contains(&instance_id);
+        t.seen.insert(instance_id);
+        t.prev = Some(instance_id);
+        duplicate
     }
 
     /// Mark the live connection gone, keeping the sticky binding so the same peer
@@ -598,25 +649,61 @@ mod tests {
     #[test]
     fn session_binds_to_first_peer_and_stays_sticky() {
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        const A: u128 = 1; // peer-a's process instance id
+        const B: u128 = 2; // peer-b's process instance id
 
         // First peer to authenticate binds the session.
-        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Admitted);
+        assert_eq!(state.admit_peer("peer-a", A), PeerAdmission::Admitted);
         // A different node id is rejected as the wrong peer while bound.
-        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::WrongPeer);
-        // A second live connection from the same peer is transient-busy.
-        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Busy);
+        assert_eq!(state.admit_peer("peer-b", B), PeerAdmission::WrongPeer);
+        // A second live connection from the *same* process is transient-busy.
+        assert_eq!(state.admit_peer("peer-a", A), PeerAdmission::Busy);
 
         // The binding is sticky: even after the peer disconnects, a different node
         // id still cannot bind...
         state.disconnect_peer();
-        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::WrongPeer);
+        assert_eq!(state.admit_peer("peer-b", B), PeerAdmission::WrongPeer);
         // ...but the originally-bound peer may reconnect.
-        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Admitted);
+        assert_eq!(state.admit_peer("peer-a", A), PeerAdmission::Admitted);
 
         // Unbinding (TUI `u`) frees the session for a new node id once the current
         // connection ends.
         state.disconnect_peer();
         state.unbind_session();
-        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::Admitted);
+        assert_eq!(state.admit_peer("peer-b", B), PeerAdmission::Admitted);
+    }
+
+    #[test]
+    fn admit_peer_flags_cloned_identity() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        const ORIG: u128 = 10;
+        const CLONE: u128 = 11;
+
+        // Same node id binds the first live process.
+        assert_eq!(state.admit_peer("peer-a", ORIG), PeerAdmission::Admitted);
+        // A *different* process presenting the same node id while the original is
+        // still connected is a cloned identity key.
+        assert_eq!(state.admit_peer("peer-a", CLONE), PeerAdmission::Duplicate);
+        // Same process reconnecting (still connected) is just transient-busy.
+        assert_eq!(state.admit_peer("peer-a", ORIG), PeerAdmission::Busy);
+
+        // After the original disconnects, a new process may legitimately take over
+        // (e.g. a restart): not flagged as duplicate.
+        state.disconnect_peer();
+        assert_eq!(state.admit_peer("peer-a", CLONE), PeerAdmission::Admitted);
+    }
+
+    #[test]
+    fn observe_listener_instance_detects_alternation() {
+        let state = AppState::new(Role::Dial, false, LogBuffer::new(16), vec![]);
+        // First connection: a new listener instance — fine.
+        assert!(!state.observe_listener_instance(100));
+        // Reconnect to the same listener — fine.
+        assert!(!state.observe_listener_instance(100));
+        // A clean listener restart moves forward to a new instance — fine.
+        assert!(!state.observe_listener_instance(200));
+        // The old instance reappearing (A→B→A) means two live listeners share the
+        // node id — flagged as a duplicate.
+        assert!(state.observe_listener_instance(100));
     }
 }

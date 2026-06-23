@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -46,10 +47,12 @@ use crate::iroh_mode::helpers::{
     bridge_streams, forward_stream_to_udp_client, forward_stream_to_udp_server,
     forward_udp_to_stream, open_bi_with_retry,
 };
+use crate::identity::self_instance_id;
 use crate::signaling::{
-    AuthRequest, AuthResponse, StreamAck, StreamHello, decode_auth_request, decode_auth_response,
-    decode_stream_ack, decode_stream_hello, encode_auth_request, encode_auth_response,
-    encode_stream_ack, encode_stream_hello, read_length_prefixed,
+    AuthRequest, AuthResponse, ControlMsg, StreamAck, StreamHello, decode_auth_request,
+    decode_auth_response, decode_control_msg, decode_stream_ack, decode_stream_hello,
+    encode_auth_request, encode_auth_response, encode_control_msg, encode_stream_ack,
+    encode_stream_hello, read_length_prefixed,
 };
 
 /// Default maximum concurrent forwarded streams across all tunnels in the session.
@@ -81,9 +84,29 @@ const PEER_BUSY_CODE: u32 = 3;
 /// until the listener unbinds or restarts, so retrying can never succeed.
 const WRONG_PEER_CODE: u32 = 4;
 
+/// Connection close code for a peer rejected (or torn down) because another
+/// process is using the same node id — a cloned identity key. Fatal for the
+/// dialer that receives it: it hard-aborts rather than reconnecting, since a
+/// second live process sharing its key makes routing unreliable.
+const DUPLICATE_INSTANCE_CODE: u32 = 5;
+
+/// Connection close code used by the liveness heartbeat when the peer stops
+/// responding. Non-fatal: the dialer reconnects, the listener frees the session.
+const HEARTBEAT_DEAD_CODE: u32 = 6;
+
 /// Connection close code for a clean local shutdown (Ctrl-C). "No error" by
 /// convention; the peer just sees the connection go away.
 const SHUTDOWN_CODE: u32 = 0;
+
+/// Interval between liveness heartbeat pings (dialer → listener).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long the dialer waits for a Pong before declaring the connection dead.
+const HEARTBEAT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the listener waits for a Ping before declaring the connection dead.
+/// Larger than the interval so a couple of dropped pings don't trip it.
+const HEARTBEAT_PING_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Maximum reconnect backoff for the dialing peer.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
@@ -103,6 +126,10 @@ pub struct PeerConfig {
     /// The shared auth token (presented when dialing, required when listening).
     /// **Sensitive - redacted in Debug.**
     pub auth_token: String,
+    /// Optional persisted iroh identity. `Some` ⇒ stable node id (from a config
+    /// `identity_file` or the `DUOPIPE_SECRET_KEY` test var); `None` ⇒ ephemeral
+    /// identity (a fresh node id every run). **Sensitive - redacted in Debug.**
+    pub secret_key: Option<iroh::SecretKey>,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -129,6 +156,10 @@ impl std::fmt::Debug for PeerConfig {
             .field("allowed_sources", &self.allowed_sources)
             .field("autostart_requests", &self.autostart_requests)
             .field("auth_token", &"[REDACTED]")
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
@@ -165,7 +196,7 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     let endpoint = create_server_endpoint(
         &config.relay_urls,
         config.relay_only,
-        None,
+        config.secret_key.clone(),
         config.dns_server.as_deref(),
         ALPN,
         Some(&config.transport),
@@ -243,7 +274,7 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
         &config.relay_urls,
         config.relay_only,
         config.dns_server.as_deref(),
-        None,
+        config.secret_key.as_ref(),
         Some(&config.transport),
     )
     .await?;
@@ -275,14 +306,21 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
                 match handle_connection(conn, config.clone(), true).await {
                     Ok(()) => log::info!("Connection closed; will reconnect"),
                     Err(e) => {
-                        // Auth failures (bad token) and rejections (the listener's
-                        // session is bound to a different node id) are fatal —
-                        // reconnecting can't succeed: a bad token stays bad, and a
-                        // wrong-peer rejection won't change until the listener
-                        // unbinds or restarts. (A transient peer-busy close is NOT
-                        // surfaced as an error, so it falls through to a retry.)
+                        // Auth failures (bad token), wrong-peer rejections (the
+                        // listener's session is bound to a different node id), and
+                        // duplicate-identity detections are fatal — reconnecting
+                        // can't succeed: a bad token stays bad, a wrong-peer
+                        // rejection won't change until the listener unbinds or
+                        // restarts, and a live duplicate keeps colliding on our key.
+                        // (A transient peer-busy close is NOT surfaced as an error,
+                        // so it falls through to a retry.)
                         if e.downcast_ref::<TunnelError>().is_some_and(|te| {
-                            matches!(te.category, ErrorCategory::Auth | ErrorCategory::Rejected)
+                            matches!(
+                                te.category,
+                                ErrorCategory::Auth
+                                    | ErrorCategory::Rejected
+                                    | ErrorCategory::Duplicate
+                            )
                         }) {
                             endpoint.close().await;
                             return Err(e);
@@ -320,19 +358,38 @@ async fn handle_connection(
 ) -> Result<()> {
     let remote_id = conn.remote_id();
 
-    // Phase 1: authenticate.
+    // Phase 1: authenticate. Each side learns the other's per-process `instance_id`
+    // (a nonce independent of the node id), which is how a cloned identity key —
+    // two processes with the same node id — is told apart from one process
+    // reconnecting.
+    let peer_instance: u128;
     if is_dialer {
         config.status.set_conn_status(ConnStatus::Authenticating);
-        auth_as_dialer(&conn, &config.auth_token).await?;
+        peer_instance = auth_as_dialer(&conn, &config.auth_token).await?;
+        // A cloned *listener* identity shows up as the listener's instance_id
+        // alternating across reconnects (the relay routes us to whichever clone
+        // holds the home slot). A clean listener restart only ever moves forward,
+        // so a *reappearing* instance is the unambiguous duplicate signal.
+        if config.status.observe_listener_instance(peer_instance) {
+            log::error!(
+                "Duplicate node id detected: another process is using the listener's identity \
+                 (instance id alternated). Aborting."
+            );
+            conn.close(DUPLICATE_INSTANCE_CODE.into(), b"duplicate_instance");
+            return Err(TunnelError::duplicate(anyhow::anyhow!(
+                "duplicate node id: another process is using the peer's identity key"
+            ))
+            .into());
+        }
         config.status.set_conn_status(ConnStatus::Connected);
     } else {
         let accepted: HashSet<String> = std::iter::once(config.auth_token.clone()).collect();
-        auth_as_listener(&conn, &accepted).await?;
+        peer_instance = auth_as_listener(&conn, &accepted).await?;
         // Single sticky session: the first peer to authenticate binds it for the
         // program's lifetime. A second authenticated connection would otherwise
         // duplicate every tunnel bind (the supervisors share one broadcast channel)
         // and reseed the shared tunnel table to Idle.
-        match config.status.admit_peer(&remote_id.to_string()) {
+        match config.status.admit_peer(&remote_id.to_string(), peer_instance) {
             PeerAdmission::Admitted => {
                 config.status.add_peer(remote_id.to_string());
                 log::info!("Peer {} authenticated and bound to the session", remote_id);
@@ -353,6 +410,18 @@ async fn handle_connection(
                 conn.close(WRONG_PEER_CODE.into(), b"wrong_peer");
                 return Ok(());
             }
+            PeerAdmission::Duplicate => {
+                // Same node id, but a *different* live process than the one bound:
+                // a cloned identity key. Refuse this connection with a fatal code so
+                // the clone aborts; this (innocent) listener keeps serving the peer
+                // that is already bound.
+                log::error!(
+                    "Rejecting {}: another live process is using this node id (cloned identity key)",
+                    remote_id
+                );
+                conn.close(DUPLICATE_INSTANCE_CODE.into(), b"duplicate_instance");
+                return Ok(());
+            }
         }
     }
 
@@ -369,16 +438,28 @@ async fn handle_connection(
     // burst sent below cannot race ahead of the subscription.
     let command_rx = config.status.subscribe_commands();
 
+    // Set when a heartbeat task observes the peer's instance_id change mid-
+    // connection (a cloned identity). The post-close check below turns this into a
+    // fatal abort even though the close was initiated locally.
+    let duplicate = Arc::new(AtomicBool::new(false));
+    let control = ControlCtx {
+        self_instance: self_instance_id(),
+        peer_instance,
+        duplicate: duplicate.clone(),
+    };
+
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     // (a) Accept incoming requests from the peer: for each, gate the requested
-    //     source against our allowed_sources allowlist, then connect out.
+    //     source against our allowed_sources allowlist, then connect out. The
+    //     liveness control stream (opened by the dialer) also arrives here.
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
         let allowed_sources = Arc::new(config.allowed_sources.clone());
+        let control = control.clone();
         tasks.spawn(async move {
-            if let Err(e) = accept_loop(conn, semaphore, allowed_sources).await {
+            if let Err(e) = accept_loop(conn, semaphore, allowed_sources, control).await {
                 log::debug!("Accept loop ended: {}", e);
             }
         });
@@ -391,6 +472,21 @@ async fn handle_connection(
         let status = config.status.clone();
         tasks.spawn(async move {
             request_supervisor(conn, semaphore, status, command_rx).await;
+        });
+    }
+
+    // (c) Liveness heartbeat. The dialer opens the control stream and pings; the
+    //     listener responds via the accept loop (a). Either side detecting silence
+    //     tears the connection down fast (faster than the QUIC idle timeout), which
+    //     also keeps the listener's session-bound flag accurate for duplicate
+    //     detection.
+    if is_dialer {
+        let conn = conn.clone();
+        let control = control.clone();
+        tasks.spawn(async move {
+            if let Err(e) = heartbeat_pinger(conn, control).await {
+                log::debug!("Heartbeat pinger ended: {}", e);
+            }
         });
     }
 
@@ -424,6 +520,17 @@ async fn handle_connection(
     }
     tasks.shutdown().await;
 
+    // A duplicate node id is fatal for the dialer: either we detected the peer's
+    // instance_id change locally (`duplicate` flag), or the peer (listener) closed
+    // us out with the duplicate code. Reconnecting cannot help — a second live
+    // process is using our key — so hard-abort with a clear error.
+    if is_dialer && (duplicate.load(Ordering::Relaxed) || is_duplicate_close(&reason)) {
+        return Err(TunnelError::duplicate(anyhow::anyhow!(
+            "duplicate node id: another process is using this identity key (set a unique identity_file per host)"
+        ))
+        .into());
+    }
+
     // A dialer rejected because the listener's session is bound to a *different*
     // node id must NOT reconnect: its node id won't match until the listener
     // unbinds or restarts, so retrying can never succeed. Surface it as a fatal
@@ -446,6 +553,16 @@ fn is_wrong_peer_close(reason: &ConnectionError) -> bool {
         reason,
         ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
             if u64::from(*error_code) == WRONG_PEER_CODE as u64
+    )
+}
+
+/// Whether `reason` is the peer closing us out because another live process is
+/// using our node id (application close with [`DUPLICATE_INSTANCE_CODE`]).
+fn is_duplicate_close(reason: &ConnectionError) -> bool {
+    matches!(
+        reason,
+        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+            if u64::from(*error_code) == DUPLICATE_INSTANCE_CODE as u64
     )
 }
 
@@ -522,10 +639,12 @@ async fn request_supervisor(
 // Authentication
 // ============================================================================
 
-async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<()> {
+/// Authenticate as the dialer. Returns the *listener's* `instance_id` so the
+/// caller can detect a cloned listener identity across reconnects.
+async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<u128> {
     let (mut send, mut recv) = open_bi_with_retry(conn).await?;
 
-    let request = AuthRequest::new(auth_token);
+    let request = AuthRequest::new(auth_token, self_instance_id());
     send.write_all(&encode_auth_request(&request)?).await?;
     send.finish()?;
 
@@ -543,13 +662,15 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
     }
 
     log::info!("Authenticated with peer successfully");
-    Ok(())
+    Ok(response.instance_id)
 }
 
+/// Authenticate as the listener. Returns the *dialer's* `instance_id` so the
+/// caller can bind the session to a specific process and reject a clone.
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
     auth_tokens: &HashSet<String>,
-) -> Result<()> {
+) -> Result<u128> {
     let remote_id = conn.remote_id();
 
     let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
@@ -565,21 +686,21 @@ async fn auth_as_listener(
 
         if !is_token_valid(request.auth_token.as_str(), auth_tokens) {
             log::warn!("Invalid auth token from {}", remote_id);
-            let response = AuthResponse::rejected("Invalid authentication token");
+            let response = AuthResponse::rejected("Invalid authentication token", self_instance_id());
             send.write_all(&encode_auth_response(&response)?).await?;
             send.finish()?;
             anyhow::bail!("Invalid auth token");
         }
 
-        let response = AuthResponse::accepted();
+        let response = AuthResponse::accepted(self_instance_id());
         send.write_all(&encode_auth_response(&response)?).await?;
         send.finish()?;
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(request.instance_id)
     })
     .await;
 
     match auth_result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(instance_id)) => Ok(instance_id),
         Ok(Err(e)) => {
             conn.close(AUTH_FAILED_CODE.into(), b"auth_failed");
             Err(TunnelError::auth(anyhow::anyhow!("auth_failed: {}", e)).into())
@@ -596,10 +717,25 @@ async fn auth_as_listener(
 // Accept loop (acceptor / connect side)
 // ============================================================================
 
+/// Per-connection liveness/identity context shared with the accept loop and the
+/// heartbeat tasks. Cheap to clone (the only owned field is an `Arc`).
+#[derive(Clone)]
+struct ControlCtx {
+    /// This process's instance id (sent in our pings/pongs).
+    self_instance: u128,
+    /// The peer's instance id learned at handshake; a control message bearing a
+    /// different one means the peer's identity changed mid-connection.
+    peer_instance: u128,
+    /// Set when a duplicate identity is detected, so `handle_connection` can turn
+    /// a locally-initiated close into a fatal abort.
+    duplicate: Arc<AtomicBool>,
+}
+
 async fn accept_loop(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
     allowed_sources: Arc<AllowedSources>,
+    control: ControlCtx,
 ) -> Result<()> {
     let mut stream_tasks: JoinSet<()> = JoinSet::new();
 
@@ -611,8 +747,12 @@ async fn accept_loop(
 
         let semaphore = semaphore.clone();
         let allowed_sources = allowed_sources.clone();
+        let conn = conn.clone();
+        let control = control.clone();
         stream_tasks.spawn(async move {
-            if let Err(e) = handle_incoming_stream(send, recv, semaphore, allowed_sources).await {
+            if let Err(e) =
+                handle_incoming_stream(conn, send, recv, semaphore, allowed_sources, control).await
+            {
                 log::warn!("Stream error: {}", e);
             }
         });
@@ -622,10 +762,12 @@ async fn accept_loop(
 }
 
 async fn handle_incoming_stream(
+    conn: Arc<iroh::endpoint::Connection>,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     semaphore: Arc<Semaphore>,
     allowed_sources: Arc<AllowedSources>,
+    control: ControlCtx,
 ) -> Result<()> {
     let hello_bytes = tokio::time::timeout(HELLO_TIMEOUT, read_length_prefixed(&mut recv))
         .await
@@ -654,6 +796,93 @@ async fn handle_incoming_stream(
             };
             let _permit = permit;
             connect_side(send, recv, &source).await
+        }
+        StreamHello::Control { .. } => heartbeat_responder(conn, send, recv, control).await,
+    }
+}
+
+// ============================================================================
+// Liveness heartbeat
+// ============================================================================
+
+/// Dialer side: open the control stream, then ping on an interval and require a
+/// matching pong each time. A missed pong tears the connection down (the dialer
+/// reconnects); a pong bearing a different `instance_id` means the listener's
+/// identity changed under us (a clone) — flag it and close fatally.
+async fn heartbeat_pinger(
+    conn: Arc<iroh::endpoint::Connection>,
+    control: ControlCtx,
+) -> Result<()> {
+    let (mut send, mut recv) = open_bi_with_retry(&conn).await?;
+    send.write_all(&encode_stream_hello(&StreamHello::control())?)
+        .await?;
+
+    let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut seq: u64 = 0;
+    loop {
+        ticker.tick().await;
+        seq += 1;
+        if send
+            .write_all(&encode_control_msg(&ControlMsg::ping(seq, control.self_instance))?)
+            .await
+            .is_err()
+        {
+            // Send side gone: connection is closing; let conn.closed() drive teardown.
+            return Ok(());
+        }
+
+        let pong_bytes =
+            match tokio::time::timeout(HEARTBEAT_PONG_TIMEOUT, read_length_prefixed(&mut recv)).await
+            {
+                Ok(Ok(b)) => b,
+                Ok(Err(_)) => return Ok(()), // stream closed
+                Err(_) => {
+                    log::warn!("Heartbeat: no pong within {HEARTBEAT_PONG_TIMEOUT:?}; closing dead connection");
+                    conn.close(HEARTBEAT_DEAD_CODE.into(), b"heartbeat_timeout");
+                    return Ok(());
+                }
+            };
+        let pong = decode_control_msg(&pong_bytes).context("Invalid heartbeat pong")?;
+        if pong.instance_id() != control.peer_instance {
+            log::error!("Heartbeat: peer instance id changed mid-connection (cloned identity)");
+            control.duplicate.store(true, Ordering::Relaxed);
+            conn.close(DUPLICATE_INSTANCE_CODE.into(), b"duplicate_instance");
+            return Ok(());
+        }
+    }
+}
+
+/// Listener side: answer pings with pongs and verify the peer's `instance_id`
+/// stays put. Silence beyond [`HEARTBEAT_PING_TIMEOUT`] closes the connection so
+/// the bound session is freed promptly.
+async fn heartbeat_responder(
+    conn: Arc<iroh::endpoint::Connection>,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    control: ControlCtx,
+) -> Result<()> {
+    loop {
+        let ping_bytes =
+            match tokio::time::timeout(HEARTBEAT_PING_TIMEOUT, read_length_prefixed(&mut recv)).await
+            {
+                Ok(Ok(b)) => b,
+                Ok(Err(_)) => return Ok(()), // stream closed
+                Err(_) => {
+                    log::warn!("Heartbeat: no ping within {HEARTBEAT_PING_TIMEOUT:?}; closing dead connection");
+                    conn.close(HEARTBEAT_DEAD_CODE.into(), b"heartbeat_timeout");
+                    return Ok(());
+                }
+            };
+        let msg = decode_control_msg(&ping_bytes).context("Invalid heartbeat ping")?;
+        if msg.instance_id() != control.peer_instance {
+            log::error!("Heartbeat: peer instance id changed mid-connection (cloned identity)");
+            control.duplicate.store(true, Ordering::Relaxed);
+            conn.close(DUPLICATE_INSTANCE_CODE.into(), b"duplicate_instance");
+            return Ok(());
+        }
+        if let ControlMsg::Ping { seq, .. } = msg {
+            send.write_all(&encode_control_msg(&ControlMsg::pong(seq, control.self_instance))?)
+                .await?;
         }
     }
 }
@@ -932,6 +1161,7 @@ mod tests {
             allowed_sources: AllowedSources::default(),
             autostart_requests: false,
             auth_token: token.to_string(),
+            secret_key: None,
             relay_urls: vec![],
             relay_only: false,
             dns_server: Some("none".to_string()),
@@ -1019,6 +1249,83 @@ mod tests {
         );
 
         server_task.abort();
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// The liveness heartbeat must flag a duplicate identity and tear the
+    /// connection down when a control message arrives bearing a different
+    /// `instance_id` than the one learned at handshake. This exercises the wire
+    /// path (`StreamHello::Control` + `ControlMsg`) and the responder's reaction;
+    /// the cross-process case (two real processes sharing a node id) is exercised
+    /// manually via `DUOPIPE_SECRET_KEY`.
+    #[tokio::test]
+    async fn heartbeat_flags_instance_id_mismatch() {
+        const EXPECTED_PEER: u128 = 0xAAAA_AAAA;
+        const WRONG_PEER: u128 = 0xBBBB_BBBB;
+
+        let server_ep = hermetic_endpoint().await;
+        let client_ep = hermetic_endpoint().await;
+
+        let server_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server_ep.addr();
+                if addr.ip_addrs().next().is_some() {
+                    break addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server direct address ready");
+
+        let duplicate = Arc::new(AtomicBool::new(false));
+
+        // Server: accept the control stream and run the responder expecting
+        // EXPECTED_PEER. It should see the WRONG_PEER ping and flag a duplicate.
+        let server_ep2 = server_ep.clone();
+        let duplicate2 = duplicate.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = Arc::new(incoming.await.expect("accept connection"));
+            let (send, mut recv) = conn.accept_bi().await.expect("accept control stream");
+            // Consume the leading StreamHello as handle_incoming_stream would.
+            let hello = read_length_prefixed(&mut recv).await.expect("read hello");
+            assert!(matches!(
+                decode_stream_hello(&hello).unwrap(),
+                StreamHello::Control { .. }
+            ));
+            let control = ControlCtx {
+                self_instance: 1,
+                peer_instance: EXPECTED_PEER,
+                duplicate: duplicate2,
+            };
+            let _ = heartbeat_responder(conn.clone(), send, recv, control).await;
+        });
+
+        // Client: open the control stream and send a ping with the wrong instance.
+        let conn = client_ep
+            .connect(server_addr, ALPN)
+            .await
+            .expect("dial connect");
+        let (mut send, _recv) = conn.open_bi().await.expect("open control stream");
+        send.write_all(&encode_stream_hello(&StreamHello::control()).unwrap())
+            .await
+            .expect("write hello");
+        send.write_all(&encode_control_msg(&ControlMsg::ping(1, WRONG_PEER)).unwrap())
+            .await
+            .expect("write ping");
+
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("responder hung")
+            .expect("responder task panicked");
+
+        assert!(
+            duplicate.load(Ordering::Relaxed),
+            "responder must flag a duplicate on instance_id mismatch"
+        );
+
         client_ep.close().await;
         server_ep.close().await;
     }
