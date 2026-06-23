@@ -842,11 +842,26 @@ async fn heartbeat_pinger(
                     return Ok(());
                 }
             };
-        let pong = decode_control_msg(&pong_bytes).context("Invalid heartbeat pong")?;
+        // Fail closed on a malformed or unexpected message rather than leaving the
+        // connection up without an active heartbeat: tear it down so the dialer
+        // reconnects promptly.
+        let pong = match decode_control_msg(&pong_bytes) {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::warn!("Heartbeat: malformed pong ({e:#}); closing connection");
+                conn.close(HEARTBEAT_DEAD_CODE.into(), b"bad_heartbeat");
+                return Ok(());
+            }
+        };
         if pong.instance_id() != control.peer_instance {
             log::error!("Heartbeat: peer instance id changed mid-connection (cloned identity)");
             control.duplicate.store(true, Ordering::Relaxed);
             conn.close(DUPLICATE_INSTANCE_CODE.into(), b"duplicate_instance");
+            return Ok(());
+        }
+        if !matches!(pong, ControlMsg::Pong { .. }) {
+            log::warn!("Heartbeat: expected a Pong but got another control message; closing connection");
+            conn.close(HEARTBEAT_DEAD_CODE.into(), b"bad_heartbeat");
             return Ok(());
         }
     }
@@ -873,16 +888,33 @@ async fn heartbeat_responder(
                     return Ok(());
                 }
             };
-        let msg = decode_control_msg(&ping_bytes).context("Invalid heartbeat ping")?;
+        // Fail closed on a malformed message: tear the connection down so the bound
+        // session is freed rather than lingering without an active heartbeat.
+        let msg = match decode_control_msg(&ping_bytes) {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::warn!("Heartbeat: malformed ping ({e:#}); closing connection");
+                conn.close(HEARTBEAT_DEAD_CODE.into(), b"bad_heartbeat");
+                return Ok(());
+            }
+        };
         if msg.instance_id() != control.peer_instance {
             log::error!("Heartbeat: peer instance id changed mid-connection (cloned identity)");
             control.duplicate.store(true, Ordering::Relaxed);
             conn.close(DUPLICATE_INSTANCE_CODE.into(), b"duplicate_instance");
             return Ok(());
         }
-        if let ControlMsg::Ping { seq, .. } = msg {
-            send.write_all(&encode_control_msg(&ControlMsg::pong(seq, control.self_instance))?)
-                .await?;
+        match msg {
+            ControlMsg::Ping { seq, .. } => {
+                send.write_all(&encode_control_msg(&ControlMsg::pong(seq, control.self_instance))?)
+                    .await?;
+            }
+            // The dialer only ever pings; a Pong here is a protocol violation.
+            ControlMsg::Pong { .. } => {
+                log::warn!("Heartbeat: responder received an unexpected Pong; closing connection");
+                conn.close(HEARTBEAT_DEAD_CODE.into(), b"bad_heartbeat");
+                return Ok(());
+            }
         }
     }
 }
@@ -1326,6 +1358,85 @@ mod tests {
             "responder must flag a duplicate on instance_id mismatch"
         );
 
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// Fail-closed: a control message of the wrong variant (a Pong reaching the
+    /// responder, which only ever receives Pings) is a protocol violation and must
+    /// tear the connection down — not be silently accepted — even when its
+    /// instance_id is correct (so it is not a duplicate).
+    #[tokio::test]
+    async fn heartbeat_responder_closes_on_wrong_variant() {
+        const PEER: u128 = 0xCCCC_CCCC;
+
+        let server_ep = hermetic_endpoint().await;
+        let client_ep = hermetic_endpoint().await;
+
+        let server_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server_ep.addr();
+                if addr.ip_addrs().next().is_some() {
+                    break addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server direct address ready");
+
+        let duplicate = Arc::new(AtomicBool::new(false));
+        let server_ep2 = server_ep.clone();
+        let duplicate2 = duplicate.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = Arc::new(incoming.await.expect("accept connection"));
+            let (send, mut recv) = conn.accept_bi().await.expect("accept control stream");
+            let hello = read_length_prefixed(&mut recv).await.expect("read hello");
+            assert!(matches!(
+                decode_stream_hello(&hello).unwrap(),
+                StreamHello::Control { .. }
+            ));
+            let control = ControlCtx {
+                self_instance: 1,
+                peer_instance: PEER,
+                duplicate: duplicate2,
+            };
+            let _ = heartbeat_responder(conn.clone(), send, recv, control).await;
+        });
+
+        // Client sends a Pong (wrong variant for the responder) with the correct
+        // instance id, so the only reason to reject it is the variant check.
+        let conn = client_ep
+            .connect(server_addr, ALPN)
+            .await
+            .expect("dial connect");
+        let (mut send, _recv) = conn.open_bi().await.expect("open control stream");
+        send.write_all(&encode_stream_hello(&StreamHello::control()).unwrap())
+            .await
+            .expect("write hello");
+        send.write_all(&encode_control_msg(&ControlMsg::pong(1, PEER)).unwrap())
+            .await
+            .expect("write pong");
+
+        // The responder must tear the connection down; the client sees it close.
+        let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("connection was not closed on wrong-variant heartbeat");
+        assert!(
+            matches!(
+                reason,
+                ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
+                    if u64::from(error_code) == HEARTBEAT_DEAD_CODE as u64
+            ),
+            "expected HEARTBEAT_DEAD_CODE close, got {reason:?}"
+        );
+        assert!(
+            !duplicate.load(Ordering::Relaxed),
+            "a wrong-variant message is not a duplicate"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
         client_ep.close().await;
         server_ep.close().await;
     }
