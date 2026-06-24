@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::{
-    AppState, ConnStatus, DialCommand, DialTarget, Role, TunnelCommand, TunnelId, TunnelStatus,
+    AppState, ConnStatus, DialCommand, DialTarget, NameCommand, NameConflict, Role, TunnelCommand,
+    TunnelId, TunnelStatus,
 };
 use crate::auth::is_token_valid;
 use crate::config::{AllowedSources, RequestEntry, TransportTuning};
@@ -133,6 +135,9 @@ pub struct PeerConfig {
     /// stderr so a test harness can wire up the dialing side. The interactive TUI
     /// shows them in its header instead and leaves this false.
     pub announce_endpoint: bool,
+    /// Path to the loaded peer config file (nostr mode), used to append a rename nudge
+    /// when the user resolves a name conflict. `None` in quick/headless modes.
+    pub config_path: Option<PathBuf>,
     /// Shared state surfaced by the TUI.
     pub status: Arc<AppState>,
 }
@@ -155,6 +160,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("max_streams", &self.max_streams)
             .field("transport", &self.transport)
             .field("announce_endpoint", &self.announce_endpoint)
+            .field("config_path", &self.config_path)
             .field("status", &"<present>")
             .finish()
     }
@@ -481,13 +487,18 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
     // exchange. Runs in the background and republishes periodically; relay failures
     // are logged but non-fatal (peers who already have the node id still connect).
     let _publisher = match (config.nostr_discovery, config.nostr_identifier.clone()) {
-        (true, Some(identifier)) => Some(spawn_node_id_publisher(
-            config.auth_token.clone(),
+        (true, Some(identifier)) => Some(spawn_node_id_publisher(PublisherParams {
+            auth_token: config.auth_token.clone(),
             identifier,
-            endpoint_id,
-            config.nostr_relays.clone(),
-            config.status.shutdown.clone(),
-        )),
+            node_id: endpoint_id,
+            relays: config.nostr_relays.clone(),
+            shutdown: config.status.shutdown.clone(),
+            state: config.status.clone(),
+            // The interactive TUI can prompt; headless test mode (announce_endpoint)
+            // cannot, so it degrades silently instead of blocking.
+            interactive: !config.announce_endpoint,
+            config_path: config.config_path.clone(),
+        })),
         _ => None,
     };
 
@@ -544,33 +555,248 @@ impl Drop for PublisherGuard {
     }
 }
 
-/// Interval between node-id republishes. Replaceable nostr events can be dropped by
-/// relays at varying times, so we refresh periodically while listening.
+/// Steady-state interval between node-id republishes. Replaceable nostr events can be
+/// dropped by relays at varying times, so we refresh periodically while listening. The
+/// same loop re-checks for a name conflict each cycle (conflict detection happens only
+/// at these nostr touch-points — there is no separate monitor).
 const NODE_ID_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Spawn a task that publishes our ephemeral node id to nostr now, then refreshes
-/// it every [`NODE_ID_REPUBLISH_INTERVAL`] until shutdown.
-fn spawn_node_id_publisher(
+/// Interval for the initial conflict-detection burst. Startup deliberately does no
+/// nostr lookup (so a sole device's restart, whose own stale relay record carries a
+/// different ephemeral node id, is never a false conflict). That means a second device
+/// launched against a live name would otherwise go unnoticed until the first 300s
+/// republish. To detect it promptly we re-check a few times soon after the initial
+/// claim: each re-check publishes first, so it still sees our *own* fresh record when
+/// there is no competitor (no false positive) and a foreign newer record when there is.
+const STARTUP_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Number of publish cycles that use [`STARTUP_RECHECK_INTERVAL`] before settling into
+/// [`NODE_ID_REPUBLISH_INTERVAL`]. Bounds the fast phase to ~1 minute after launch so
+/// steady state remains the slow, "no continuous monitoring" cadence.
+const STARTUP_RECHECK_CYCLES: u32 = 6;
+
+/// Short prefix of a node id for human-readable conflict messages.
+fn short_node_id(id: &str) -> String {
+    id.chars().take(12).collect::<String>() + "…"
+}
+
+/// Inputs for the node-id publisher task.
+struct PublisherParams {
     auth_token: String,
     identifier: String,
     node_id: EndpointId,
     relays: Vec<String>,
     shutdown: CancellationToken,
-) -> PublisherGuard {
-    PublisherGuard(tokio::spawn(async move {
-        loop {
-            match crate::nostr_discovery::publish_node_id(&auth_token, &identifier, &node_id, &relays)
-                .await
-            {
-                Ok(()) => log::info!("Published node id to nostr for peer discovery"),
-                Err(e) => log::warn!("Failed to publish node id to nostr: {e:#}"),
+    state: Arc<AppState>,
+    /// Whether a TUI is present to prompt the user (false in headless test mode).
+    interactive: bool,
+    /// Loaded config path, for the rename nudge. `None` ⇒ rename only logs.
+    config_path: Option<PathBuf>,
+}
+
+/// What the per-cycle conflict check decided.
+enum CheckOutcome {
+    /// No conflict — go ahead and (re)publish.
+    Publish,
+    /// Another device holds the name; carries its node id for the prompt.
+    Conflict { other_node_id: String },
+}
+
+/// Spawn the node-id publisher: claim/refresh this peer's name on nostr while
+/// resolving conflicts with other devices using the same name.
+///
+/// Detection uses no stored identifier (which could be duplicated by an accidental
+/// clone): a mid-session conflict is simply the relay's current node id differing from
+/// *our own* ephemeral node id, and a startup conflict is a local flag file left when
+/// this device previously lost the name. On a conflict the publisher stops publishing,
+/// writes the flag, and (interactively) prompts the user to take over, rename, or
+/// decline — quitting at startup or degrading to serve-only mid-session.
+fn spawn_node_id_publisher(params: PublisherParams) -> PublisherGuard {
+    PublisherGuard(tokio::spawn(run_node_id_publisher(params)))
+}
+
+async fn run_node_id_publisher(params: PublisherParams) {
+    let PublisherParams {
+        auth_token,
+        identifier,
+        node_id,
+        relays,
+        shutdown,
+        state,
+        interactive,
+        config_path,
+    } = params;
+
+    let mut commands = state.subscribe_name();
+    let mut first = true;
+    // Count of completed publishes; the first few cycles re-check quickly (see
+    // STARTUP_RECHECK_CYCLES) so a same-name conflict surfaces without waiting a full
+    // republish interval.
+    let mut publishes: u32 = 0;
+
+    loop {
+        // Decide whether this cycle can publish. Startup keys off the local flag (never
+        // the relay record, so a fresh node id each run is not a false conflict);
+        // subsequent cycles compare the relay's node id against our own.
+        let outcome = if first {
+            match crate::peer_state::read_flag(&identifier) {
+                Some(flag) => CheckOutcome::Conflict {
+                    other_node_id: flag.other_node_id,
+                },
+                None => CheckOutcome::Publish,
             }
-            tokio::select! {
+        } else {
+            match crate::nostr_discovery::lookup_node_id_opt(&auth_token, &identifier, &relays).await
+            {
+                // A live competitor overwrote our record with a different node id.
+                Ok(Some(id)) if id != node_id => CheckOutcome::Conflict {
+                    other_node_id: id.to_string(),
+                },
+                // Our own record, no record, or a network error: can't prove a
+                // conflict, so just (re)publish.
+                _ => CheckOutcome::Publish,
+            }
+        };
+
+        if let CheckOutcome::Conflict { other_node_id } = outcome {
+            let at_startup = first;
+            // Stop publishing and remember the conflict so it survives a restart.
+            if let Err(e) = crate::peer_state::write_flag(&identifier, &other_node_id) {
+                log::warn!("Could not write name-conflict flag: {e}");
+            }
+
+            if !interactive {
+                // No TUI to prompt: degrade to serve-only.
+                let msg = format!(
+                    "nostr name '{}' is in use by another device ({}); not publishing (serving only).",
+                    identifier,
+                    short_node_id(&other_node_id)
+                );
+                log::warn!("{msg}");
+                state.set_name_conflict(NameConflict::Degraded { message: msg });
+                break;
+            }
+
+            state.set_name_conflict(NameConflict::Prompt {
+                message: conflict_prompt_message(&identifier, &other_node_id, at_startup),
+            });
+
+            // Discard any decisions buffered before this prompt so a stale keypress
+            // can't auto-resolve a later conflict.
+            while commands.try_recv().is_ok() {}
+
+            let cmd = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(NODE_ID_REPUBLISH_INTERVAL) => {}
+                r = commands.recv() => match r {
+                    Ok(c) => c,
+                    // Sender dropped: nothing more can decide this; stop publishing.
+                    Err(_) => break,
+                },
+            };
+
+            match cmd {
+                NameCommand::TakeOver => {
+                    if let Err(e) = crate::peer_state::clear_flag(&identifier) {
+                        log::warn!("Could not clear name-conflict flag: {e}");
+                    }
+                    state.clear_name_conflict();
+                    log::info!("Taking over nostr name '{identifier}'.");
+                    // Fall through to publish below.
+                }
+                NameCommand::Rename => {
+                    nudge_rename(&config_path, &identifier);
+                    if at_startup {
+                        log::warn!(
+                            "Name '{identifier}' is in use; quitting (rename it in the config and restart)."
+                        );
+                        shutdown.cancel();
+                        break;
+                    }
+                    state.set_name_conflict(NameConflict::Degraded {
+                        message: degraded_message(&identifier, true),
+                    });
+                    break;
+                }
+                NameCommand::Decline => {
+                    if at_startup {
+                        log::warn!("Name '{identifier}' is in use; quitting.");
+                        shutdown.cancel();
+                        break;
+                    }
+                    state.set_name_conflict(NameConflict::Degraded {
+                        message: degraded_message(&identifier, false),
+                    });
+                    break;
+                }
             }
         }
-    }))
+
+        // Publish (claim or refresh) our node id under the name.
+        match crate::nostr_discovery::publish_node_id(&auth_token, &identifier, &node_id, &relays)
+            .await
+        {
+            Ok(()) => log::info!("Published node id to nostr for peer discovery"),
+            Err(e) => log::warn!("Failed to publish node id to nostr: {e:#}"),
+        }
+        state.set_name_conflict(NameConflict::Inactive);
+        first = false;
+        publishes = publishes.saturating_add(1);
+
+        // Re-check quickly for the first few cycles, then settle to the slow cadence.
+        let interval = if publishes <= STARTUP_RECHECK_CYCLES {
+            STARTUP_RECHECK_INTERVAL
+        } else {
+            NODE_ID_REPUBLISH_INTERVAL
+        };
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Build the conflict-prompt body shown in the TUI, including the consequence of each
+/// choice (which differs at startup vs mid-session).
+fn conflict_prompt_message(identifier: &str, other_node_id: &str, at_startup: bool) -> String {
+    let decline = if at_startup {
+        "quit"
+    } else {
+        "serve only (stop publishing this name)"
+    };
+    let take = if at_startup { "take over" } else { "reclaim" };
+    let when = if at_startup {
+        "was claimed by another device (it may have taken over while this peer was down)"
+    } else {
+        "was just taken over by another device"
+    };
+    format!(
+        "Name '{identifier}' {when}.\nOther node id: {other}\n\n\
+         [t] {take} the name (publish and gain precedence)\n\
+         [r] rename: note the conflict in the config, then {decline}\n\
+         [n] decline: {decline}",
+        other = short_node_id(other_node_id),
+    )
+}
+
+/// Persistent degraded-mode warning shown in the header after declining/renaming.
+fn degraded_message(identifier: &str, renamed: bool) -> String {
+    let tail = if renamed {
+        "see the rename note added to your config"
+    } else {
+        "restart to reclaim or rename"
+    };
+    format!("name '{identifier}' taken over by another device — serving only (not published); {tail}.")
+}
+
+/// Append the non-destructive rename nudge to the config file, if we know its path.
+fn nudge_rename(config_path: &Option<PathBuf>, identifier: &str) {
+    match config_path {
+        Some(path) => match crate::config::append_name_conflict_comment(path, identifier) {
+            Ok(()) => log::info!("Added a rename note to {}.", path.display()),
+            Err(e) => log::warn!("Could not add a rename note to the config: {e:#}"),
+        },
+        None => log::warn!("No config file to annotate; rename '{identifier}' manually."),
+    }
 }
 
 // ============================================================================
@@ -1307,6 +1533,7 @@ mod tests {
             max_streams: None,
             transport: TransportTuning::default(),
             announce_endpoint: false,
+            config_path: None,
             status,
         })
     }
@@ -1343,6 +1570,7 @@ mod tests {
             max_streams: None,
             transport: TransportTuning::default(),
             announce_endpoint: false,
+            config_path: None,
             status,
         };
 

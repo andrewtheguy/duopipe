@@ -10,7 +10,9 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use tui_input::Input;
 
 use super::textinput::render_spans;
-use crate::app_state::{AppSnapshot, ConnStatus, PeerRow, Role, TunnelRow, TunnelStatus};
+use crate::app_state::{
+    AppSnapshot, ConnStatus, NameConflict, PeerRow, Role, TunnelRow, TunnelStatus,
+};
 use crate::logging::LogLine;
 
 /// View state owned by the TUI loop (not shared with the runtime).
@@ -113,10 +115,11 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
     let show_token_banner = show_generated_token_banner(snap, ui);
+    let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
     let [header_area, tunnels_area, peers_area, logs_area] = Layout::vertical([
-        Constraint::Length(header_height(show_token_banner)),
+        Constraint::Length(header_height(show_token_banner, show_conflict_warning)),
         Constraint::Length(tunnel_rows.clamp(4, 10)),
         Constraint::Length(peer_rows.clamp(3, 8)),
         Constraint::Min(3),
@@ -133,8 +136,9 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
     matches!(snap.role, Role::Listen | Role::Both) && snap.token_generated && !ui.token_banner_hidden
 }
 
-fn header_height(show_token_banner: bool) -> u16 {
-    if show_token_banner { 6 } else { 5 }
+fn header_height(show_token_banner: bool, show_conflict_warning: bool) -> u16 {
+    let base = if show_token_banner { 6 } else { 5 };
+    base + if show_conflict_warning { 1 } else { 0 }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_banner: bool) {
@@ -187,7 +191,46 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
         ]));
     }
 
+    if let NameConflict::Degraded { message } = &snap.name_conflict {
+        lines.push(Line::from(Span::styled(
+            format!("⚠ {message}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+
     let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(para, area);
+}
+
+/// Modal prompting the user to resolve a nostr name conflict. The body text is built
+/// by the publisher (it knows startup vs mid-session consequences); this renders it
+/// verbatim with a key legend.
+pub fn render_name_conflict_dialog(frame: &mut Frame, message: &str) {
+    let mut lines = vec![Line::from(Span::styled(
+        "Name conflict",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::raw(""));
+    for line in message.lines() {
+        lines.push(Line::from(Span::raw(line.to_string())));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "t take over · r rename · n decline",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let area = centered(frame.area(), 80, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" name conflict "),
+        )
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
@@ -610,6 +653,7 @@ mod tests {
             conn_status: ConnStatus::Idle,
             path: PathInfo::establishing(),
             dial_target: None,
+            name_conflict: crate::app_state::NameConflict::Inactive,
             peers: Vec::new(),
             tunnels: Vec::new(),
             streams_used: 0,

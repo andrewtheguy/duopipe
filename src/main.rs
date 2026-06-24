@@ -12,6 +12,7 @@ mod logging;
 mod net;
 mod nostr_discovery;
 mod peer_params;
+mod peer_state;
 mod signaling;
 mod tui;
 
@@ -245,6 +246,8 @@ async fn run_peer_headless(
         max_streams: cfg.max_streams,
         transport: cfg.transport.clone(),
         announce_endpoint: true,
+        // Headless test mode never uses nostr, so there is no name to rename.
+        config_path: None,
         status: state.clone(),
     };
 
@@ -318,6 +321,7 @@ async fn run_inner() -> Result<()> {
                 PeerConfig::default(),
                 ConfigSource::None,
                 auth_token_file.as_deref(),
+                None,
                 &test_env,
                 log_buffer,
             )
@@ -327,7 +331,17 @@ async fn run_inner() -> Result<()> {
         // for node-id discovery. The token is required, from config/env only.
         Command::Nostr { config } => {
             let cfg = load_nostr_config(config.as_deref()).map_err(TunnelError::config)?;
-            run_start_peer(cfg, ConfigSource::File, None, &test_env, log_buffer).await
+            // Resolve the actual file path so a name-conflict rename can annotate it.
+            let config_path = crate::config::resolve_peer_config_path(config.as_deref());
+            run_start_peer(
+                cfg,
+                ConfigSource::File,
+                None,
+                config_path,
+                &test_env,
+                log_buffer,
+            )
+            .await
         }
         Command::GenerateAuthToken { count } => {
             for _ in 0..count {
@@ -347,6 +361,7 @@ async fn run_start_peer(
     cfg: PeerConfig,
     source: ConfigSource,
     cli_auth_token_file: Option<&Path>,
+    config_path: Option<PathBuf>,
     test_env: &Option<TestEnv>,
     log_buffer: Option<std::sync::Arc<logging::LogBuffer>>,
 ) -> Result<()> {
@@ -412,6 +427,32 @@ async fn run_start_peer(
     }
     let peer_name = peer_name.map(|n| n.to_string());
 
+    // Hold a process-lifetime exclusive lock on this name's local state file so two
+    // duopipe instances on the same machine can't claim the same nostr name. This is
+    // the same-machine counterpart to the cross-device nostr conflict resolution: it
+    // fails fast at startup (the lock is held for the whole process, so there is no
+    // mid-session local conflict). `_name_lock` must outlive `run_tui`; dropping it on
+    // exit releases the lock. Quick mode (no name) takes no lock.
+    let _name_lock = match peer_name.as_deref() {
+        Some(name) => match peer_state::acquire_name_lock(name) {
+            Ok(lock) => Some(lock),
+            Err(peer_state::NameLockError::Held) => {
+                return Err(TunnelError::config(anyhow::anyhow!(
+                    "Another duopipe process on this machine is already using the name '{name}'. \
+                     Stop it first, or use a different `name` in the config."
+                ))
+                .into());
+            }
+            Err(peer_state::NameLockError::Io(e)) => {
+                return Err(TunnelError::config(anyhow::anyhow!(
+                    "Could not acquire the local name lock for '{name}': {e}"
+                ))
+                .into());
+            }
+        },
+        None => None,
+    };
+
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
         logs: log_buffer,
@@ -426,6 +467,7 @@ async fn run_start_peer(
         nostr_relays,
         nostr_discovery: nostr_discovery_enabled,
         peer_name,
+        config_path,
     };
 
     tui::run_tui(launch).await

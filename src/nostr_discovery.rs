@@ -147,12 +147,15 @@ pub async fn publish_node_id(
 }
 
 /// Look up the node id published under `identifier` by a peer sharing the auth token.
-/// Returns the most recently published node id for that identifier.
-pub async fn lookup_node_id(
+/// Returns the most recently published node id for that identifier, or `Ok(None)` when
+/// no record exists. A query/decrypt failure is an `Err` — callers that need to tell
+/// "no record yet" (fine) from "the relays errored" (skip the check) rely on this
+/// distinction.
+pub async fn lookup_node_id_opt(
     auth_token: &str,
     identifier: &str,
     relays: &[String],
-) -> Result<EndpointId> {
+) -> Result<Option<EndpointId>> {
     let keys = derive_keys(auth_token)?;
     let client = connect_client(relays).await?;
     let filter = Filter::new()
@@ -163,18 +166,33 @@ pub async fn lookup_node_id(
     let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
     client.disconnect().await;
     let events = events.context("querying nostr relays for the peer's node id")?;
-    let latest = events.iter().max_by_key(|e| e.created_at).with_context(|| {
-        format!(
-            "no node-id record found on nostr for identifier '{}' (is that peer running and sharing the same auth token?)",
-            identifier.trim()
-        )
-    })?;
+    let Some(latest) = events.iter().max_by_key(|e| e.created_at) else {
+        return Ok(None);
+    };
     let node_id = nip44::decrypt(keys.secret_key(), &keys.public_key(), &latest.content)
         .context("decrypting nostr node-id record (wrong auth token?)")?;
-    node_id
+    let node_id = node_id
         .trim()
         .parse::<EndpointId>()
-        .context("nostr node-id record is not a valid node id")
+        .context("nostr node-id record is not a valid node id")?;
+    Ok(Some(node_id))
+}
+
+/// Look up the node id published under `identifier`, erroring if no record exists.
+/// Used by the dialer, which needs a concrete node id to dial.
+pub async fn lookup_node_id(
+    auth_token: &str,
+    identifier: &str,
+    relays: &[String],
+) -> Result<EndpointId> {
+    lookup_node_id_opt(auth_token, identifier, relays)
+        .await?
+        .with_context(|| {
+            format!(
+                "no node-id record found on nostr for identifier '{}' (is that peer running and sharing the same auth token?)",
+                identifier.trim()
+            )
+        })
 }
 
 #[cfg(test)]
