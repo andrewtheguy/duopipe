@@ -2,6 +2,13 @@ no backward compatibility is needed since it is still pre-release.
 run cargo clippy and cargo test -q after making rust code changes.
 no cargo fmt
 
+# Purpose
+duopipe is for a **single user connecting their own devices** (laptop ↔ homelab box
+↔ VPS, …) to reach services across them — the same auth token lives on each of the
+user's machines. Both ends are assumed to be owned (or otherwise fully trusted) by
+that one person; it is not a public service or a multi-tenant gateway. Two mutually
+trusting parties *can* use it, but that is not the primary design point.
+
 # Usage model
 This project is meant for interactive usage: a TUI asks, on startup, whether to
 connect to an existing instance. There are two interactive subcommands, one per
