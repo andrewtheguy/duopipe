@@ -1081,4 +1081,97 @@ mod tests {
         client_ep.close().await;
         server_ep.close().await;
     }
+
+    /// Drive a dialer's `handle_connection` against a listener that authenticates
+    /// it and then closes the connection with `close_code`. Returns the dialer's
+    /// `handle_connection` result. Synchronizes on the dialer reaching `Connected`
+    /// (auth complete) before the listener closes, so the dialer reliably observes
+    /// the application close code rather than a torn-down auth stream.
+    async fn dial_against_closing_listener(close_code: u32) -> Result<bool> {
+        let token = "close-code-test-token";
+        let server_ep = hermetic_endpoint().await;
+        let client_ep = hermetic_endpoint().await;
+
+        let server_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server_ep.addr();
+                if addr.ip_addrs().next().is_some() {
+                    break addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server direct address ready");
+
+        let client_cfg = test_peer_config(Role::Dial, token);
+        let client_status = client_cfg.status.clone();
+
+        // Listener: authenticate the dialer, wait until it has parked on the
+        // connection (Connected), then close with the code under test. Closing only
+        // after the dialer authenticates avoids racing the auth stream teardown.
+        // Spawned before the dial so the accept is ready to complete the handshake.
+        let server_ep2 = server_ep.clone();
+        let listener_view = client_status.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("accept connection");
+            let accepted: HashSet<String> = std::iter::once(token.to_string()).collect();
+            auth_as_listener(&conn, &accepted)
+                .await
+                .expect("listener auth");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while listener_view.snapshot().conn_status != ConnStatus::Connected {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("dialer authenticated");
+            conn.close(close_code.into(), b"test_close");
+            // Keep the connection alive until the close frame is flushed.
+            conn.closed().await;
+        });
+
+        let client_conn = client_ep
+            .connect(server_addr, ALPN)
+            .await
+            .expect("dial connect");
+        let result = handle_connection(client_conn, client_cfg, true).await;
+
+        server_task.abort();
+        client_ep.close().await;
+        server_ep.close().await;
+        result
+    }
+
+    /// A transient `peer_busy` close must report "not served" (`Ok(false)`) so the
+    /// dialer retries with backoff and counts the round against the initial-connect
+    /// cap, rather than treating it as an established session.
+    #[tokio::test]
+    async fn dial_reports_not_served_on_peer_busy() {
+        let result = dial_against_closing_listener(PEER_BUSY_CODE).await;
+        assert!(
+            matches!(result, Ok(false)),
+            "a peer_busy close must report not-served (Ok(false)), got {:?}",
+            result
+        );
+    }
+
+    /// A `wrong_peer` close must be fatal: the listener's session is bound to a
+    /// different node id, so reconnecting can never succeed. `handle_connection`
+    /// must surface a `Rejected` error so `run_dial` stops.
+    #[tokio::test]
+    async fn dial_reports_fatal_rejected_on_wrong_peer() {
+        let result = dial_against_closing_listener(WRONG_PEER_CODE).await;
+        let err = result.expect_err("a wrong_peer close must be a fatal error");
+        let category = err
+            .downcast_ref::<TunnelError>()
+            .map(|te| te.category)
+            .expect("error must be a TunnelError");
+        assert_eq!(
+            category,
+            ErrorCategory::Rejected,
+            "a wrong_peer close must map to a Rejected error"
+        );
+    }
 }
