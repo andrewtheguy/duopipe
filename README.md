@@ -147,7 +147,7 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. To avoid copying it by hand each time, duopipe uses **nostr** as a side channel: both peers derive a shared nostr key from the auth token, the listener publishes its current node id, and the dialer looks it up automatically (see [Node-id discovery](#node-id-discovery)). The node id is still shown in the TUI header, and you can always enter it manually instead.
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **nostr mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, the listener publishes its current node id, and the dialer looks it up automatically (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe start` with no config) nostr is off and the dialer enters the node id manually. The node id is always shown in the TUI header.
 
 ## Authentication
 
@@ -303,20 +303,21 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ### start
 
-`duopipe start` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token) comes from the config file and/or environment variables.
+`duopipe start` launches the interactive TUI. Loading a config file (`-c`/`--default-config`) selects **nostr mode**; with no config it runs **configless** (ephemeral id and token, no nostr). Everything else (requests, relays, DNS, max-streams, relay-only, auth token) comes from the config file and/or environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config`, `-c` | - | Path to TOML config file |
-| `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` |
+| `--config`, `-c` | - | Path to TOML config file (enables nostr mode) |
+| `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` (enables nostr mode) |
+| `--auth-token-file` | - | Path to a file holding the shared auth token. Precedence: this flag > `DUOPIPE_AUTH_TOKEN` > config `auth_token_file`. Lets configless mode use a fixed token instead of a generated one. |
 
-The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
+The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)). Nostr mode requires a provided auth token and fails fast if none is supplied.
 
 **Environment variables:**
 
 | Env Var | Description |
 |---------|-------------|
-| `DUOPIPE_AUTH_TOKEN` | The shared auth token (takes precedence over config `auth_token_file`). |
+| `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
 | `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
@@ -331,17 +332,15 @@ Use `--default-config` to load from the default location, or `-c <path>` for a c
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-The config file holds the tunnel requests, the path to the auth token, relays, DNS, nostr discovery settings, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
+Loading a config file selects **nostr mode** and requires a provided auth token. The config holds the tunnel requests, the path to the auth token, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
 
 ### Node-id discovery
 
-The iroh node id is ephemeral, so the listener publishes its current node id to **nostr** and the dialer looks it up — no manual copy needed. Both peers derive the same nostr key from the shared auth token, so nothing extra is exchanged (the node id is public; the auth token still gates the connection, and the value is not encrypted).
+Nostr discovery is active whenever a config file is loaded. The iroh node id is ephemeral, so the listener publishes its current node id to **nostr** and the dialer looks it up — no manual copy needed. Both peers derive the same nostr key from the shared auth token, so nothing extra is exchanged (the node id is public; the auth token still gates the connection, and the value is not encrypted). To skip nostr entirely, run configless (no config file) and enter the node id by hand.
 
 ```toml
 # Relays default to a built-in public set; override if desired:
 # nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
-# Discovery is on by default; set false to require entering the node id manually:
-# nostr_discovery = false
 ```
 
 ### Transport Tuning

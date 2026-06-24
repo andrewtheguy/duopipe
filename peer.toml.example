@@ -3,12 +3,19 @@
 # Usage: duopipe start -c peer.toml
 #        duopipe start --default-config   # loads ~/.config/duopipe/peer.toml
 #
+# Loading a config file selects NOSTR MODE: the listener publishes its current
+# ephemeral node id to nostr and a dialer looks it up, so the node id need not be
+# exchanged by hand. Nostr mode REQUIRES a provided auth token (it is the nostr
+# rendezvous secret) — set 'auth_token_file' below or the DUOPIPE_AUTH_TOKEN env
+# var. Running `duopipe start` with no config is the other mode (configless): the
+# id and token are ephemeral, nostr is off, and the dialer enters the node id by
+# hand (supply a token there with `duopipe start --auth-token-file <path>`).
+#
 # `duopipe start` is interactive: on startup the TUI asks whether to connect to an
-# existing instance. The role (dial/listen), the target node id, and (if missing)
-# the auth token are answered there — they are NOT config keys. When connecting,
-# the node id can be left blank to discover it via nostr (see below). This file
-# supplies the rest: the shared auth token, tunnel requests, the allowlist, relays,
-# tuning, and the nostr discovery settings.
+# existing instance. The role (dial/listen) and the target node id are answered
+# there — they are NOT config keys. In nostr mode the node id can be left blank to
+# discover it via nostr. This file supplies the rest: the shared auth token, tunnel
+# requests, the allowlist, relays, tuning, and the nostr relay override.
 #
 # Tunnel model: each side always *requests* tunnels from the other. A [[request]]
 # binds a local listener and asks the peer to connect out to a remote 'source';
@@ -26,23 +33,20 @@
 # channel to publish & look up the current node id, keyed off the shared auth_token
 # (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
-# The shared auth token, presented by both sides. Optional: a fresh listening
-# instance generates one if absent (shown in the TUI). Generate with:
+# The shared auth token, presented by both sides. REQUIRED in nostr mode (it is
+# the nostr rendezvous secret). Generate with:
 #   duopipe generate-auth-token
 # Supply it via 'auth_token_file' (recommended) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/token.txt"
 
-# Nostr node-id discovery. Both peers derive a shared nostr key from the auth_token
-# above; the listener publishes its current ephemeral node id and the dialer looks
-# it up, so the node id never has to be exchanged by hand. The node id is public
-# (auth_token still gates the connection), so nothing here is a secret.
+# Nostr node-id discovery is active whenever a config file is loaded. Both peers
+# derive a shared nostr key from the auth_token above; the listener publishes its
+# current ephemeral node id and the dialer looks it up, so the node id never has to
+# be exchanged by hand. The node id is public (auth_token still gates the
+# connection), so nothing here is a secret.
 #
 # Relays default to a built-in public set; override here if you want specific ones:
 # nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
-#
-# Discovery is on by default. Set false to disable it (then a dialer must be given
-# the node id directly, and a listener won't publish):
-# nostr_discovery = false
 
 # Maximum concurrent data streams per connection (default: 100).
 # max_streams = 100

@@ -4,9 +4,22 @@ no cargo fmt
 
 # Usage model
 This project is meant for interactive usage: `duopipe start` runs a TUI that asks,
-on startup, whether to connect to an existing instance. When connecting, the node
-id can be left blank to discover it via nostr (see below), or entered manually; the
-auth token is prompted for if not configured.
+on startup, whether to connect to an existing instance.
+
+There are two modes, selected purely by whether a config file is loaded:
+- Configless mode (`duopipe start`, no `-c`/`--default-config`): ephemeral node id,
+  no nostr. The auth token is generated fresh each run (shown in the TUI), or loaded
+  from `--auth-token-file <path>` / `DUOPIPE_AUTH_TOKEN`. A dialer enters the peer's
+  node id manually (there is no nostr side channel to discover it).
+- Nostr mode (`duopipe start -c <file>` / `--default-config`): requires a *provided*
+  auth token (it is the nostr rendezvous secret — a generated one couldn't be
+  discovered by the peer), so startup fails fast if none is supplied via
+  `--auth-token-file`, `DUOPIPE_AUTH_TOKEN`, or config `auth_token_file`. Nostr
+  publishes/looks up the node id (see below), so when connecting the node id can be
+  left blank to discover it, or entered manually.
+
+Token precedence is `--auth-token-file` > `DUOPIPE_AUTH_TOKEN` > config
+`auth_token_file`.
 
 Test usage is supported only for testing purposes, driven by env vars.
 `DUOPIPE_TEST_MODE=1` is the single gate: it runs the peer headless (no TUI, logs
@@ -28,9 +41,10 @@ Tests stay hermetic: when `DUOPIPE_PEER_NODE_ID` is set the dialer dials that id
 directly and never touches nostr, so `cargo test -q` needs no live relays.
 
 # Node-id discovery (nostr)
-The iroh identity is always ephemeral — there is no stable-node-id mode. Instead,
-nostr is used as a side channel to publish & look up a peer's *current* ephemeral
-node id, so a restart (new node id) doesn't require re-exchanging it.
+The iroh identity is always ephemeral — there is no stable-node-id mode. In nostr
+mode (a config file is loaded) nostr is used as a side channel to publish & look up
+a peer's *current* ephemeral node id, so a restart (new node id) doesn't require
+re-exchanging it. Configless mode does not use nostr at all.
 
 Both peers derive the same nostr keypair from the shared `auth_token`
 (`sha256("duopipe:nostr-rendezvous:v1" || auth_token)`), so no extra identifier is
@@ -45,8 +59,8 @@ before discovery can resolve.
 The dialer re-looks-up on every connect attempt, so a listener that restarted with a
 fresh node id self-heals on the next attempt (no persistent subscription). Relays
 default to a built-in public set (`nostr_discovery::DEFAULT_NOSTR_RELAYS`); override
-with `nostr_relay_urls`, or disable the whole mechanism with `nostr_discovery = false`
-(then the dialer must be given the node id directly).
+with `nostr_relay_urls`. To skip nostr entirely, run configless (no config file),
+where the dialer is given the node id directly.
 
 Tunnel model: a peer always *requests* tunnels from the other party. Each
 `[[request]]` binds a local `local_listen` address and asks the peer to connect out

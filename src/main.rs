@@ -23,7 +23,7 @@ use ::iroh::EndpointId;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Capacity of the in-memory log ring buffer shown in the TUI.
 const LOG_CAPACITY: usize = 2000;
@@ -47,19 +47,32 @@ struct Args {
 enum Command {
     /// Start a peer (interactive TUI): one connection, many tunnels both ways.
     ///
+    /// Two modes, chosen by whether a config file is loaded:
+    ///
+    /// - Configless mode (no -c/--default-config): ephemeral node id, no nostr.
+    ///   The auth token is generated fresh each run, or loaded from
+    ///   --auth-token-file / DUOPIPE_AUTH_TOKEN. A dialer enters the peer's node
+    ///   id manually.
+    /// - Nostr mode (-c/--default-config): requires a provided auth token (it is
+    ///   the nostr rendezvous secret). The listener publishes its current node id
+    ///   to nostr and a dialer looks it up, so the node id need not be exchanged.
+    ///
     /// On startup the TUI offers a choice between starting a new (listening)
-    /// instance and connecting to an existing one. Listening generates an auth
-    /// token if none is configured; connecting prompts for the existing
-    /// instance's node id and, if not configured, its auth token. Forwards,
-    /// relays, and other options come from the config file.
+    /// instance and connecting to an existing one.
     Start {
-        /// Path to config file
+        /// Path to config file (enables nostr mode)
         #[arg(short, long)]
         config: Option<PathBuf>,
 
         /// Load config from default location (~/.config/duopipe/peer.toml)
         #[arg(long)]
         default_config: bool,
+
+        /// Path to a file containing the shared auth token. Takes precedence over
+        /// DUOPIPE_AUTH_TOKEN and a config `auth_token_file`. The configless-mode
+        /// way to supply a token instead of generating an ephemeral one.
+        #[arg(long)]
+        auth_token_file: Option<PathBuf>,
     },
     /// Generate an authentication token
     ///
@@ -83,11 +96,18 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the shared auth token from env (`DUOPIPE_AUTH_TOKEN`), then
-/// `auth_token_file`. Validates the token's CRC when present. Returns `None` when
-/// none is configured (a fresh listening instance will generate one).
-fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
-    let token = if let Some(t) = env_var_opt("DUOPIPE_AUTH_TOKEN") {
+/// Resolve the shared auth token, in precedence order: the `--auth-token-file`
+/// CLI flag, then the `DUOPIPE_AUTH_TOKEN` env var, then a config `auth_token_file`.
+/// Validates the token's CRC when present. Returns `None` when none is supplied (a
+/// fresh listening instance in configless mode will generate one).
+fn resolve_config_auth_token(
+    cli_file: Option<&Path>,
+    cfg: &PeerConfig,
+) -> Result<Option<String>> {
+    let token = if let Some(file) = cli_file {
+        let expanded = expand_tilde(file);
+        Some(auth::load_auth_token_from_file(&expanded)?)
+    } else if let Some(t) = env_var_opt("DUOPIPE_AUTH_TOKEN") {
         Some(t)
     } else if let Some(file) = &cfg.auth_token_file {
         let expanded = expand_tilde(file);
@@ -294,6 +314,7 @@ async fn run_inner() -> Result<()> {
         Command::Start {
             config,
             default_config,
+            auth_token_file,
         } => {
             let (cfg, source) = resolve_peer_config(config.clone(), *default_config)?;
 
@@ -310,24 +331,29 @@ async fn run_inner() -> Result<()> {
             let relay_only = cfg.relay_only.unwrap_or(false);
             validate_relay_only(relay_only, &relay_urls).map_err(TunnelError::config)?;
 
-            // Resolve the shared auth token (env > config) before startup so
-            // failures print plainly.
-            let config_auth_token = resolve_config_auth_token(&cfg).map_err(TunnelError::config)?;
+            // Resolve the shared auth token (CLI flag > env > config) before
+            // startup so failures print plainly.
+            let config_auth_token =
+                resolve_config_auth_token(auth_token_file.as_deref(), &cfg)
+                    .map_err(TunnelError::config)?;
 
-            // Nostr node-id discovery settings. The iroh identity is always
-            // ephemeral; nostr is the side channel that publishes/looks up the
-            // current node id (keyed off the shared auth token). Relays default to
-            // the public set; discovery is on unless explicitly disabled.
+            // Mode is keyed off config presence. Configless mode (no config) keeps
+            // everything ephemeral and never touches nostr; the dialer enters the
+            // node id by hand. Nostr mode (a config file is loaded) uses nostr as a
+            // side channel to publish/look up the current ephemeral node id, keyed
+            // off the shared auth token. Relays default to the public set.
+            let nostr_discovery_enabled = source == ConfigSource::File;
             let nostr_relays = cfg.nostr_relay_urls.clone().unwrap_or_else(|| {
                 nostr_discovery::DEFAULT_NOSTR_RELAYS
                     .iter()
                     .map(|s| s.to_string())
                     .collect()
             });
-            let nostr_discovery_enabled = cfg.nostr_discovery.unwrap_or(true);
 
-            // Test mode: resolve the preset and run headless, no TUI.
-            // Interactive mode: hand off to the TUI lifecycle.
+            // Test mode: resolve the preset and run headless, no TUI. Test mode is
+            // always configless-equivalent for nostr (the node id is wired directly
+            // via DUOPIPE_PEER_NODE_ID), so the nostr-mode token requirement below
+            // does not apply here.
             if let Some(test_env) = &test_env {
                 let resolved = test_env
                     .resolve_preset(config_auth_token, cfg.allowed_sources.clone())
@@ -340,6 +366,16 @@ async fn run_inner() -> Result<()> {
                     test_env.autostart_requests,
                 )
                 .await;
+            }
+
+            // Nostr mode requires a provided auth token: it is the rendezvous secret
+            // both peers derive their nostr key from, so a generated one could not be
+            // discovered by the other side.
+            if nostr_discovery_enabled && config_auth_token.is_none() {
+                return Err(TunnelError::config(anyhow::anyhow!(
+                    "Nostr mode (a config file is present) requires an auth token. Supply it with --auth-token-file, DUOPIPE_AUTH_TOKEN, or auth_token_file in the config."
+                ))
+                .into());
             }
 
             let log_buffer = log_buffer.expect("start command initializes the TUI log buffer");

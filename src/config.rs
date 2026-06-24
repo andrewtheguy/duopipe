@@ -46,13 +46,9 @@ pub struct PeerConfig {
     /// `DUOPIPE_AUTH_TOKEN` env var) is the only way to supply a token; a fresh
     /// listening instance generates one if neither is set.
     pub auth_token_file: Option<PathBuf>,
-    /// Nostr relay URLs used for node-id discovery. Absent ⇒ a built-in set of
-    /// public relays (see `nostr_discovery::DEFAULT_NOSTR_RELAYS`).
+    /// Nostr relay URLs used for node-id discovery (nostr mode only). Absent ⇒ a
+    /// built-in set of public relays (see `nostr_discovery::DEFAULT_NOSTR_RELAYS`).
     pub nostr_relay_urls: Option<Vec<String>>,
-    /// Whether to use the nostr side channel to publish/look up the peer's current
-    /// ephemeral node id (keyed off the shared `auth_token`). Absent ⇒ enabled.
-    /// When disabled, a dialer must be given the peer's node id directly.
-    pub nostr_discovery: Option<bool>,
     /// Transport layer tuning (congestion control, buffer sizes).
     #[serde(default)]
     pub transport: TransportTuning,
@@ -117,7 +113,7 @@ impl AllowedSources {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
-    /// TOML file on disk — plaintext secrets rejected
+    /// TOML config file on disk (nostr mode).
     File,
     /// No config, defaults only
     None,

@@ -434,7 +434,7 @@ graph TB
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
-        K[nostr_relay_urls / nostr_discovery]
+        K[nostr_relay_urls]
     end
 
     A --> S[Validation]
@@ -458,7 +458,7 @@ The role (listen vs dial) and the dialer's target node id are not config fields.
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-`DUOPIPE_AUTH_TOKEN` takes precedence over the config `auth_token_file`. The token is supplied only via a file or env var — never written inline in the config.
+Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. The token is supplied only via a file or env var — never written inline in the config. In configless mode (no config file) the listener generates an ephemeral token if none is supplied; nostr mode (a config file is loaded) requires a provided token and fails fast otherwise.
 
 ```toml
 # peer.toml
@@ -605,7 +605,7 @@ Access control rests on a single shared auth token. The ALPN is a fixed constant
 
 - **Auth Token** (`DUOPIPE_AUTH_TOKEN` env var / `auth_token_file`): A single shared connection-level token, validated on the first bi-stream. Both peers use the **same** value. In code it is a 47-char `i...` token.
 
-1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or generates one if none is set, displaying it in the TUI).
+1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or, in configless mode, generates an ephemeral one if none is set, displaying it in the TUI).
 2. **Dial Peer Configuration**: The dial peer is configured with — or interactively prompted for — the same shared token.
 3. **Protocol Flow**: The dialer opens the first bidirectional stream and sends an `AuthRequest` positionally (no hello). **No tunnel streams are processed until authentication succeeds.**
 4. **Validation**: The listen peer validates the presented token against its single accepted token within a 10-second timeout (`auth_as_listener`).
@@ -701,12 +701,12 @@ sequenceDiagram
 
 ### Node-id discovery (nostr)
 
-Because the node id is ephemeral, duopipe uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Implemented in `nostr_discovery.rs`:
+Because the node id is ephemeral, **nostr mode** (active whenever a config file is loaded) uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Configless mode (no config file) does not use nostr — the dialer enters the node id by hand. Implemented in `nostr_discovery.rs`:
 
 - **Shared key from the auth token.** Both peers derive the same nostr keypair via `sha256("duopipe:nostr-rendezvous:v1" || auth_token)`. No extra identifier is exchanged — the token both sides already share *is* the rendezvous. Discovery therefore only works when the token is shared (which the dialer needs anyway, for auth).
 - **Publish (listener).** `run_listen` spawns a background task that publishes a replaceable event (NIP-78 kind 30078, `d` tag `duopipe:nodeid`, content = the current node id string) at startup and refreshes it every ~5 minutes. Relay failures are logged but non-fatal.
 - **Lookup on demand (dialer).** When no node id was supplied directly, `run_dial` looks it up (filter by author = derived pubkey + kind + `d` tag, newest wins) at the top of *every* connect attempt, so a listener that restarted with a fresh node id self-heals on the next attempt. No persistent subscription.
-- **Not encrypted.** The node id is public; the auth token still gates the actual connection. Relays default to `DEFAULT_NOSTR_RELAYS`, overridable via `nostr_relay_urls`; the whole mechanism can be turned off with `nostr_discovery = false`.
+- **Not encrypted.** The node id is public; the auth token still gates the actual connection. Relays default to `DEFAULT_NOSTR_RELAYS`, overridable via `nostr_relay_urls`. To skip nostr entirely, run configless (no config file).
 
 Hermetic tests bypass nostr entirely: when `DUOPIPE_PEER_NODE_ID` is set the dialer dials that id directly, so the test suite needs no live relays.
 
