@@ -171,11 +171,18 @@ pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
 
 /// Create the global stream limiter and register it for the TUI gauge. Shared by
 /// every peer connection — one process-wide cap on concurrent forwarded streams.
-fn new_stream_semaphore(config: &PeerConfig) -> Arc<Semaphore> {
+///
+/// Fails fast on `max_streams = 0`: a zero-permit semaphore would reject *every*
+/// forwarded stream, silently breaking all tunnels. `Config::validate()` doesn't
+/// cover this, so guard it here before any tunnel setup runs.
+fn new_stream_semaphore(config: &PeerConfig) -> Result<Arc<Semaphore>> {
     let max_streams = config.max_streams.unwrap_or(DEFAULT_MAX_STREAMS);
+    if max_streams == 0 {
+        anyhow::bail!("max_streams must be greater than 0 (got 0; it caps concurrent streams)");
+    }
     let semaphore = Arc::new(Semaphore::new(max_streams));
     config.status.set_semaphore(semaphore.clone(), max_streams);
-    semaphore
+    Ok(semaphore)
 }
 
 async fn run_listen(config: PeerConfig) -> Result<()> {
@@ -221,7 +228,7 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     let shutdown = config.status.shutdown.clone();
     // One global stream limiter shared by every connected peer. Set once so the gauge
     // tracks it exactly.
-    let semaphore = new_stream_semaphore(&config);
+    let semaphore = new_stream_semaphore(&config)?;
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
@@ -330,7 +337,7 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
 
     let shutdown = config.status.shutdown.clone();
     // One global stream limiter, set once and reused across reconnects.
-    let semaphore = new_stream_semaphore(&config);
+    let semaphore = new_stream_semaphore(&config)?;
     let config = Arc::new(config);
     // The peer's node id: either supplied directly (manual entry / test fast-path)
     // or discovered via nostr. When discovered it is re-resolved on each connect
