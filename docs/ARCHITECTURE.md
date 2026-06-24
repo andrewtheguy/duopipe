@@ -158,22 +158,22 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same peer runtime (`duopipe quick` or `duopipe nostr`). The dialer establishes the QUIC connection and **requests** tunnels (`[[request]]`), running its own request listeners; the listener is a **pure server** that accepts incoming request streams and serves them, and can serve many dialers at once.
+Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe nostr`): an always-on serve half plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** tunnels (`[[request]]`), running its own request listeners; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
 
 ```mermaid
 graph TB
-    subgraph "Listen Peer"
-        A[duopipe quick/nostr<br/>answered no]
+    subgraph "Server Side of One Connection"
+        A[always-on serve half]
         B[iroh Endpoint<br/>ephemeral node id]
-        C[Accept Loop +<br/>Request Listeners]
+        C[Accept Loop +<br/>Source Allowlist Gate]
         D[Discovery<br/>Pkarr/DNS]
         E[Relay Server]
     end
 
-    subgraph "Dial Peer"
-        F[duopipe quick/nostr<br/>answered yes]
+    subgraph "Requester Side of One Connection"
+        F[on-demand dial session]
         G[iroh Endpoint<br/>ephemeral node id]
-        H[Accept Loop +<br/>Request Listeners]
+        H[Request Listeners<br/>for active tunnels]
         I[Discovery<br/>Pkarr/DNS]
         J[Relay Server]
     end
@@ -200,7 +200,7 @@ graph TB
 
 ### Connection Establishment Flow
 
-Connection setup is asymmetric (dialer + acceptor), but authentication is the *only* phase that distinguishes the two roles. After auth, the roles converge: both peers open and accept streams.
+Connection setup is asymmetric (dialer + acceptor), and the tunnel model remains asymmetric for that connection: after auth, the dialer opens request streams and the listener accepts, allowlists, and bridges them. An interactive process gets bidirectional use by also having its own independent dial session.
 
 ```mermaid
 sequenceDiagram
@@ -209,16 +209,16 @@ sequenceDiagram
     participant D as Dial Peer
     participant RS as Relay Server
 
-    Note over L: Generate ephemeral identity (TUI: answered "no")
+    Note over L: Always-on serve half creates ephemeral identity
     L->>L: Create iroh Endpoint
     L->>SD: Publish node id + Addresses
-    Note over L: Display node id + auth token in TUI
+    Note over L: Display node id + token banner/hint in TUI
     L->>RS: Connect to relay
     L->>L: endpoint.accept() loop
 
-    Note over D: User provides node id (TUI prompt, answered "yes")
+    Note over D: User presses c and enters node id or peer name
     D->>D: Create iroh Endpoint (ephemeral identity)
-    D->>SD: Resolve node id
+    D->>SD: Resolve node id or current name record
     SD-->>D: Return addresses
     D->>RS: Connect to relay
 
@@ -245,13 +245,10 @@ sequenceDiagram
         L->>L: Close connection (error code 2)
     end
 
-    Note over D,L: After auth, BOTH sides run symmetrically
-    par Dial peer's requests
-        D->>L: open_bi() + StreamHello::LocalForward{source}
-    and Listen peer's requests
-        L->>D: open_bi() + StreamHello::LocalForward{source}
-    end
-    Note over D,L: The dialer requests tunnels; the listener serves them
+    Note over D,L: After auth, the dialer requests tunnels
+    D->>L: open_bi() + StreamHello::LocalForward{source}
+    L->>L: Check source against allowed_sources
+    L-->>D: StreamAck + bridged traffic, or rejection
 ```
 
 ### Stream Dispatch (StreamHello)
@@ -417,7 +414,7 @@ graph TB
 
 ## Configuration System
 
-A single, symmetric `PeerConfig` drives the peer. There is no `role` enum and no `connect` key; the connection role is chosen **at startup** (interactively in the TUI, or via env vars for tests), not in config.
+A single, symmetric `PeerConfig` drives both halves of an interactive peer. There is no `role` key and no `connect` key: interactive runs always use the dual-role runtime, and the outbound dial target is chosen later from the dashboard. Only headless test mode derives a single listen/dial role from environment variables.
 
 ### Configuration File Structure
 
@@ -447,7 +444,7 @@ graph TB
     style S fill:#FFF9C4
 ```
 
-The role (listen vs dial) and the dialer's target node id are not config fields. They are resolved at startup from the TUI prompts, or — for tests — from `DUOPIPE_PEER_NODE_ID` (set ⇒ dial, unset ⇒ listen) under `DUOPIPE_TEST_MODE=1`.
+The outbound dial target is not a config field. In interactive mode it is entered at runtime from the connect prompt (`c`): a node id in quick mode or a peer `name` in nostr mode. In headless test mode only, `DUOPIPE_PEER_NODE_ID` under `DUOPIPE_TEST_MODE=1` selects the single role (set ⇒ dial, unset ⇒ listen).
 
 ### iroh Credential Mapping
 
@@ -491,7 +488,7 @@ sequenceDiagram
         Config->>Source: Read file
         Source-->>Config: TOML content
     else duopipe quick
-        Main->>Main: Use env vars + --auth-token-file + interactive prompts only
+        Main->>Main: Use env vars + --auth-token-file + setup screen
     end
 
     alt Config loaded
@@ -501,7 +498,7 @@ sequenceDiagram
         Main->>Main: Apply env overrides (DUOPIPE_AUTH_TOKEN wins)
     end
 
-    Main->>Main: Launch TUI: resolve role + dial target
+    Main->>Main: Launch always-listening TUI; dial target is entered later
 ```
 
 ### Config Validation
@@ -631,7 +628,7 @@ sequenceDiagram
         Note over L,D: Connection closed (auth timeout)
     end
 
-    Note over D,L: After auth, both sides open StreamHello-tagged tunnels
+    Note over D,L: After auth, dialer opens StreamHello-tagged request streams
 ```
 
 ### Token Security Notes (iroh Mode)
@@ -684,11 +681,11 @@ sequenceDiagram
     participant EP as iroh Endpoint
 
     Note over EP: No key file — fresh identity each run
-    User->>TUI: duopipe quick/nostr  (answer "no" → listen)
+    User->>TUI: duopipe quick/nostr
     TUI->>EP: Create endpoint (ephemeral identity)
     EP->>EP: Derive node id from fresh keypair
     EP-->>TUI: node id
-    TUI->>User: Display node id + auth token
+    TUI->>User: Display node id + generated-token banner or loaded-token hint
 ```
 
 ### Node-id discovery (nostr)
@@ -848,10 +845,11 @@ The `iroh::Endpoint` provides:
 
 ### Peer Runtime (iroh_mode/peer.rs)
 
-`run_peer(PeerConfig)` is the single entry point. It validates relay-only usage and dispatches on `config.role` (resolved at startup from the TUI or env vars). The ALPN is the fixed `ALPN` constant.
+`run_peer(PeerConfig)` is the single entry point. It validates relay-only usage and dispatches on `config.role`: interactive runs use `Role::Both`, while headless test mode uses `Role::Listen` or `Role::Dial`. The ALPN is the fixed `ALPN` constant.
 
 - `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`. When `announce_endpoint` is set (non-interactive mode) it prints `node_id:` and `auth_token:` to stderr.
-- `run_dial` — `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
+- `run_dial_manager` — interactive-only manager for the single outbound session. It reuses one client endpoint, idles until a `DialCommand::Connect`, and replaces or disconnects the active session on dashboard commands.
+- `run_dial` — headless test path for a fixed target: `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
 `handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out, capped by the global semaphore). The **dialer** additionally runs a `request_supervisor` that starts/stops its own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request; the **listener** runs only the acceptor (it is a pure server). In test mode, `DUOPIPE_AUTOSTART_REQUESTS=1` starts every dial-role request on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
 

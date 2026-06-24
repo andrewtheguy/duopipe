@@ -44,16 +44,16 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start a peer in configless mode (interactive TUI): one connection, many
-    /// tunnels both ways.
+    /// Start a peer in configless mode (interactive TUI): always serving, with
+    /// one on-demand outbound dial session.
     ///
     /// Everything is ephemeral and nostr is off: the node id changes every run and
     /// a dialer enters the peer's node id manually. The auth token is generated
     /// fresh each run (shown in the TUI), or loaded from --auth-token-file /
     /// DUOPIPE_AUTH_TOKEN. No config file is read.
     ///
-    /// On startup the TUI offers a choice between starting a new (listening)
-    /// instance and connecting to an existing one.
+    /// On startup the TUI confirms setup, then opens the dashboard already
+    /// listening. Press `c` in the dashboard to dial a peer by node id.
     Quick {
         /// Path to a file containing the shared auth token. Takes precedence over
         /// DUOPIPE_AUTH_TOKEN. Without it (or the env var) a fresh ephemeral token
@@ -61,16 +61,16 @@ enum Command {
         #[arg(long)]
         auth_token_file: Option<PathBuf>,
     },
-    /// Start a peer in nostr mode (interactive TUI): one connection, many tunnels
-    /// both ways.
+    /// Start a peer in nostr mode (interactive TUI): always serving, with one
+    /// on-demand outbound dial session.
     ///
     /// Requires a config file and a provided auth token (it is the nostr rendezvous
     /// secret — supply it via config `auth_token_file` or DUOPIPE_AUTH_TOKEN). The
     /// listener publishes its current ephemeral node id to nostr and a dialer looks
     /// it up, so the node id need not be exchanged by hand.
     ///
-    /// On startup the TUI offers a choice between starting a new (listening)
-    /// instance and connecting to an existing one.
+    /// On startup the TUI confirms setup, then opens the dashboard already
+    /// listening. Press `c` in the dashboard to dial a peer by name.
     Nostr {
         /// Path to config file. Defaults to ~/.config/duopipe/peer.toml.
         #[arg(short, long)]

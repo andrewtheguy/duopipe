@@ -11,10 +11,10 @@
 # ephemeral, nostr is off, and the dialer enters the node id by hand (supply a
 # token there with `duopipe quick --auth-token-file <path>`).
 #
-# `duopipe nostr` is interactive: on startup the TUI asks whether to connect to an
-# existing instance. The role (dial/listen) and the target node id are answered
-# there — they are NOT config keys. In nostr mode the node id can be left blank to
-# discover it via nostr. This file supplies the rest: the shared auth token, tunnel
+# `duopipe nostr` is interactive and always starts serving inbound peers. There is
+# no startup listen/dial role choice and no dial target in this file: press `c` on
+# the dashboard and type the target peer's `name` to start the single outbound dial
+# session. This file supplies the shared auth token, this peer's own `name`, tunnel
 # requests, the allowlist, relays, tuning, and the nostr relay override.
 #
 # Tunnel model: the DIALER *requests* tunnels; the LISTENER is a pure server. A
@@ -81,9 +81,8 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # Tunnel requests (used when this peer DIALS): ask the listener to connect out to
 # 'remote_source'; deliver traffic to a local listener bound at 'local_listen'. The
 # 'remote_source' scheme (tcp:// or udp://) selects the protocol. 'name' is the label
-# shown in the TUI. Nothing starts until you activate it (Enter in the TUI, or
-# DUOPIPE_AUTOSTART_REQUESTS=1 in test mode). Ignored when this peer is the listener
-# (the listener is a pure server and initiates no tunnels).
+# shown in the TUI. Nothing starts until you connect to a peer and activate it
+# (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1 in test mode).
 # ============================================================================
 [[request]]
 name = "db"

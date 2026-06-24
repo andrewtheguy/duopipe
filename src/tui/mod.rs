@@ -63,7 +63,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut events = EventStream::new();
 
-    // Phase 1: resolve role/target/token via the interactive setup screen.
+    // Phase 1: resolve the serving allowlist and auth token via the setup screen.
     let resolved = match run_setup(
         &mut terminal,
         &mut events,

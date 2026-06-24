@@ -236,7 +236,7 @@ On each machine, point at a config that declares its requests (see [Configuratio
 duopipe nostr -c ./peer.toml
 ```
 
-There is no role prompt — setup just confirms the allowlist/token and the dashboard opens, already listening. Each config must set a `name` and supply the auth token (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header shows this instance's **node id** and **auth token**.
+There is no role prompt — setup just confirms the allowlist/token and the dashboard opens, already listening. Each config must set a `name` and supply the auth token (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header shows this instance's **node id** and indicates that the auth token was loaded.
 
 > **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — peers find each other by `name`.
 
@@ -318,7 +318,7 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ## CLI Options
 
-Both interactive subcommands launch the same TUI; they differ only in mode. The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
+Both interactive subcommands launch the same always-listening TUI; they differ only in how the connect prompt names a target. In `quick`, press `c` and enter the peer's node id. In `nostr`, press `c` and enter the peer's `name`. Headless test mode is the only path with a fixed listen/dial role (see [Test mode (testing only)](#test-mode-testing-only)).
 
 ### quick (configless mode)
 
@@ -384,11 +384,11 @@ The connection-level receive window uses iroh's default. If `send_window` is omi
 
 ### Peer Config Example
 
-The same config shape is used by both peers; the role is chosen interactively at startup.
+The same config shape is used by both peers. Every interactive run serves from launch; the outbound dial target is chosen later from the dashboard.
 
 ```toml
 # Example peer configuration.
-# The connection role and the dialer's target identifier are chosen interactively.
+# The outbound dial target is chosen interactively from the dashboard.
 
 # This peer's short identifier (required in nostr mode). A dialer types it to find
 # this peer; the listener publishes its node id under this name.

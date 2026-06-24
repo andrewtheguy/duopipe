@@ -1,11 +1,11 @@
-//! Symmetric iroh peer: one connection, request-based tunnels.
+//! iroh peer runtime: always-on serving plus request-based dial sessions.
 //!
-//! A peer either dials another peer (`Role::Dial`) or listens for one
-//! (`Role::Listen`). Connection *setup* is asymmetric (QUIC needs a dialer and
-//! an acceptor), but once a connection is established each side *requests*
-//! tunnels from the other: a request binds a local listener and asks the peer to
-//! connect out to a remote `source`, bridging the two. Requests are activated
-//! on demand (the TUI sends start/stop commands); nothing starts automatically
+//! Interactive peers run as `Role::Both`: an always-on `Role::Listen` half that
+//! serves inbound peers, plus a dial manager that owns at most one outbound
+//! `Role::Dial` session. Within any one connection, only the dialer requests
+//! tunnels: a request binds a local listener and asks the connected peer to
+//! connect out to a remote `source`, bridging the two. Requests are activated on
+//! demand (the TUI sends start/stop commands); nothing starts automatically
 //! unless `DUOPIPE_AUTOSTART_REQUESTS` is set (test mode only).
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
