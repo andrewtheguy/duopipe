@@ -5,8 +5,10 @@
 #
 # `duopipe start` is interactive: on startup the TUI asks whether to connect to an
 # existing instance. The role (dial/listen), the target node id, and (if missing)
-# the auth token are answered there — they are NOT config keys. This file supplies
-# the rest: the shared auth token, tunnel requests, the allowlist, relays, tuning.
+# the auth token are answered there — they are NOT config keys. When connecting,
+# the node id can be left blank to discover it via nostr (see below). This file
+# supplies the rest: the shared auth token, tunnel requests, the allowlist, relays,
+# tuning, and the nostr discovery settings.
 #
 # Tunnel model: each side always *requests* tunnels from the other. A [[request]]
 # binds a local listener and asks the peer to connect out to a remote 'source';
@@ -19,9 +21,10 @@
 # (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
 # dual-stack localhost.
 #
-# Node id: by default the iroh identity key is ephemeral (regenerated every run),
-# so a listening instance's node id changes between runs. Set 'identity_file'
-# (below) to persist the key and keep a stable node id.
+# Node id: the iroh identity key is always ephemeral (regenerated every run), so a
+# listening instance's node id changes between runs. nostr is used as a side
+# channel to publish & look up the current node id, keyed off the shared auth_token
+# (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
 # The shared auth token, presented by both sides. Optional: a fresh listening
 # instance generates one if absent (shown in the TUI). Generate with:
@@ -29,11 +32,17 @@
 # Supply it via 'auth_token_file' (recommended) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/token.txt"
 
-# Persisted iroh identity for a STABLE node id (config-file mode only). When set,
-# the file is read if present; on first run, if it is missing, you are asked to
-# confirm before a new key is generated and written (mode 0o600). Leave unset for
-# an ephemeral identity (a fresh node id every run, the default).
-# identity_file = "~/.config/duopipe/identity.key"
+# Nostr node-id discovery. Both peers derive a shared nostr key from the auth_token
+# above; the listener publishes its current ephemeral node id and the dialer looks
+# it up, so the node id never has to be exchanged by hand. The node id is public
+# (auth_token still gates the connection), so nothing here is a secret.
+#
+# Relays default to a built-in public set; override here if you want specific ones:
+# nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
+#
+# Discovery is on by default. Set false to disable it (then a dialer must be given
+# the node id directly, and a listener won't publish):
+# nostr_discovery = false
 
 # Maximum concurrent data streams per connection (default: 100).
 # max_streams = 100

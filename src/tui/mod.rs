@@ -46,8 +46,11 @@ pub struct TuiLaunch {
     /// A valid auth token from config/env (pre-seeds the dial flow; used directly
     /// for listen). Pre-validated in main.
     pub config_auth_token: Option<String>,
-    /// Optional persisted iroh identity (stable node id). `None` ⇒ ephemeral.
-    pub secret_key: Option<iroh::SecretKey>,
+    /// Nostr relay URLs for node-id discovery.
+    pub nostr_relays: Vec<String>,
+    /// Whether nostr node-id discovery is enabled (listener publishes, dialer
+    /// looks up). The iroh identity is always ephemeral regardless.
+    pub nostr_discovery: bool,
 }
 
 /// Run the interactive setup, then the live dashboard, until the user quits or
@@ -62,6 +65,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         &mut events,
         launch.config_auth_token.clone(),
         launch.allowed_sources.clone(),
+        launch.nostr_discovery,
     )
     .await
     {
@@ -146,7 +150,8 @@ fn build_peer_config(
         allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests: false,
         auth_token: resolved.auth_token.clone(),
-        secret_key: launch.secret_key.clone(),
+        nostr_relays: launch.nostr_relays.clone(),
+        nostr_discovery: launch.nostr_discovery,
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),
@@ -163,8 +168,9 @@ async fn run_setup(
     events: &mut EventStream,
     config_auth_token: Option<String>,
     config_allowed_sources: AllowedSources,
+    nostr_discovery: bool,
 ) -> SetupOutcome {
-    let mut state = SetupState::new(config_auth_token, config_allowed_sources);
+    let mut state = SetupState::new(config_auth_token, config_allowed_sources, nostr_discovery);
     let mut tick = tokio::time::interval(TICK);
 
     loop {

@@ -109,12 +109,16 @@ pub struct PeerConfig {
     /// (set from `DUOPIPE_AUTOSTART_REQUESTS` in test mode; see `DUOPIPE_TEST_MODE`).
     pub autostart_requests: bool,
     /// The shared auth token (presented when dialing, required when listening).
-    /// **Sensitive - redacted in Debug.**
+    /// Also the rendezvous secret for nostr discovery: both peers derive the same
+    /// nostr key from it. **Sensitive - redacted in Debug.**
     pub auth_token: String,
-    /// Optional persisted iroh identity. `Some` ⇒ stable node id (from a config
-    /// `identity_file` or the `DUOPIPE_SECRET_KEY` test var); `None` ⇒ ephemeral
-    /// identity (a fresh node id every run). **Sensitive - redacted in Debug.**
-    pub secret_key: Option<iroh::SecretKey>,
+    /// Nostr relay URLs used for node-id discovery.
+    pub nostr_relays: Vec<String>,
+    /// When true, use the nostr side channel: the listener publishes its current
+    /// ephemeral node id; the dialer looks it up (keyed off `auth_token`). The iroh
+    /// identity itself is always ephemeral. Disabled in headless test mode, where
+    /// the dialer's node id is wired directly.
+    pub nostr_discovery: bool,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -141,10 +145,8 @@ impl std::fmt::Debug for PeerConfig {
             .field("allowed_sources", &self.allowed_sources)
             .field("autostart_requests", &self.autostart_requests)
             .field("auth_token", &"[REDACTED]")
-            .field(
-                "secret_key",
-                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
-            )
+            .field("nostr_relays", &self.nostr_relays)
+            .field("nostr_discovery", &self.nostr_discovery)
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
@@ -181,7 +183,6 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     let endpoint = create_server_endpoint(
         &config.relay_urls,
         config.relay_only,
-        config.secret_key.clone(),
         config.dns_server.as_deref(),
         ALPN,
         Some(&config.transport),
@@ -199,6 +200,21 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     log::info!("node id: {}", endpoint_id);
     log::info!("Dial this instance with the node id and auth token.");
     log::info!("Waiting for peers to connect...");
+
+    // Publish the (ephemeral) node id to nostr so a peer sharing the auth token can
+    // discover it without a manual node-id exchange. Runs in the background and
+    // republishes periodically; relay failures are logged but non-fatal (peers who
+    // already have the node id still connect directly).
+    let _publisher = if config.nostr_discovery {
+        Some(spawn_node_id_publisher(
+            config.auth_token.clone(),
+            endpoint_id,
+            config.nostr_relays.clone(),
+            config.status.shutdown.clone(),
+        ))
+    } else {
+        None
+    };
 
     let shutdown = config.status.shutdown.clone();
     let config = Arc::new(config);
@@ -243,14 +259,51 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Background guard that aborts the node-id publisher task on drop.
+struct PublisherGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for PublisherGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Interval between node-id republishes. Replaceable nostr events can be dropped by
+/// relays at varying times, so we refresh periodically while listening.
+const NODE_ID_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Spawn a task that publishes our ephemeral node id to nostr now, then refreshes
+/// it every [`NODE_ID_REPUBLISH_INTERVAL`] until shutdown.
+fn spawn_node_id_publisher(
+    auth_token: String,
+    node_id: EndpointId,
+    relays: Vec<String>,
+    shutdown: CancellationToken,
+) -> PublisherGuard {
+    PublisherGuard(tokio::spawn(async move {
+        loop {
+            match crate::nostr_discovery::publish_node_id(&auth_token, &node_id, &relays).await {
+                Ok(()) => log::info!("Published node id to nostr for peer discovery"),
+                Err(e) => log::warn!("Failed to publish node id to nostr: {e:#}"),
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(NODE_ID_REPUBLISH_INTERVAL) => {}
+            }
+        }
+    }))
+}
+
 // ============================================================================
 // Dial role
 // ============================================================================
 
 async fn run_dial(config: PeerConfig) -> Result<()> {
-    let peer_id: EndpointId = config
-        .peer_node_id
-        .context("dial role requires peer_node_id")?;
+    if config.peer_node_id.is_none() && !config.nostr_discovery {
+        anyhow::bail!(
+            "dial role requires a peer node id (provide one, or enable nostr discovery)"
+        );
+    }
 
     log::info!("Symmetric Peer - Dial Mode");
     log::info!("==========================");
@@ -259,7 +312,6 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
         &config.relay_urls,
         config.relay_only,
         config.dns_server.as_deref(),
-        config.secret_key.as_ref(),
         Some(&config.transport),
     )
     .await?;
@@ -268,6 +320,10 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
 
     let shutdown = config.status.shutdown.clone();
     let config = Arc::new(config);
+    // The peer's node id: either supplied directly (manual entry / test fast-path)
+    // or discovered via nostr. When discovered it is re-resolved on each connect
+    // attempt so a listener that restarted with a fresh ephemeral id self-heals.
+    let peer_id: Option<EndpointId> = config.peer_node_id;
     let mut backoff = Duration::from_secs(1);
     // Until the first connection is fully established and served, cap retries (see
     // `MAX_INITIAL_CONNECT_ATTEMPTS`). Once we have served a real session at least
@@ -278,15 +334,41 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
 
     loop {
         config.status.set_conn_status(ConnStatus::Connecting);
-        let connect = tokio::select! {
-            _ = shutdown.cancelled() => break,
-            connect = connect_to_server(
-                &endpoint,
-                peer_id,
-                &config.relay_urls,
-                config.relay_only,
-                ALPN,
-            ) => connect,
+
+        // Resolve the target node id. If one was supplied directly, use it as-is.
+        // Otherwise look it up on nostr now — re-resolving every attempt means a
+        // listener that restarted with a fresh ephemeral id is picked up here.
+        let target: Result<EndpointId> = match peer_id {
+            Some(id) => Ok(id),
+            None => tokio::select! {
+                _ = shutdown.cancelled() => break,
+                r = crate::nostr_discovery::lookup_node_id(
+                    &config.auth_token,
+                    &config.nostr_relays,
+                ) => match r {
+                    Ok(id) => {
+                        log::info!("Discovered peer node id via nostr: {id}");
+                        Ok(id)
+                    }
+                    Err(e) => Err(e.context("nostr node-id lookup failed")),
+                },
+            },
+        };
+
+        let connect = match target {
+            Ok(id) => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    connect = connect_to_server(
+                        &endpoint,
+                        id,
+                        &config.relay_urls,
+                        config.relay_only,
+                        ALPN,
+                    ) => connect,
+                }
+            }
+            Err(e) => Err(e),
         };
 
         match connect {
@@ -1001,7 +1083,8 @@ mod tests {
             allowed_sources: AllowedSources::default(),
             autostart_requests: false,
             auth_token: token.to_string(),
-            secret_key: None,
+            nostr_relays: vec![],
+            nostr_discovery: false,
             relay_urls: vec![],
             relay_only: false,
             dns_server: Some("none".to_string()),
@@ -1016,7 +1099,7 @@ mod tests {
         // Relay disabled + DNS off: a fully local, direct-only endpoint. The shared
         // transport config still applies keep-alive (15s) and a 300s idle timeout,
         // so a connection between two of these stays alive for the whole test.
-        create_endpoint_builder(RelayMode::Disabled, false, Some("none"), None, None)
+        create_endpoint_builder(RelayMode::Disabled, false, Some("none"), None)
             .expect("endpoint builder")
             .alpns(vec![ALPN.to_vec()])
             .bind()

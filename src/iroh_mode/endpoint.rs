@@ -8,7 +8,7 @@ use crate::error::TunnelError;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, TransportAddr,
     address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
     endpoint::{
         AckFrequencyConfig, Builder as EndpointBuilder, ControllerFactory, PathList,
@@ -118,14 +118,14 @@ pub fn print_relay_status(relay_urls: &[String], relay_only: bool, using_custom_
 /// * `relay_mode` - The relay mode to use
 /// * `relay_only` - If true, only use relay connections (no direct P2P).
 /// * `dns_server` - Optional custom DNS server URL (e.g., "https://dns.example.com"), or "none" to disable DNS discovery
-/// * `secret_key` - Optional iroh identity key. Normal runtime passes `None`,
-///   so iroh generates an ephemeral identity.
 /// * `transport_tuning` - Optional transport layer tuning (congestion control, buffer sizes)
+///
+/// The iroh identity is always ephemeral (a fresh node id every run); node-id
+/// discovery is handled out-of-band via nostr, so no secret key is wired in here.
 pub fn create_endpoint_builder(
     relay_mode: RelayMode,
     relay_only: bool,
     dns_server: Option<&str>,
-    secret_key: Option<&SecretKey>,
     transport_tuning: Option<&TransportTuning>,
 ) -> Result<EndpointBuilder> {
     // Configure transport with keep-alive and idle timeout.
@@ -222,18 +222,12 @@ pub fn create_endpoint_builder(
                 info!("DNS discovery disabled (dns_server=none)");
             }
             Some(dns_url) => {
-                // Custom DNS server with publishing and resolving via HTTP (pkarr)
+                // Custom DNS server, resolve only via HTTP (pkarr). The ephemeral
+                // identity is not published to a custom DNS server; peers discover
+                // the node id via nostr instead.
                 let pkarr_url: Url = dns_url.parse().context("Invalid DNS server URL")?;
-                if secret_key.is_some() {
-                    info!("Using custom DNS server: {}", dns_url);
-                    builder = builder
-                        .address_lookup(PkarrPublisher::builder(pkarr_url.clone()))
-                        .address_lookup(PkarrResolver::builder(pkarr_url));
-                } else {
-                    // Custom DNS server, resolve only via HTTP (no secret = can't publish)
-                    info!("Using custom DNS server (resolve only): {}", dns_url);
-                    builder = builder.address_lookup(PkarrResolver::builder(pkarr_url));
-                }
+                info!("Using custom DNS server (resolve only): {}", dns_url);
+                builder = builder.address_lookup(PkarrResolver::builder(pkarr_url));
             }
             None => {
                 // Default n0 DNS
@@ -284,12 +278,11 @@ async fn wait_for_endpoint_online(endpoint: &Endpoint) -> Result<()> {
     }
 }
 
-/// Create a listening endpoint. Normal runtime passes no secret key, so the
-/// endpoint identity is ephemeral and the node id changes every run.
+/// Create a listening endpoint. The endpoint identity is ephemeral, so the node
+/// id changes every run; peers discover the current node id via nostr.
 pub async fn create_server_endpoint(
     relay_urls: &[String],
     relay_only: bool,
-    secret: Option<SecretKey>,
     dns_server: Option<&str>,
     alpn: &[u8],
     transport_tuning: Option<&TransportTuning>,
@@ -298,18 +291,8 @@ pub async fn create_server_endpoint(
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(
-        relay_mode,
-        relay_only,
-        dns_server,
-        secret.as_ref(),
-        transport_tuning,
-    )?
-    .alpns(vec![alpn.to_vec()]);
-
-    if let Some(secret) = secret {
-        builder = builder.secret_key(secret);
-    }
+    let builder = create_endpoint_builder(relay_mode, relay_only, dns_server, transport_tuning)?
+        .alpns(vec![alpn.to_vec()]);
 
     let endpoint = builder
         .bind()
@@ -321,31 +304,18 @@ pub async fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create a dialing endpoint. Normal runtime passes no secret key, so the
-/// endpoint identity is ephemeral.
+/// Create a dialing endpoint. The endpoint identity is ephemeral.
 pub async fn create_client_endpoint(
     relay_urls: &[String],
     relay_only: bool,
     dns_server: Option<&str>,
-    secret_key: Option<&SecretKey>,
     transport_tuning: Option<&TransportTuning>,
 ) -> Result<Endpoint> {
     let relay_mode = parse_relay_mode(relay_urls)?;
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(
-        relay_mode,
-        relay_only,
-        dns_server,
-        secret_key,
-        transport_tuning,
-    )?;
-
-    // Set a caller-supplied identity key. The normal runtime leaves this unset.
-    if let Some(secret) = secret_key {
-        builder = builder.secret_key(secret.clone());
-    }
+    let builder = create_endpoint_builder(relay_mode, relay_only, dns_server, transport_tuning)?;
 
     let endpoint = builder
         .bind()
