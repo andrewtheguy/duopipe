@@ -518,20 +518,21 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
     let _ = writeln!(out, "duopipe connection info");
     let _ = writeln!(out, "generated: {}", now.strftime("%Y-%m-%d %H:%M:%S"));
     let _ = writeln!(out, "host:      {}", snap.hostname);
-    let _ = writeln!(out, "role:      {}", snap.role.label());
+    let _ = writeln!(out, "mode:      {}", ui::mode_label(snap));
+    if let Some(name) = ui::own_name_display(snap) {
+        let _ = writeln!(out, "name:      {name}");
+    }
     let _ = writeln!(
         out,
         "node id:   {}",
         snap.endpoint_id.as_deref().unwrap_or("(pending)")
     );
-    if matches!(snap.role, Role::Dial | Role::Both) {
-        let _ = writeln!(
-            out,
-            "dial:      {}",
-            snap.dial_target.as_deref().unwrap_or("(none)")
-        );
+    if let Some(target) = snap.dial_target.as_deref() {
+        let _ = writeln!(out, "dial:      {target}");
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
+    } else {
+        let _ = writeln!(out, "dial:      not connected (press c)");
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
 
@@ -771,6 +772,30 @@ mod tests {
 
         assert!(ui.token_banner_hidden);
         assert!(ui.token_banner_auto_hide_at.is_none());
+    }
+
+    #[test]
+    fn dump_connection_info_uses_mode_name_and_omits_idle_path() {
+        let st = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            Vec::new(),
+            true,
+            Some("web1".to_string()),
+        );
+        st.set_endpoint_id("node-123".to_string());
+
+        let path = dump_connection_info(&st.snapshot()).expect("dump path");
+        let text = std::fs::read_to_string(&path).expect("dump contents");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(text.contains("mode:      nostr"));
+        assert!(text.contains("name:      web1"));
+        assert!(text.contains("dial:      not connected (press c)"));
+        assert!(!text.contains("role:"));
+        assert!(!text.contains("status:"));
+        assert!(!text.contains("path:"));
     }
 
     #[test]

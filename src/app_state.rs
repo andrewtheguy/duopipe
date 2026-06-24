@@ -512,6 +512,8 @@ impl AppState {
             role: self.role,
             hostname: self.hostname.clone(),
             token_generated: self.token_generated,
+            nostr_discovery: self.nostr_discovery,
+            own_name: self.own_name.clone(),
             endpoint_id: self.endpoint_id.read().clone(),
             auth_token: self.auth_token.read().clone(),
             conn_status: self.conn_status.read().clone(),
@@ -530,6 +532,8 @@ pub struct AppSnapshot {
     pub role: Role,
     pub hostname: String,
     pub token_generated: bool,
+    pub nostr_discovery: bool,
+    pub own_name: Option<String>,
     pub endpoint_id: Option<String>,
     pub auth_token: Option<String>,
     pub conn_status: ConnStatus,
@@ -627,5 +631,22 @@ mod tests {
         let peers = state.snapshot().peers;
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].remote_id, "peer-b");
+    }
+
+    #[test]
+    fn snapshot_carries_mode_metadata() {
+        let state = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            vec![],
+            true,
+            Some("web1".to_string()),
+        );
+
+        let snap = state.snapshot();
+
+        assert!(snap.nostr_discovery);
+        assert_eq!(snap.own_name.as_deref(), Some("web1"));
     }
 }
