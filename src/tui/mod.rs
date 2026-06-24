@@ -596,6 +596,38 @@ mod tests {
         }
     }
 
+    fn type_connect_target(ui: &mut UiState, st: &Arc<AppState>, s: &str) {
+        for c in s.chars() {
+            handle_connect_form(key(KeyCode::Char(c)), ui, st);
+        }
+    }
+
+    #[test]
+    fn connect_submit_keeps_modal_open_when_dial_manager_is_absent() {
+        let st = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            Vec::new(),
+            true,
+            Some("web1".to_string()),
+        );
+        let mut ui = UiState {
+            connect_form: Some(ConnectForm::default()),
+            ..Default::default()
+        };
+
+        type_connect_target(&mut ui, &st, "homelab");
+        handle_connect_form(key(KeyCode::Enter), &mut ui, &st);
+
+        let form = ui.connect_form.as_ref().expect("form stays open");
+        assert_eq!(
+            form.error.as_deref(),
+            Some("Dial manager is not running; cannot connect")
+        );
+        assert_eq!(st.snapshot().dial_target, None);
+    }
+
     #[test]
     fn add_form_valid_submit_appends_and_closes() {
         let st = state();
