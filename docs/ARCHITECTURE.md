@@ -24,9 +24,9 @@ duopipe is a P2P TCP/UDP port forwarding tool using iroh for peer discovery, rel
 
 Binary: `duopipe`
 
-> **Design Goal:** The project's primary goal is to provide a convenient way to connect to different networks for development or homelab purposes without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale. It is meant for **interactive use** (`duopipe start` and its TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
+> **Design Goal:** The project's primary goal is to provide a convenient way to connect to different networks for development or homelab purposes without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe nostr` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
-duopipe runs as a single, **symmetric peer**: `duopipe start`, which launches an interactive ratatui TUI. There is no separate "server" and "client" binary mode. Connection *setup* is asymmetric — QUIC needs one side to dial and the other to accept — but once a connection exists, **either side can open streams**, so tunnels flow in **both directions** over the one connection.
+duopipe runs as a single, **symmetric peer**, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Connection *setup* is asymmetric — QUIC needs one side to dial and the other to accept — but once a connection exists, **either side can open streams**, so tunnels flow in **both directions** over the one connection.
 
 The role is chosen **at startup**: the TUI asks "Connect to an existing instance?" (or, for tests, the role is derived from environment variables — see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated on every run, so the listener's node id changes each run.
 
@@ -159,12 +159,12 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same `duopipe start` runtime. The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own request listeners, so tunnel requests (`[[request]]`) activated on either side all multiplex over the single connection.
+Both ends run the same peer runtime (`duopipe quick` or `duopipe nostr`). The only asymmetry is who establishes the QUIC connection. Once authenticated, each peer runs **both** an accept-streams loop *and* its own request listeners, so tunnel requests (`[[request]]`) activated on either side all multiplex over the single connection.
 
 ```mermaid
 graph TB
     subgraph "Listen Peer"
-        A[duopipe start<br/>answered no]
+        A[duopipe quick/nostr<br/>answered no]
         B[iroh Endpoint<br/>ephemeral node id]
         C[Accept Loop +<br/>Request Listeners]
         D[Discovery<br/>Pkarr/DNS]
@@ -172,7 +172,7 @@ graph TB
     end
 
     subgraph "Dial Peer"
-        F[duopipe start<br/>answered yes]
+        F[duopipe quick/nostr<br/>answered yes]
         G[iroh Endpoint<br/>ephemeral node id]
         H[Accept Loop +<br/>Request Listeners]
         I[Discovery<br/>Pkarr/DNS]
@@ -472,7 +472,7 @@ local_listen = "127.0.0.1:2222"
 
 ### Configuration Loading Flow
 
-Configs are file-based (`-c`, `--default-config`) and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`. Without a config flag, configuration comes from environment variables and interactive prompts only.
+Config files are read by `duopipe nostr` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config: configuration comes from environment variables, the `--auth-token-file` flag, and interactive prompts only.
 
 ```mermaid
 sequenceDiagram
@@ -482,18 +482,17 @@ sequenceDiagram
     participant Source as Config Source (file)
 
     CLI->>Main: Parse arguments
-    Main->>Main: Check config flags (only one allowed)
 
-    alt --default-config
+    alt duopipe nostr (no -c)
         Main->>Config: Load from default path
         Config->>Source: Read ~/.config/duopipe/peer.toml
         Source-->>Config: TOML content
-    else -c <path>
+    else duopipe nostr -c <path>
         Main->>Config: Load from specified path
         Config->>Source: Read file
         Source-->>Config: TOML content
-    else No config flag
-        Main->>Main: Use env vars + interactive prompts only
+    else duopipe quick
+        Main->>Main: Use env vars + --auth-token-file + interactive prompts only
     end
 
     alt Config loaded
@@ -692,7 +691,7 @@ sequenceDiagram
     participant EP as iroh Endpoint
 
     Note over EP: No key file — fresh identity each run
-    User->>TUI: duopipe start  (answer "no" → listen)
+    User->>TUI: duopipe quick/nostr  (answer "no" → listen)
     TUI->>EP: Create endpoint (ephemeral identity)
     EP->>EP: Derive node id from fresh keypair
     EP-->>TUI: node id

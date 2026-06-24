@@ -3,23 +3,22 @@ run cargo clippy and cargo test -q after making rust code changes.
 no cargo fmt
 
 # Usage model
-This project is meant for interactive usage: `duopipe start` runs a TUI that asks,
-on startup, whether to connect to an existing instance.
+This project is meant for interactive usage: a TUI asks, on startup, whether to
+connect to an existing instance. There are two interactive subcommands, one per
+mode:
+- Configless mode — `duopipe quick [--auth-token-file <path>]`: ephemeral node id,
+  no nostr, no config file. The auth token is generated fresh each run (shown in
+  the TUI), or loaded from `--auth-token-file` / `DUOPIPE_AUTH_TOKEN`. A dialer
+  enters the peer's node id manually (there is no nostr side channel to discover it).
+- Nostr mode — `duopipe nostr [-c <file>]`: reads a config file (the `-c` path, or
+  the default `~/.config/duopipe/peer.toml`) and requires a *provided* auth token
+  (it is the nostr rendezvous secret — a generated one couldn't be discovered by
+  the peer), so startup fails fast if none is supplied via `DUOPIPE_AUTH_TOKEN` or
+  config `auth_token_file`. Nostr publishes/looks up the node id (see below), so
+  when connecting the node id can be left blank to discover it, or entered manually.
 
-There are two modes, selected purely by whether a config file is loaded:
-- Configless mode (`duopipe start`, no `-c`/`--default-config`): ephemeral node id,
-  no nostr. The auth token is generated fresh each run (shown in the TUI), or loaded
-  from `--auth-token-file <path>` / `DUOPIPE_AUTH_TOKEN`. A dialer enters the peer's
-  node id manually (there is no nostr side channel to discover it).
-- Nostr mode (`duopipe start -c <file>` / `--default-config`): requires a *provided*
-  auth token (it is the nostr rendezvous secret — a generated one couldn't be
-  discovered by the peer), so startup fails fast if none is supplied via
-  `--auth-token-file`, `DUOPIPE_AUTH_TOKEN`, or config `auth_token_file`. Nostr
-  publishes/looks up the node id (see below), so when connecting the node id can be
-  left blank to discover it, or entered manually.
-
-Token precedence is `--auth-token-file` > `DUOPIPE_AUTH_TOKEN` > config
-`auth_token_file`.
+Token precedence is `--auth-token-file` (quick only) > `DUOPIPE_AUTH_TOKEN` > config
+`auth_token_file` (nostr only).
 
 Test usage is supported only for testing purposes, driven by env vars.
 `DUOPIPE_TEST_MODE=1` is the single gate: it runs the peer headless (no TUI, logs

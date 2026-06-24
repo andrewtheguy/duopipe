@@ -2,10 +2,10 @@
 
 **Cross-platform secure P2P TCP/UDP port forwarding with NAT traversal, driven by an interactive TUI.**
 
-Duopipe enables you to forward TCP and UDP traffic between machines without requiring public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted connections between peers using modern P2P networking techniques. It is driven through an interactive terminal UI (TUI) launched with `duopipe start`, which walks you through connecting to a peer and managing tunnels.
+Duopipe enables you to forward TCP and UDP traffic between machines without requiring public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted connections between peers using modern P2P networking techniques. It is driven through an interactive terminal UI (TUI) launched with `duopipe quick` (configless) or `duopipe nostr` (config-driven, with node-id discovery), which walks you through connecting to a peer and managing tunnels.
 
 > [!IMPORTANT]
-> **Project Goal:** This tool provides a convenient way to connect to different networks for **development or homelab purposes** without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale. It is meant for **interactive use** (`duopipe start` and its TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
+> **Project Goal:** This tool provides a convenient way to connect to different networks for **development or homelab purposes** without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe nostr` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
 > [!WARNING]
 > **No Backward Compatibility (Pre-1.0):** During initial development before version 1.0, no backward compatibility or migration path is provided between minor versions (e.g., 0.1.x to 0.2.x). Expect to regenerate tokens and rebuild peer configurations when upgrading in between minor versions.
@@ -36,7 +36,7 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 
 ## Overview
 
-duopipe runs as a single symmetric command: `duopipe start`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
+duopipe runs as a single symmetric peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
@@ -147,7 +147,7 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **nostr mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, the listener publishes its current node id, and the dialer looks it up automatically (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe start` with no config) nostr is off and the dialer enters the node id manually. The node id is always shown in the TUI header.
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **nostr mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, the listener publishes its current node id, and the dialer looks it up automatically (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe quick`) nostr is off and the dialer enters the node id manually. The node id is always shown in the TUI header.
 
 ## Authentication
 
@@ -226,29 +226,29 @@ For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe start` on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
+duopipe is **interactive-first**: you run `duopipe nostr` (config-driven, with node-id discovery) on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
 
 ### 1. Start the listening instance
 
 On the first machine, point at a config that declares the requests (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
-duopipe start -c ./peer.toml
+duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step. The token hides automatically after 10 minutes, or immediately when you press `h`.
+When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. The auth token must be supplied (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); the listener then publishes its current node id to nostr so the dialer can find it. The TUI header shows the **node id** and the **auth token**.
 
-> **Important:** The node id is regenerated on every run (the identity is ephemeral), so re-copy it each time you start the listener.
+> **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — the dialer discovers it via the shared auth token.
 
 ### 2. Start the dialing instance
 
 On the second machine (also pointed at a config that declares its requests):
 
 ```bash
-duopipe start -c ./peer.toml
+duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. It prompts for the listener's **node id**, and for the **auth token** if one isn't already in config or the `DUOPIPE_AUTH_TOKEN` env var. Both are validated before connecting.
+When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Leave the **node id** blank to discover it via nostr (or enter it manually). The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
 
 Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
 
@@ -301,17 +301,23 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ## CLI Options
 
-### start
+Both interactive subcommands launch the same TUI; they differ only in mode. The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
 
-`duopipe start` launches the interactive TUI. Loading a config file (`-c`/`--default-config`) selects **nostr mode**; with no config it runs **configless** (ephemeral id and token, no nostr). Everything else (requests, relays, DNS, max-streams, relay-only, auth token) comes from the config file and/or environment variables.
+### quick (configless mode)
+
+`duopipe quick` runs everything ephemeral with **no config file** and **no nostr**: the node id changes every run and a dialer enters it by hand.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config`, `-c` | - | Path to TOML config file (enables nostr mode) |
-| `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` (enables nostr mode) |
-| `--auth-token-file` | - | Path to a file holding the shared auth token. Precedence: this flag > `DUOPIPE_AUTH_TOKEN` > config `auth_token_file`. Lets configless mode use a fixed token instead of a generated one. |
+| `--auth-token-file` | - | Path to a file holding the shared auth token. Precedence: this flag > `DUOPIPE_AUTH_TOKEN`. Without either, a fresh ephemeral token is generated each run. |
 
-The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)). Nostr mode requires a provided auth token and fails fast if none is supplied.
+### nostr (config-driven mode)
+
+`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It **requires a provided auth token** (the nostr rendezvous secret) and fails fast if none is supplied via config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--config`, `-c` | `~/.config/duopipe/peer.toml` | Path to TOML config file |
 
 **Environment variables:**
 
@@ -324,7 +330,7 @@ The connection role (listen/dial) and the dialer's target node id are chosen int
 
 ## Configuration Files
 
-Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). Prefer config files so your settings are saved and reusable. Only one of these may be used at a time. All config keys live at the top level.
+Config files are used by `duopipe nostr`: run it with no flag to load the default location, or `-c <path>` for a custom path (TOML). Prefer config files so your settings are saved and reusable. All config keys live at the top level.
 
 > **Security:** Supply the auth token with `auth_token_file` or the `DUOPIPE_AUTH_TOKEN` environment variable — it is never written inline in the config file.
 
@@ -332,11 +338,11 @@ Use `--default-config` to load from the default location, or `-c <path>` for a c
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-Loading a config file selects **nostr mode** and requires a provided auth token. The config holds the tunnel requests, the path to the auth token, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
+`duopipe nostr` requires a provided auth token. The config holds the tunnel requests, the path to the auth token, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
 
 ### Node-id discovery
 
-Nostr discovery is active whenever a config file is loaded. The iroh node id is ephemeral, so the listener publishes its current node id to **nostr** and the dialer looks it up — no manual copy needed. Both peers derive the same nostr key from the shared auth token, so nothing extra is exchanged (the node id is public; the auth token still gates the connection, and the value is not encrypted). To skip nostr entirely, run configless (no config file) and enter the node id by hand.
+Nostr discovery is active in `duopipe nostr`. The iroh node id is ephemeral, so the listener publishes its current node id to **nostr** and the dialer looks it up — no manual copy needed. Both peers derive the same nostr key from the shared auth token, so nothing extra is exchanged (the node id is public; the auth token still gates the connection, and the value is not encrypted). To skip nostr entirely, run `duopipe quick` and enter the node id by hand.
 
 ```toml
 # Relays default to a built-in public set; override if desired:
@@ -391,10 +397,10 @@ tcp = ["127.0.0.0/8"]
 
 ```bash
 # Load from default location (~/.config/duopipe/peer.toml)
-duopipe start --default-config
+duopipe nostr
 
 # Load from custom path
-duopipe start -c ./my-peer.toml
+duopipe nostr -c ./my-peer.toml
 ```
 
 ---

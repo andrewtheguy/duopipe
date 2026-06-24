@@ -1,17 +1,17 @@
 # duopipe peer configuration example
 #
-# Usage: duopipe start -c peer.toml
-#        duopipe start --default-config   # loads ~/.config/duopipe/peer.toml
+# Usage: duopipe nostr -c peer.toml
+#        duopipe nostr                    # loads ~/.config/duopipe/peer.toml
 #
-# Loading a config file selects NOSTR MODE: the listener publishes its current
-# ephemeral node id to nostr and a dialer looks it up, so the node id need not be
-# exchanged by hand. Nostr mode REQUIRES a provided auth token (it is the nostr
-# rendezvous secret) — set 'auth_token_file' below or the DUOPIPE_AUTH_TOKEN env
-# var. Running `duopipe start` with no config is the other mode (configless): the
-# id and token are ephemeral, nostr is off, and the dialer enters the node id by
-# hand (supply a token there with `duopipe start --auth-token-file <path>`).
+# This file is read by NOSTR MODE (`duopipe nostr`): the listener publishes its
+# current ephemeral node id to nostr and a dialer looks it up, so the node id need
+# not be exchanged by hand. Nostr mode REQUIRES a provided auth token (it is the
+# nostr rendezvous secret) — set 'auth_token_file' below or the DUOPIPE_AUTH_TOKEN
+# env var. The other mode is configless (`duopipe quick`): the id and token are
+# ephemeral, nostr is off, and the dialer enters the node id by hand (supply a
+# token there with `duopipe quick --auth-token-file <path>`).
 #
-# `duopipe start` is interactive: on startup the TUI asks whether to connect to an
+# `duopipe nostr` is interactive: on startup the TUI asks whether to connect to an
 # existing instance. The role (dial/listen) and the target node id are answered
 # there — they are NOT config keys. In nostr mode the node id can be left blank to
 # discover it via nostr. This file supplies the rest: the shared auth token, tunnel
