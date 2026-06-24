@@ -286,6 +286,43 @@ local_listen = "0.0.0.0:51820"
 
 > **Note:** UDP requests use a single-peer-address reply model — suitable for single-client UDP services.
 
+### Bidirectional tunnels — both directions on demand
+
+The tunnel model is one-directional per connection: **the dialer requests, the
+listener only serves.** So if `homelab` listens and `laptop` dials, only `laptop`
+can pull tunnels from `homelab`. To *also* let `homelab` reach a service on
+`laptop` on demand, that direction needs its own listener (on `laptop`) and dialer
+(on `homelab`).
+
+The way to do this today is to **run two instances per machine** — one listening,
+one dialing — reusing the same config file (the role is chosen interactively):
+
+```bash
+# on the homelab box
+duopipe nostr -c ./homelab.toml   # answer No  → LISTEN (serves laptop)
+duopipe nostr -c ./homelab.toml   # answer Yes → DIAL, target: laptop
+
+# on the laptop box
+duopipe nostr -c ./laptop.toml    # answer No  → LISTEN (serves homelab)
+duopipe nostr -c ./laptop.toml    # answer Yes → DIAL, target: homelab
+```
+
+Each box's `[[request]]` list drives what it pulls **when dialing**, and its
+`[allowed_sources]` gates what peers may reach **when listening** — so a single
+config already carries both halves. Start the tunnels you want in each dialing
+TUI.
+
+**This does not conflict on nostr.** Only the *listener* publishes its node id,
+and each record is keyed by a `d` tag derived from that listener's own `name`
+(salted with the auth token). Two machines listening under distinct names
+(`homelab`, `laptop`) publish two independent records; the dialers only *read*
+(they publish nothing). The only requirement is that **each machine listens under
+a unique `name`** — which is already true for distinct peers. Pick non-colliding
+`local_listen` ports if you run a listener and a dialer on the same host.
+
+> Running two processes per machine is the current answer; a single dual-role
+> process with a split TUI is planned — see [docs/ROADMAP.md](docs/ROADMAP.md).
+
 ### Test mode (testing only)
 
 duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1` runs the peer **headless** (no TUI, logs to stderr, needs no terminal) and is the single gate that enables all test-only env vars:
