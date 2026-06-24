@@ -21,15 +21,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use iroh::EndpointId;
-use iroh::endpoint::{ApplicationClose, ConnectionError};
+use iroh::endpoint::ConnectionError;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::app_state::{
-    AppState, ConnStatus, PeerAdmission, Role, TunnelCommand, TunnelId, TunnelStatus,
-};
+use crate::app_state::{AppState, ConnStatus, Role, TunnelCommand, TunnelId, TunnelStatus};
 use crate::auth::is_token_valid;
 use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
@@ -70,16 +68,6 @@ const AUTH_FAILED_CODE: u32 = 1;
 
 /// Connection close code for authentication timeout (no auth within deadline).
 const AUTH_TIMEOUT_CODE: u32 = 2;
-
-/// Connection close code for a *transient* rejection: the bound peer's previous
-/// connection is still tearing down (listen role). Not fatal — the dialer retries
-/// with backoff and gets back in once the old connection clears.
-const PEER_BUSY_CODE: u32 = 3;
-
-/// Connection close code for a peer rejected because the session is bound to a
-/// different node id (listen role). Fatal for the dialer: its node id won't match
-/// until the listener unbinds or restarts, so retrying can never succeed.
-const WRONG_PEER_CODE: u32 = 4;
 
 /// Connection close code for a clean local shutdown (Ctrl-C). "No error" by
 /// convention; the peer just sees the connection go away.
@@ -181,6 +169,22 @@ pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
 // Listen role
 // ============================================================================
 
+/// Create the global stream limiter and register it for the TUI gauge. Shared by
+/// every peer connection — one process-wide cap on concurrent forwarded streams.
+///
+/// Fails fast on `max_streams = 0`: a zero-permit semaphore would reject *every*
+/// forwarded stream, silently breaking all tunnels. `Config::validate()` doesn't
+/// cover this, so guard it here before any tunnel setup runs.
+fn new_stream_semaphore(config: &PeerConfig) -> Result<Arc<Semaphore>> {
+    let max_streams = config.max_streams.unwrap_or(DEFAULT_MAX_STREAMS);
+    if max_streams == 0 {
+        anyhow::bail!("max_streams must be greater than 0 (got 0; it caps concurrent streams)");
+    }
+    let semaphore = Arc::new(Semaphore::new(max_streams));
+    config.status.set_semaphore(semaphore.clone(), max_streams);
+    Ok(semaphore)
+}
+
 async fn run_listen(config: PeerConfig) -> Result<()> {
     log::info!("Symmetric Peer - Listen Mode");
     log::info!("============================");
@@ -222,6 +226,9 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     };
 
     let shutdown = config.status.shutdown.clone();
+    // One global stream limiter shared by every connected peer. Set once so the gauge
+    // tracks it exactly.
+    let semaphore = new_stream_semaphore(&config)?;
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
@@ -251,8 +258,9 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
         log::info!("Peer connected: {} (awaiting auth)", remote_id);
 
         let config = config.clone();
+        let semaphore = semaphore.clone();
         connection_tasks.spawn(async move {
-            if let Err(e) = handle_connection(conn, config, false).await {
+            if let Err(e) = handle_connection(conn, config, semaphore, false).await {
                 log::warn!("Connection error for {}: {}", remote_id, e);
             }
         });
@@ -328,6 +336,8 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
     config.status.set_endpoint_id(own_id.to_string());
 
     let shutdown = config.status.shutdown.clone();
+    // One global stream limiter, set once and reused across reconnects.
+    let semaphore = new_stream_semaphore(&config)?;
     let config = Arc::new(config);
     // The peer's node id: either supplied directly (manual entry / test fast-path)
     // or discovered via nostr. When discovered it is re-resolved on each connect
@@ -405,31 +415,21 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
             Ok(conn) => {
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
-                match handle_connection(conn, config.clone(), true).await {
-                    // `true` ⇒ a real session was served; `false` ⇒ the peer was
-                    // busy (its session is held by another connection) so nothing
-                    // was established this round.
-                    Ok(session_served) => {
-                        if session_served {
-                            established = true;
-                            attempts = 0;
-                            backoff = Duration::from_secs(1);
-                            log::info!("Connection closed; will reconnect");
-                        } else {
-                            log::warn!(
-                                "Peer is busy (its session is held by another connection)"
-                            );
-                        }
+                match handle_connection(conn, config.clone(), semaphore.clone(), true).await {
+                    Ok(()) => {
+                        // A real session was served; reset the initial-connect cap so a
+                        // later transient outage doesn't count against startup.
+                        established = true;
+                        attempts = 0;
+                        backoff = Duration::from_secs(1);
+                        log::info!("Connection closed; will reconnect");
                     }
                     Err(e) => {
-                        // Auth failures (bad token) and wrong-peer rejections (the
-                        // listener's session is bound to a different node id) are
-                        // fatal — reconnecting can't succeed: a bad token stays bad,
-                        // and a wrong-peer rejection won't change until the listener
-                        // unbinds or restarts.
-                        if e.downcast_ref::<TunnelError>().is_some_and(|te| {
-                            matches!(te.category, ErrorCategory::Auth | ErrorCategory::Rejected)
-                        }) {
+                        // Auth failures (bad token) are fatal — reconnecting can't
+                        // succeed because a bad token stays bad.
+                        if e.downcast_ref::<TunnelError>()
+                            .is_some_and(|te| matches!(te.category, ErrorCategory::Auth))
+                        {
                             endpoint.close().await;
                             return Err(e);
                         }
@@ -481,11 +481,13 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
 async fn handle_connection(
     conn: iroh::endpoint::Connection,
     config: Arc<PeerConfig>,
+    semaphore: Arc<Semaphore>,
     is_dialer: bool,
-) -> Result<bool> {
+) -> Result<()> {
     let remote_id = conn.remote_id();
 
-    // Phase 1: authenticate.
+    // Phase 1: authenticate. The listener serves any number of peers concurrently,
+    // so there is no session binding — authentication is the only gate.
     if is_dialer {
         config.status.set_conn_status(ConnStatus::Authenticating);
         auth_as_dialer(&conn, &config.auth_token).await?;
@@ -493,51 +495,19 @@ async fn handle_connection(
     } else {
         let accepted: HashSet<String> = std::iter::once(config.auth_token.clone()).collect();
         auth_as_listener(&conn, &accepted).await?;
-        // Single sticky session: the first peer to authenticate binds it for the
-        // program's lifetime. A second authenticated connection would otherwise
-        // duplicate every tunnel bind (the supervisors share one broadcast channel)
-        // and reseed the shared tunnel table to Idle.
-        match config.status.admit_peer(&remote_id.to_string()) {
-            PeerAdmission::Admitted => {
-                config.status.add_peer(remote_id.to_string());
-                log::info!("Peer {} authenticated and bound to the session", remote_id);
-            }
-            PeerAdmission::Busy => {
-                log::warn!(
-                    "Rejecting {}: bound peer's connection is still active",
-                    remote_id
-                );
-                conn.close(PEER_BUSY_CODE.into(), b"peer_busy");
-                return Ok(false);
-            }
-            PeerAdmission::WrongPeer => {
-                log::warn!(
-                    "Rejecting {}: session is bound to a different peer",
-                    remote_id
-                );
-                conn.close(WRONG_PEER_CODE.into(), b"wrong_peer");
-                return Ok(false);
-            }
-        }
+        config.status.add_peer(remote_id.to_string());
+        log::info!("Peer {remote_id} authenticated");
     }
-
-    config.status.seed_tunnels_from_requests();
 
     let _path_watcher = watch_connection_paths(&conn, config.status.clone(), remote_id.to_string());
 
     let conn = Arc::new(conn);
-    let max_streams = config.max_streams.unwrap_or(DEFAULT_MAX_STREAMS);
-    let semaphore = Arc::new(Semaphore::new(max_streams));
-    config.status.set_semaphore(semaphore.clone(), max_streams);
-
-    // Subscribe to tunnel commands before spawning the supervisor so an autostart
-    // burst sent below cannot race ahead of the subscription.
-    let command_rx = config.status.subscribe_commands();
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
-    // (a) Accept incoming requests from the peer: for each, gate the requested
-    //     source against our allowed_sources allowlist, then connect out.
+    // Acceptor side (both roles): accept incoming tunnel requests from the peer, gate
+    // each requested source against our allowed_sources allowlist, then connect out.
+    // Streams are capped by the global semaphore shared across all peers.
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
@@ -549,20 +519,27 @@ async fn handle_connection(
         });
     }
 
-    // (b) Supervise our own tunnel requests: start/stop them on command.
-    {
-        let conn = conn.clone();
-        let semaphore = semaphore.clone();
-        let status = config.status.clone();
-        tasks.spawn(async move {
-            request_supervisor(conn, semaphore, status, command_rx).await;
-        });
-    }
-
-    // Optionally autostart every configured request (non-interactive/test mode).
-    if config.autostart_requests {
-        for id in config.status.request_ids() {
-            config.status.send_command(TunnelCommand::Start(id));
+    // Requester side (dial role only): a dialer drives a single connection, so it
+    // owns the tunnel table and supervises start/stop of its own requests. A listener
+    // serves many peers at once and initiates no tunnels — there is no single
+    // connection a request could be bound to — so it only runs the acceptor above.
+    if is_dialer {
+        config.status.seed_tunnels_from_requests();
+        // Subscribe before spawning so an autostart burst cannot race the subscription.
+        let command_rx = config.status.subscribe_commands();
+        {
+            let conn = conn.clone();
+            let semaphore = semaphore.clone();
+            let status = config.status.clone();
+            tasks.spawn(async move {
+                request_supervisor(conn, semaphore, status, command_rx).await;
+            });
+        }
+        // Optionally autostart every configured request (non-interactive/test mode).
+        if config.autostart_requests {
+            for id in config.status.request_ids() {
+                config.status.send_command(TunnelCommand::Start(id));
+            }
         }
     }
 
@@ -583,49 +560,9 @@ async fn handle_connection(
         config.status.set_conn_status(ConnStatus::Closed);
     } else {
         config.status.remove_peer(&remote_id.to_string());
-        // Keep the sticky binding (do not unbind) so only this node id may
-        // reconnect; just mark the connection gone.
-        config.status.disconnect_peer();
     }
     tasks.shutdown().await;
-
-    // A dialer rejected because the listener's session is bound to a *different*
-    // node id must NOT reconnect: its node id won't match until the listener
-    // unbinds or restarts, so retrying can never succeed. Surface it as a fatal
-    // `Rejected` error so `run_dial` stops.
-    if is_dialer && is_wrong_peer_close(&reason) {
-        return Err(TunnelError::rejected(anyhow::anyhow!(
-            "Peer rejected connection: its session is bound to a different peer"
-        ))
-        .into());
-    }
-
-    // A transient `peer_busy` close (the bound peer's own stale connection still
-    // tearing down, or another connection holding the single session) is reported
-    // as "not served" so the dialer retries with backoff — and, until it has ever
-    // established a session, counts against the initial-connection cap.
-    Ok(!(is_dialer && is_busy_close(&reason)))
-}
-
-/// Whether `reason` is the listener closing us out because its session is bound to
-/// a different node id (application close with [`WRONG_PEER_CODE`]).
-fn is_wrong_peer_close(reason: &ConnectionError) -> bool {
-    matches!(
-        reason,
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
-            if u64::from(*error_code) == WRONG_PEER_CODE as u64
-    )
-}
-
-/// Whether `reason` is the listener closing us out because its single session is
-/// already held by another live connection (application close with
-/// [`PEER_BUSY_CODE`]). Transient: the dialer should retry.
-fn is_busy_close(reason: &ConnectionError) -> bool {
-    matches!(
-        reason,
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, .. })
-            if u64::from(*error_code) == PEER_BUSY_CODE as u64
-    )
+    Ok(())
 }
 
 /// Supervise this peer's tunnel requests over one connection. Listens for
@@ -1081,28 +1018,11 @@ mod tests {
     use super::*;
     use crate::iroh_mode::endpoint::create_endpoint_builder;
     use crate::logging::LogBuffer;
-    use bytes::Bytes;
     use iroh::Endpoint;
-    use iroh::endpoint::{RelayMode, VarInt};
+    use iroh::endpoint::RelayMode;
 
-    fn app_close(code: u32) -> ConnectionError {
-        ConnectionError::ApplicationClosed(ApplicationClose {
-            error_code: VarInt::from_u32(code),
-            reason: Bytes::new(),
-        })
-    }
-
-    #[test]
-    fn wrong_peer_close_is_detected_only_for_its_code() {
-        assert!(is_wrong_peer_close(&app_close(WRONG_PEER_CODE)));
-        // A transient peer-busy close is NOT fatal (the dialer retries), so it must
-        // not be detected as wrong-peer.
-        assert!(!is_wrong_peer_close(&app_close(PEER_BUSY_CODE)));
-        // Other application close codes (e.g. auth failures) are not wrong-peer.
-        assert!(!is_wrong_peer_close(&app_close(AUTH_FAILED_CODE)));
-        assert!(!is_wrong_peer_close(&app_close(AUTH_TIMEOUT_CODE)));
-        // A non-application close (transport-level) is never wrong-peer.
-        assert!(!is_wrong_peer_close(&ConnectionError::LocallyClosed));
+    fn test_semaphore() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(DEFAULT_MAX_STREAMS))
     }
 
     fn test_peer_config(role: Role, token: &str) -> Arc<PeerConfig> {
@@ -1169,7 +1089,7 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let incoming = server_ep2.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("accept connection");
-            let _ = handle_connection(conn, server_cfg, false).await;
+            let _ = handle_connection(conn, server_cfg, test_semaphore(), false).await;
         });
 
         // Dialer side: the system under test.
@@ -1179,7 +1099,8 @@ mod tests {
             .expect("dial connect");
         let client_cfg = test_peer_config(Role::Dial, token);
         let client_status = client_cfg.status.clone();
-        let client_task = tokio::spawn(handle_connection(client_conn, client_cfg, true));
+        let client_task =
+            tokio::spawn(handle_connection(client_conn, client_cfg, test_semaphore(), true));
 
         // Wait until the dialer has authenticated (parked on the connection).
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1212,7 +1133,7 @@ mod tests {
     /// `handle_connection` result. Synchronizes on the dialer reaching `Connected`
     /// (auth complete) before the listener closes, so the dialer reliably observes
     /// the application close code rather than a torn-down auth stream.
-    async fn dial_against_closing_listener(close_code: u32) -> Result<bool> {
+    async fn dial_against_closing_listener(close_code: u32) -> Result<()> {
         let token = "close-code-test-token";
         let server_ep = hermetic_endpoint().await;
         let client_ep = hermetic_endpoint().await;
@@ -1261,7 +1182,7 @@ mod tests {
             .connect(server_addr, ALPN)
             .await
             .expect("dial connect");
-        let result = handle_connection(client_conn, client_cfg, true).await;
+        let result = handle_connection(client_conn, client_cfg, test_semaphore(), true).await;
 
         server_task.abort();
         client_ep.close().await;
@@ -1269,34 +1190,15 @@ mod tests {
         result
     }
 
-    /// A transient `peer_busy` close must report "not served" (`Ok(false)`) so the
-    /// dialer retries with backoff and counts the round against the initial-connect
-    /// cap, rather than treating it as an established session.
+    /// A listener simply closing the connection ends the dialer's session cleanly
+    /// (`Ok(())`); there are no longer any session-rejection close codes, so the
+    /// dialer treats it as an established session and `run_dial` reconnects.
     #[tokio::test]
-    async fn dial_reports_not_served_on_peer_busy() {
-        let result = dial_against_closing_listener(PEER_BUSY_CODE).await;
+    async fn dial_returns_ok_when_listener_closes() {
+        let result = dial_against_closing_listener(SHUTDOWN_CODE).await;
         assert!(
-            matches!(result, Ok(false)),
-            "a peer_busy close must report not-served (Ok(false)), got {:?}",
-            result
-        );
-    }
-
-    /// A `wrong_peer` close must be fatal: the listener's session is bound to a
-    /// different node id, so reconnecting can never succeed. `handle_connection`
-    /// must surface a `Rejected` error so `run_dial` stops.
-    #[tokio::test]
-    async fn dial_reports_fatal_rejected_on_wrong_peer() {
-        let result = dial_against_closing_listener(WRONG_PEER_CODE).await;
-        let err = result.expect_err("a wrong_peer close must be a fatal error");
-        let category = err
-            .downcast_ref::<TunnelError>()
-            .map(|te| te.category)
-            .expect("error must be a TunnelError");
-        assert_eq!(
-            category,
-            ErrorCategory::Rejected,
-            "a wrong_peer close must map to a Rejected error"
+            result.is_ok(),
+            "a plain listener close must return Ok(()), got {result:?}"
         );
     }
 }

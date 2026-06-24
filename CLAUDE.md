@@ -35,8 +35,8 @@ to stderr, needs no terminal) and is required for the other test-only vars to ta
 effect.
 - `DUOPIPE_TEST_MODE=1` enables headless test mode and gates the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` present ⇒ dial that node id; absent ⇒ listen.
-- `DUOPIPE_AUTOSTART_REQUESTS=1` starts every configured `[[request]]` once the
-  connection is up. Required to exercise tunnels in tests, since requests are
+- `DUOPIPE_AUTOSTART_REQUESTS=1` starts every configured `[[request]]` (dial role)
+  once the connection is up. Required to exercise tunnels in tests, since requests are
   otherwise activated interactively in the TUI and nothing forwards automatically.
 - `DUOPIPE_AUTH_TOKEN=<token>` is the shared auth token (required to dial; for
   listen it is used if set, otherwise one is generated). Also honored outside test
@@ -80,8 +80,19 @@ maps back to this peer. Relays
 default to a built-in public set (`nostr_discovery::DEFAULT_NOSTR_RELAYS`); override
 with `nostr_relay_urls`. To dial a raw node id without nostr, use quick mode.
 
-Tunnel model: a peer always *requests* tunnels from the other party. Each
-`[[request]]` binds a local `local_listen` address and asks the peer to connect out
-to a `remote_source`. The serving side gates incoming requests with `[allowed_sources]`
-CIDR lists (`tcp`/`udp`); an empty/absent `tcp` list defaults to dual-stack localhost
-(`127.0.0.0/8`, `::1/128`), and an empty/absent `udp` list uses the same default.
+Tunnel model: the **dialer requests** tunnels; the **listener is a pure server**.
+Each `[[request]]` (dial role) binds a local `local_listen` address and asks the
+listener to connect out to a `remote_source`, bridging the two — SSH `-L`-style local
+forwarding. The listener initiates no tunnels of its own; it only serves, gating each
+incoming request against its `[allowed_sources]` CIDR lists (`tcp`/`udp`); an
+empty/absent `tcp` list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`),
+and an empty/absent `udp` list uses the same default. To expose a service that lives
+near the listener box, run that box as the dialer instead.
+
+Multiple peers: a listener accepts **many concurrent dialers** over its one iroh
+endpoint — there is no single-peer session binding (authentication is the only gate).
+Each dialer is its own process binding its own local ports, so N dialers can all
+request the same listener source (e.g. `127.0.0.1:5678`) at once with no conflict —
+the listener just makes N independent outbound connects. The TUI lists connected
+peers on the listener; tunnels live on the dial side. One global `max_streams`
+semaphore caps concurrent forwarded streams across all peers.

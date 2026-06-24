@@ -17,13 +17,15 @@
 # discover it via nostr. This file supplies the rest: the shared auth token, tunnel
 # requests, the allowlist, relays, tuning, and the nostr relay override.
 #
-# Tunnel model: each side always *requests* tunnels from the other. A [[request]]
-# binds a local listener and asks the peer to connect out to a remote 'source';
-# traffic is bridged between them. Requests do NOT start automatically — the TUI
-# lists them and you start/stop each one with Enter (in test mode only, with
-# DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start all on connect).
+# Tunnel model: the DIALER *requests* tunnels; the LISTENER is a pure server. A
+# [[request]] (used when this peer dials) binds a local listener and asks the
+# listener peer to connect out to a remote 'source'; traffic is bridged between
+# them. Requests do NOT start automatically — the TUI lists them and you start/stop
+# each one with Enter (in test mode only, with DUOPIPE_TEST_MODE=1, set
+# DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start all on connect). When listening, this
+# peer serves any number of dialers at once and initiates no tunnels of its own.
 #
-# Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
+# Trust model: once token auth succeeds the dialer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
 # (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
 # dual-stack localhost.
@@ -58,7 +60,8 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # Relays default to a built-in public set; override here if you want specific ones:
 # nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
 
-# Maximum concurrent data streams per connection (default: 100).
+# Maximum concurrent forwarded data streams, shared across all connected peers
+# (default: 100).
 # max_streams = 100
 
 # Custom relay server URL(s) for failover. Defaults to iroh's public relays.
@@ -75,11 +78,12 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # dns_server = "none"
 
 # ============================================================================
-# Tunnel requests: ask the peer to connect out to 'remote_source'; deliver traffic
-# to a local listener bound at 'local_listen'. The 'remote_source' scheme (tcp://
-# or udp://) selects the protocol. 'name' is the label shown in the TUI. Nothing
-# starts until you activate it (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1
-# in test mode).
+# Tunnel requests (used when this peer DIALS): ask the listener to connect out to
+# 'remote_source'; deliver traffic to a local listener bound at 'local_listen'. The
+# 'remote_source' scheme (tcp:// or udp://) selects the protocol. 'name' is the label
+# shown in the TUI. Nothing starts until you activate it (Enter in the TUI, or
+# DUOPIPE_AUTOSTART_REQUESTS=1 in test mode). Ignored when this peer is the listener
+# (the listener is a pure server and initiates no tunnels).
 # ============================================================================
 [[request]]
 name = "db"

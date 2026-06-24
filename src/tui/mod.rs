@@ -214,12 +214,12 @@ async fn run_setup(
 
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
 ///
-/// Arrows / `j`/`k` move the tunnel selection cursor; `Enter`/`Space` start or
-/// stop the selected tunnel; `a` opens the add-request modal; `x`/`Del` removes the
-/// selected tunnel from the session (config is untouched); `h` hides the
-/// generated-token banner; `u` (listen role) unbinds the session so a new peer may
-/// connect. Logs scroll with `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits
-/// (or `Ctrl-C`).
+/// Tunnels are a dial-role concept (the dialer requests them); the listen role is a
+/// pure server and shows only its connected peers. Arrows / `j`/`k` move the tunnel
+/// selection cursor; `Enter`/`Space` start or stop the selected tunnel; `a` opens the
+/// add-request modal; `x`/`Del` removes the selected tunnel from the session (config
+/// is untouched); `h` hides the generated-token banner. Logs scroll with
+/// `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits (or `Ctrl-C`).
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     // Ctrl-C is an always-available emergency quit, even with the modal open.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -247,17 +247,12 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     let total = state.logs.len();
     let tunnels = state.tunnel_count();
     match key.code {
-        KeyCode::Char('a') => {
+        // Tunnels are dial-role only; the listener is a pure server and initiates none.
+        KeyCode::Char('a') if state.role == Role::Dial => {
             ui.add_form = Some(AddRequestForm::default());
         }
         KeyCode::Char('h') => {
             hide_token_banner(ui);
-        }
-        KeyCode::Char('u') if state.role == Role::Listen => {
-            // Clear the sticky session binding so a different node id may bind next
-            // (e.g. after the original dialer is gone for good).
-            state.unbind_session();
-            log::info!("Session unbound; a new peer may now connect");
         }
         KeyCode::Up | KeyCode::Char('k') => {
             ui.selected = ui.selected.saturating_sub(1);

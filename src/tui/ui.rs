@@ -293,8 +293,14 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
     let header = Row::new(["", "NAME", "SPEC", "STATUS", "DETAIL"])
         .style(Style::default().add_modifier(Modifier::BOLD));
+    // The listen role is a pure server: it serves the peers' requests and initiates
+    // no tunnels of its own, so its table stays empty.
+    let empty_msg = match snap.role {
+        Role::Listen => "(serving peers — this side initiates no tunnels)",
+        Role::Dial => "(no tunnels configured)",
+    };
     let rows: Vec<Row> = if snap.tunnels.is_empty() {
-        vec![Row::new(["", "", "(no tunnels configured)", "", ""])]
+        vec![Row::new(["", "", empty_msg, "", ""])]
     } else {
         snap.tunnels
             .iter()
@@ -309,11 +315,13 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
         Constraint::Length(10),
         Constraint::Percentage(25),
     ];
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] "),
-    );
+    let title = match snap.role {
+        Role::Dial => " Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] ",
+        Role::Listen => " Tunnels ",
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(table, area);
 }
 
@@ -339,8 +347,8 @@ fn tunnel_row(t: &TunnelRow, selected: bool) -> Row<'static> {
 
 fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
     let title = match snap.role {
-        // The session binds to the first peer; `u` clears that binding.
-        Role::Listen => " Connected peers  [u unbind] ",
+        // The listener serves many peers at once; all currently-connected ones show here.
+        Role::Listen => " Connected peers ",
         Role::Dial => " Connection ",
     };
     let header = Row::new(["REMOTE ID", "SINCE", "PATH"])
@@ -350,14 +358,6 @@ fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
         Role::Listen => {
             if !snap.peers.is_empty() {
                 snap.peers.iter().map(peer_row).collect()
-            } else if let Some(bound) = &snap.bound_peer {
-                // Bound but disconnected: the session is reserved for this node id
-                // until it reconnects or the operator presses `u`.
-                vec![Row::new(vec![
-                    Cell::from(short_id(bound)),
-                    Cell::from("(bound — waiting)"),
-                    Cell::from("press u to unbind"),
-                ])]
             } else {
                 vec![Row::new(["", "(waiting for peers)", ""])]
             }

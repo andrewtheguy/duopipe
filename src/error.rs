@@ -7,10 +7,6 @@ pub enum ErrorCategory {
     Config,
     /// Authentication failure — do not retry (wrong credentials).
     Auth,
-    /// Peer refused an authenticated connection because its session is bound to a
-    /// different node id — do not retry, since this node id can never match until
-    /// the listener unbinds or restarts.
-    Rejected,
     /// Connection establishment failed — retry only if it worked before.
     Connection,
     /// Connection lost after tunnel was established — always retry.
@@ -35,13 +31,6 @@ impl TunnelError {
     pub fn auth(err: impl Into<anyhow::Error>) -> Self {
         Self {
             category: ErrorCategory::Auth,
-            source: err.into(),
-        }
-    }
-
-    pub fn rejected(err: impl Into<anyhow::Error>) -> Self {
-        Self {
-            category: ErrorCategory::Rejected,
             source: err.into(),
         }
     }
@@ -92,10 +81,6 @@ mod tests {
         assert_eq!(
             TunnelError::auth(anyhow::anyhow!("test")).category,
             ErrorCategory::Auth
-        );
-        assert_eq!(
-            TunnelError::rejected(anyhow::anyhow!("test")).category,
-            ErrorCategory::Rejected
         );
         assert_eq!(
             TunnelError::connection(anyhow::anyhow!("test")).category,
