@@ -222,6 +222,15 @@ fn decode_length_prefixed<T: for<'de> Deserialize<'de>>(
             data.len()
         );
     }
+    // Strict frame boundary: a buffer holds exactly one length-prefixed frame.
+    // Reject trailing bytes rather than silently ignoring them.
+    if data.len() > 4 + len {
+        anyhow::bail!(
+            "{} has {} trailing byte(s) after the frame",
+            type_name,
+            data.len() - (4 + len)
+        );
+    }
     let value: T = serde_json::from_slice(&data[4..4 + len])
         .with_context(|| format!("Invalid {} JSON", type_name))?;
     let version = get_version(&value);
@@ -504,6 +513,18 @@ mod tests {
         buf.extend_from_slice(&json);
         let err = decode_stream_hello(&buf).unwrap_err();
         assert!(err.to_string().contains("version mismatch"));
+    }
+
+    #[test]
+    fn test_decode_rejects_trailing_bytes() {
+        // A valid frame with extra bytes appended must be rejected, not silently
+        // truncated to the framed length.
+        let mut buf = encode_stream_hello(&StreamHello::local_forward("tcp://127.0.0.1:22")).unwrap();
+        // Sanity: the clean frame decodes.
+        assert!(decode_stream_hello(&buf).is_ok());
+        buf.extend_from_slice(b"trailing");
+        let err = decode_stream_hello(&buf).unwrap_err();
+        assert!(err.to_string().contains("trailing"));
     }
 
     #[test]
