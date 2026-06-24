@@ -281,14 +281,18 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
             }
         },
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if let Some(peer) = &peer
+            // Tunnel actions only apply when the tunnels pane is focused; with the
+            // peer pane focused these keys are inert (selection moves with arrows).
+            if ui.focus == Pane::Tunnels
+                && let Some(peer) = &peer
                 && let Some(id) = peer.tunnel_id_at(ui.selected)
             {
                 peer.toggle_tunnel(id);
             }
         }
         KeyCode::Char('x') | KeyCode::Delete => {
-            if let Some(peer) = &peer
+            if ui.focus == Pane::Tunnels
+                && let Some(peer) = &peer
                 && let Some(id) = peer.tunnel_id_at(ui.selected)
             {
                 peer.delete_request(id);
