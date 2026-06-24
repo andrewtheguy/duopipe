@@ -294,8 +294,15 @@ can pull tunnels from `homelab`. To *also* let `homelab` reach a service on
 `laptop` on demand, that direction needs its own listener (on `laptop`) and dialer
 (on `homelab`).
 
-The way to do this today is to **run two instances per machine** — one listening,
-one dialing — reusing the same config file (the role is chosen interactively):
+The simplest way is the **"Serve and dial (both directions)"** option in the setup
+screen: one process per machine runs a listen half (serving inbound peers) **and** a
+dial half (one outbound connection requesting tunnels) at once, over a shared TUI.
+Pick it on each box and enter the *other* machine's `name` as the dial target — and
+each side's TUI shows both its connected peers and its own outbound tunnels.
+
+If you'd rather keep the two halves as separate processes, you can instead **run two
+instances per machine** — one listening, one dialing — reusing the same config file
+(the role is chosen interactively):
 
 ```bash
 # on the homelab box
@@ -320,8 +327,9 @@ and each record is keyed by a `d` tag derived from that listener's own `name`
 a unique `name`** — which is already true for distinct peers. Pick non-colliding
 `local_listen` ports if you run a listener and a dialer on the same host.
 
-> Running two processes per machine is the current answer; a single dual-role
-> process with a split TUI is planned — see [docs/ROADMAP.md](docs/ROADMAP.md).
+> The same no-conflict reasoning applies to the single-process dual-role mode: its
+> listen half publishes under this machine's own `name`, its dial half only reads the
+> target's. Use distinct names per machine either way.
 
 ### Test mode (testing only)
 
