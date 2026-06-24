@@ -2,10 +2,10 @@
 //!
 //! duopipe keeps the iroh identity ephemeral (a fresh node id every run) and uses
 //! nostr to publish & look it up. Both peers derive the *same* nostr keypair from
-//! the shared `auth_token`, so the listener publishes a replaceable event whose
-//! content is its current node id and the dialer derives the same key to look it up.
-//! The node id is public — the `auth_token` still gates the actual connection — so
-//! the value is not encrypted.
+//! the shared `auth_token`, so the listener publishes a replaceable event carrying
+//! its current node id and the dialer derives the same key to look it up. The node
+//! id is encrypted in the event content (NIP-44; see below), and the `auth_token`
+//! still gates the actual connection.
 //!
 //! Several peers may share one `auth_token`, so each is distinguished by a short
 //! **identifier**: the kind-30078 `d` tag is `duopipe:nodeid:<sha256(auth||id)>`. A

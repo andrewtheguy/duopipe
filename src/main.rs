@@ -30,7 +30,6 @@ const LOG_CAPACITY: usize = 2000;
 
 use crate::config::{
     AllowedSources, ConfigSource, PeerConfig, expand_tilde, load_peer_config,
-    validate_allowed_sources, validate_request_specs, validate_transport_tuning,
 };
 use crate::iroh_mode::endpoint::validate_relay_only;
 
@@ -345,14 +344,9 @@ async fn run_start_peer(
     test_env: &Option<TestEnv>,
     log_buffer: Option<std::sync::Arc<logging::LogBuffer>>,
 ) -> Result<()> {
-    if source != ConfigSource::None {
-        cfg.validate().map_err(TunnelError::config)?;
-    }
-
-    // Requests, allowlist, relays, and transport come from config only.
-    validate_request_specs(&cfg.request).map_err(TunnelError::config)?;
-    validate_allowed_sources(&cfg.allowed_sources).map_err(TunnelError::config)?;
-    validate_transport_tuning(&cfg.transport, "transport").map_err(TunnelError::config)?;
+    // Validate config structure and address formats (requests, allowlist,
+    // transport). In configless mode this runs on defaults, which are trivially valid.
+    cfg.validate().map_err(TunnelError::config)?;
 
     let relay_urls = cfg.relay_urls.clone().unwrap_or_default();
     let relay_only = cfg.relay_only.unwrap_or(false);
