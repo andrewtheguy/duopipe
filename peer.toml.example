@@ -1,12 +1,21 @@
 # duopipe peer configuration example
 #
-# Usage: duopipe start -c peer.toml
-#        duopipe start --default-config   # loads ~/.config/duopipe/peer.toml
+# Usage: duopipe nostr -c peer.toml
+#        duopipe nostr                    # loads ~/.config/duopipe/peer.toml
 #
-# `duopipe start` is interactive: on startup the TUI asks whether to connect to an
-# existing instance. The role (dial/listen), the target node id, and (if missing)
-# the auth token are answered there — they are NOT config keys. This file supplies
-# the rest: the shared auth token, tunnel requests, the allowlist, relays, tuning.
+# This file is read by NOSTR MODE (`duopipe nostr`): the listener publishes its
+# current ephemeral node id to nostr and a dialer looks it up, so the node id need
+# not be exchanged by hand. Nostr mode REQUIRES a provided auth token (it is the
+# nostr rendezvous secret) — set 'auth_token_file' below or the DUOPIPE_AUTH_TOKEN
+# env var. The other mode is configless (`duopipe quick`): the id and token are
+# ephemeral, nostr is off, and the dialer enters the node id by hand (supply a
+# token there with `duopipe quick --auth-token-file <path>`).
+#
+# `duopipe nostr` is interactive: on startup the TUI asks whether to connect to an
+# existing instance. The role (dial/listen) and the target node id are answered
+# there — they are NOT config keys. In nostr mode the node id can be left blank to
+# discover it via nostr. This file supplies the rest: the shared auth token, tunnel
+# requests, the allowlist, relays, tuning, and the nostr relay override.
 #
 # Tunnel model: each side always *requests* tunnels from the other. A [[request]]
 # binds a local listener and asks the peer to connect out to a remote 'source';
@@ -17,15 +26,37 @@
 # Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
 # (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
-# dual-stack localhost. The iroh identity key is ephemeral (regenerated every
-# run), so a listening instance's node id changes between runs.
+# dual-stack localhost.
+#
+# Node id: the iroh identity key is always ephemeral (regenerated every run), so a
+# listening instance's node id changes between runs. nostr is used as a side
+# channel to publish & look up the current node id, keyed off the shared auth_token
+# (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
-# The shared auth token, presented by both sides. Optional: a fresh listening
-# instance generates one if absent (shown in the TUI). Generate with:
+# This peer's short, memorable identifier. REQUIRED in nostr mode. When listening,
+# this peer publishes its node id under this name; a dialer types it to find this
+# peer. Several peers can share one auth token and be reached individually by name
+# (duplicate names just mean newest-wins). For the raw node-id flow, use quick mode
+# (`duopipe quick`).
+name = "web1"
+
+# The shared auth token, presented by both sides. REQUIRED in nostr mode (it is
+# the nostr rendezvous secret). Generate with:
 #   duopipe generate-auth-token
-# SECURITY: Plaintext 'auth_token' is not allowed in config files. Use
-# 'auth_token_file' (recommended), DUOPIPE_AUTH_TOKEN, or an age-encrypted value.
+# Supply it via 'auth_token_file' (recommended) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/token.txt"
+
+# Nostr node-id discovery is active whenever a config file is loaded. Both peers
+# derive a shared nostr key from the auth_token above; the listener publishes its
+# current ephemeral node id under its 'name' and the dialer looks it up by that
+# name, so the node id never has to be exchanged by hand. The published node id is
+# encrypted (NIP-44) under the shared auth_token-derived key, and the 'name' is
+# hashed (salted with the auth_token) into the lookup key — so neither the node id
+# nor the name can be read or guessed off the relays without the token. The
+# auth_token still gates the actual connection.
+#
+# Relays default to a built-in public set; override here if you want specific ones:
+# nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
 
 # Maximum concurrent data streams per connection (default: 100).
 # max_streams = 100
@@ -74,24 +105,6 @@ tcp = [
 udp = [
     "10.0.0.0/8",       # private network
 ]
-
-# ============================================================================
-# Encrypted Inline Secrets (Optional)
-# ============================================================================
-# Instead of _file variants, you can encrypt secrets directly in this config
-# using age encryption (useful for managing multiple configs with one key).
-#
-# 1. Generate a key: duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
-# 2. Encrypt a value: echo -n "token" | duopipe config-encryption encrypt-value --recipient age1...
-# 3. Paste the ageenc:... output as a TOML string value.
-#
-# encryption_key_file is required at runtime to decrypt ageenc: values.
-# encryption_recipient is only used by `encrypt-value` to select the public key.
-#
-# encryption_key_file = "~/.config/duopipe/age.key"
-# encryption_recipient = "age1..."
-#
-# auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3Jn..."
 
 # ============================================================================
 # Transport Tuning (Optional)

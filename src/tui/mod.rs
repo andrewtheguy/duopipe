@@ -46,6 +46,14 @@ pub struct TuiLaunch {
     /// A valid auth token from config/env (pre-seeds the dial flow; used directly
     /// for listen). Pre-validated in main.
     pub config_auth_token: Option<String>,
+    /// Nostr relay URLs for node-id discovery.
+    pub nostr_relays: Vec<String>,
+    /// Whether nostr node-id discovery is enabled (listener publishes, dialer
+    /// looks up). The iroh identity is always ephemeral regardless.
+    pub nostr_discovery: bool,
+    /// This peer's own short identifier (config `name`), published under when
+    /// listening in nostr mode. `None` in quick mode.
+    pub peer_name: Option<String>,
 }
 
 /// Run the interactive setup, then the live dashboard, until the user quits or
@@ -60,6 +68,8 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         &mut events,
         launch.config_auth_token.clone(),
         launch.allowed_sources.clone(),
+        launch.nostr_discovery,
+        launch.peer_name.clone(),
     )
     .await
     {
@@ -138,12 +148,21 @@ fn build_peer_config(
     launch: &TuiLaunch,
     state: Arc<AppState>,
 ) -> crate::iroh_mode::PeerConfig {
+    // The nostr identifier is role-dependent: a listener publishes under its own
+    // name (config), a dialer looks up the target's name (entered in setup).
+    let nostr_identifier = match resolved.role {
+        Role::Listen => launch.peer_name.clone(),
+        Role::Dial => resolved.peer_identifier.clone(),
+    };
     crate::iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
         allowed_sources: resolved.allowed_sources.clone(),
         autostart_requests: false,
         auth_token: resolved.auth_token.clone(),
+        nostr_relays: launch.nostr_relays.clone(),
+        nostr_discovery: launch.nostr_discovery,
+        nostr_identifier,
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),
@@ -160,8 +179,15 @@ async fn run_setup(
     events: &mut EventStream,
     config_auth_token: Option<String>,
     config_allowed_sources: AllowedSources,
+    nostr_discovery: bool,
+    own_name: Option<String>,
 ) -> SetupOutcome {
-    let mut state = SetupState::new(config_auth_token, config_allowed_sources);
+    let mut state = SetupState::new(
+        config_auth_token,
+        config_allowed_sources,
+        nostr_discovery,
+        own_name,
+    );
     let mut tick = tokio::time::interval(TICK);
 
     loop {

@@ -42,79 +42,21 @@ pub struct PeerConfig {
     pub dns_server: Option<String>,
     /// Maximum concurrent forwarded streams across all tunnels (default: 100).
     pub max_streams: Option<usize>,
-    /// The shared authentication token, used by both sides of the connection.
-    /// Optional: when starting a fresh (listening) instance without one, a token
-    /// is generated and shown in the TUI. Prefer `auth_token_file` or an
-    /// age-encrypted value in production to avoid exposing it in config files.
-    pub auth_token: Option<String>,
-    /// Path to file containing the authentication token.
+    /// Path to a file containing the shared authentication token. This (or the
+    /// `DUOPIPE_AUTH_TOKEN` env var) is the only way to supply a token; a fresh
+    /// listening instance generates one if neither is set.
     pub auth_token_file: Option<PathBuf>,
-    /// Path to age identity (private key) file for decrypting age-encrypted values.
-    pub encryption_key_file: Option<PathBuf>,
-    /// Age public key (recipient) for encrypting values in this config.
-    /// Used by `encrypt-value --config`, not required for decryption.
-    /// Accessed via separate minimal TOML parsing in the encrypt-value command.
-    #[allow(dead_code)]
-    pub encryption_recipient: Option<String>,
+    /// This peer's short, memorable identifier for nostr discovery. Required in
+    /// nostr mode: a listener publishes its node id under this name, and a dialer
+    /// types it to look the peer up — so several peers can share one auth token and
+    /// still be reached individually.
+    pub name: Option<String>,
+    /// Nostr relay URLs used for node-id discovery (nostr mode only). Absent ⇒ a
+    /// built-in set of public relays (see `nostr_discovery::DEFAULT_NOSTR_RELAYS`).
+    pub nostr_relay_urls: Option<Vec<String>>,
     /// Transport layer tuning (congestion control, buffer sizes).
     #[serde(default)]
     pub transport: TransportTuning,
-}
-
-impl PeerConfig {
-    /// Reject a plaintext `auth_token` when config is loaded from a file.
-    ///
-    /// Age-encrypted values (detected by `ageenc:` prefix) are allowed through;
-    /// they will be decrypted later via `decrypt_secrets()`.
-    fn reject_plaintext_secrets(&self) -> Result<()> {
-        use crate::encryption::is_age_encrypted;
-        if self
-            .auth_token
-            .as_ref()
-            .is_some_and(|v| !is_age_encrypted(v))
-        {
-            anyhow::bail!(
-                "Plaintext 'auth_token' is not allowed in config files. \
-                 Use 'auth_token_file', set DUOPIPE_AUTH_TOKEN env var, \
-                 or use an age-encrypted value. See: duopipe config-encryption encrypt-value --help"
-            );
-        }
-        Ok(())
-    }
-
-    /// Decrypt any age-encrypted fields in place.
-    ///
-    /// If no fields contain age-encrypted values, returns immediately.
-    /// If encrypted fields are found but no key file is provided, returns an error.
-    pub fn decrypt_secrets(&mut self, encryption_key_file: Option<&Path>) -> Result<()> {
-        use crate::encryption::{decrypt_value, is_age_encrypted};
-
-        let has_encrypted = self
-            .auth_token
-            .as_ref()
-            .is_some_and(|v| is_age_encrypted(v));
-
-        if !has_encrypted {
-            return Ok(());
-        }
-
-        let key_path = encryption_key_file.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Age-encrypted values found but no encryption key file specified.\n\
-                 Set encryption_key_file in config \
-                 or set DUOPIPE_ENCRYPTION_KEY_FILE env var."
-            )
-        })?;
-
-        if let Some(ref v) = self.auth_token
-            && is_age_encrypted(v)
-        {
-            self.auth_token =
-                Some(decrypt_value(v, key_path).context("Failed to decrypt auth_token")?);
-        }
-
-        Ok(())
-    }
 }
 
 /// A tunnel request: ask the peer to connect out to `remote_source` and deliver
@@ -176,7 +118,7 @@ impl AllowedSources {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
-    /// TOML file on disk — plaintext secrets rejected
+    /// TOML config file on disk (nostr mode).
     File,
     /// No config, defaults only
     None,
@@ -407,17 +349,10 @@ impl PeerConfig {
     /// Note: the connection role (dial/listen) and the target node id are
     /// resolved interactively at startup (or via env vars for tests), so they
     /// are not part of the config and not checked here.
-    pub fn validate(&self, source: ConfigSource) -> Result<()> {
-        let iroh = self;
-        if source == ConfigSource::File {
-            iroh.reject_plaintext_secrets()?;
-        }
-        if iroh.auth_token.is_some() && iroh.auth_token_file.is_some() {
-            anyhow::bail!("Use only one of 'auth_token' or 'auth_token_file'.");
-        }
-        validate_request_specs(&iroh.request)?;
-        validate_allowed_sources(&iroh.allowed_sources)?;
-        validate_transport_tuning(&iroh.transport, "transport")?;
+    pub fn validate(&self) -> Result<()> {
+        validate_request_specs(&self.request)?;
+        validate_allowed_sources(&self.allowed_sources)?;
+        validate_transport_tuning(&self.transport, "transport")?;
 
         Ok(())
     }
@@ -514,7 +449,7 @@ receive_window = 67108864
             CongestionController::Bbr
         );
         assert_eq!(cfg.transport.receive_window, Some(67108864));
-        cfg.validate(ConfigSource::File)
+        cfg.validate()
             .expect("config should validate");
     }
 
@@ -525,7 +460,7 @@ receive_window = 67108864
 tcp = ["not-a-cidr"]
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
+        let err = cfg.validate().unwrap_err();
         assert!(
             err.to_string().contains("allowed_sources"),
             "error was: {err}"
@@ -555,27 +490,6 @@ tcp = ["not-a-cidr"]
     }
 
     #[test]
-    fn rejects_plaintext_auth_token_from_file() {
-        let cfg = peer_config(PeerConfig {
-            auth_token: Some("secret123".into()),
-            ..Default::default()
-        });
-        let err = cfg.validate(ConfigSource::File).unwrap_err();
-        assert!(err.to_string().contains("Plaintext 'auth_token'"));
-    }
-
-    const FAKE_AGE_ENCRYPTED: &str = "ageenc:YWdlLWVuY3J5cHRpb24=";
-
-    #[test]
-    fn allows_age_encrypted_secrets_from_file() {
-        let cfg = peer_config(PeerConfig {
-            auth_token: Some(FAKE_AGE_ENCRYPTED.into()),
-            ..Default::default()
-        });
-        assert!(cfg.validate(ConfigSource::File).is_ok());
-    }
-
-    #[test]
     fn validates_request_address_formats() {
         let cfg = peer_config(PeerConfig {
             request: vec![RequestEntry {
@@ -585,7 +499,7 @@ tcp = ["not-a-cidr"]
             }],
             ..Default::default()
         });
-        assert!(cfg.validate(ConfigSource::File).is_ok());
+        assert!(cfg.validate().is_ok());
 
         let bad_listen = peer_config(PeerConfig {
             request: vec![RequestEntry {
@@ -595,7 +509,7 @@ tcp = ["not-a-cidr"]
             }],
             ..Default::default()
         });
-        assert!(bad_listen.validate(ConfigSource::File).is_err());
+        assert!(bad_listen.validate().is_err());
 
         let bad_source = peer_config(PeerConfig {
             request: vec![RequestEntry {
@@ -605,7 +519,7 @@ tcp = ["not-a-cidr"]
             }],
             ..Default::default()
         });
-        assert!(bad_source.validate(ConfigSource::File).is_err());
+        assert!(bad_source.validate().is_err());
     }
 
     #[test]
@@ -646,13 +560,4 @@ tcp = ["not-a-cidr"]
         );
     }
 
-    #[test]
-    fn decrypt_secrets_missing_key_returns_error() {
-        let mut iroh = PeerConfig {
-            auth_token: Some(FAKE_AGE_ENCRYPTED.into()),
-            ..Default::default()
-        };
-        let err = iroh.decrypt_secrets(None).unwrap_err();
-        assert!(err.to_string().contains("no encryption key file"));
-    }
 }

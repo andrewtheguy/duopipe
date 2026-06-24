@@ -1,11 +1,11 @@
 # duopipe
 
-**Cross-platform secure P2P TCP/UDP port forwarding with NAT traversal, driven by an interactive TUI.**
+**Cross-platform secure P2P TCP/UDP port forwarding with NAT traversal, for linking your own devices — driven by an interactive TUI.**
 
-Duopipe enables you to forward TCP and UDP traffic between machines without requiring public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted connections between peers using modern P2P networking techniques. It is driven through an interactive terminal UI (TUI) launched with `duopipe start`, which walks you through connecting to a peer and managing tunnels.
+Duopipe is for **one person connecting their own devices** — laptop, homelab box, work machine, VPS — so they can reach services on each other without public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted P2P connections between two endpoints **you control**. It is driven through an interactive terminal UI (TUI) launched with `duopipe quick` (configless) or `duopipe nostr` (config-driven, with node-id discovery), which walks you through connecting your devices and managing tunnels.
 
 > [!IMPORTANT]
-> **Project Goal:** This tool provides a convenient way to connect to different networks for **development or homelab purposes** without the hassle and security risk of opening a port. It is **not** meant for production setups or designed to be performant at scale. It is meant for **interactive use** (`duopipe start` and its TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
+> **Project Goal:** This tool lets a **single user link their own devices** to reach services across them — for **development or homelab purposes** — without the hassle and security risk of opening a port. Both ends are expected to be machines you own (or otherwise fully trust). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe nostr` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
 > [!WARNING]
 > **No Backward Compatibility (Pre-1.0):** During initial development before version 1.0, no backward compatibility or migration path is provided between minor versions (e.g., 0.1.x to 0.2.x). Expect to regenerate tokens and rebuild peer configurations when upgrading in between minor versions.
@@ -36,11 +36,11 @@ Duopipe enables you to forward TCP and UDP traffic between machines without requ
 
 ## Overview
 
-duopipe runs as a single symmetric command: `duopipe start`, which launches an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
+duopipe runs as a single symmetric peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
-- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to the other side. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
+- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to your other device. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
 - Answer **Yes** → this peer **dials**. The TUI prompts for the existing instance's node id, and for the auth token if one isn't already in config or the environment. Both are validated (node id parse, auth-token CRC16) before connecting.
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
@@ -48,10 +48,10 @@ On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the 
 Once the connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
-> **Intended use — a coordinated link between two trusted endpoints.** duopipe assumes the two peers are operated by **two parties who trust each other**, or by **one person across their own devices** (e.g. laptop ↔ homelab box). It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
-> - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth token is per-run too. Share the current node id and the shared token over a side channel you already have (chat, SSH session, password manager, a second device you control) before connecting.
-> - **Live, interactive operation.** Both ends run the TUI and watch shared status — connection state, the active peer, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; the two ends coordinate *what* to expose and *when*.
-> - **Mutual trust, narrowly scoped.** Either peer may *request* tunnels of the other, so only pair with someone (or a device) you trust, and keep each side's `[allowed_sources]` allowlist as tight as the task needs.
+> **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS); the same auth token lives on each of your machines. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
+> - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth token is per-run too. Move the auth token between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in nostr mode the node id is then discovered automatically.
+> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, the active peer, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
+> - **Trust assumed, exposure narrowly scoped.** Either peer may *request* tunnels of the other, which is fine between your own devices; still keep each side's `[allowed_sources]` allowlist as tight as the task needs.
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
 
@@ -147,13 +147,11 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The consequence is that the **listening** peer's **node id changes every run**: the TUI displays the current node id in its header, and you must copy it to the dialing peer each time you start a session.
-
-> **Note:** There is no `config-encryption` overlap to worry about here. The age encryption key (`config-encryption generate-key`) only protects secrets stored in config files; it has nothing to do with the peer's network identity.
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **nostr mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, each listener publishes its current node id under its `name`, and a dialer looks it up by typing the target peer's `name` (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe quick`) nostr is off and the dialer enters the node id manually. The node id is always shown in the TUI header.
 
 ## Authentication
 
-A peer connection is gated by a single pre-shared **auth token**, shared by **both** peers. The dialing peer presents it; the listening peer accepts exactly that one token. Sharing it presumes a coordinated link between two trusted endpoints (or your own devices) with an out-of-band channel to pass it over — see [Intended use](#overview).
+A peer connection is gated by a single pre-shared **auth token**, shared by **both** peers. The dialing peer presents it; the listening peer accepts exactly that one token. The expected setup is the **same token on your own devices**, copied between them over an out-of-band channel you already have (a password manager, an SSH session) — see [Intended use](#overview).
 
 > **Note:** The QUIC ALPN identifier is a fixed constant (`mf/2`). It is no longer used for access control — authentication is solely via the shared auth token.
 
@@ -168,7 +166,7 @@ The CRC16 checksum detects all single-byte errors in the token payload.
 Generate auth tokens with: `duopipe generate-auth-token`
 
 > [!IMPORTANT]
-> **Trust after auth, gated by the source allowlist.** Once the connection-level auth token passes, the peer may *request* tunnels, but when it asks us to connect out to one of our sources we only honor addresses inside our `[allowed_sources]` CIDR lists. Empty or absent TCP or UDP defaults to dual-stack localhost. Requests are also activated interactively — nothing forwards until you start it. Only share the token with peers you trust, and keep `[allowed_sources]` as narrow as possible.
+> **Trust after auth, gated by the source allowlist.** Once the connection-level auth token passes, the peer may *request* tunnels, but when it asks us to connect out to one of our sources we only honor addresses inside our `[allowed_sources]` CIDR lists. Empty or absent TCP or UDP defaults to dual-stack localhost. Requests are also activated interactively — nothing forwards until you start it. Keep the token only on devices you own (or otherwise fully trust), and keep `[allowed_sources]` as narrow as possible.
 
 ### Token Management
 
@@ -187,7 +185,7 @@ The same token is used by **both** sides: the listener accepts it, and the diale
 
 ### Configuration File
 
-> **Security:** A plaintext `auth_token` is **not allowed** in TOML config files. Use `auth_token_file`, set the `DUOPIPE_AUTH_TOKEN` environment variable, or embed the token directly with an [age-encrypted inline value](#encrypted-config-values).
+> **Security:** Supply the auth token with `auth_token_file` or the `DUOPIPE_AUTH_TOKEN` environment variable. The token is never written inline in the config file.
 
 A minimal config is essentially the requests you can make, the sources you'll expose, plus an optional shared token (`peer.toml`):
 ```toml
@@ -228,29 +226,29 @@ For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe start` on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively.
+duopipe is **interactive-first**: you run `duopipe nostr` (config-driven, with node-id discovery) on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
 
 ### 1. Start the listening instance
 
 On the first machine, point at a config that declares the requests (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
-duopipe start -c ./peer.toml
+duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. If no auth token is configured, it generates one. The TUI header shows the **node id** and the **auth token** — copy both for the next step. The token hides automatically after 10 minutes, or immediately when you press `h`.
+When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. The config must set a `name` and supply the auth token (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); the listener then publishes its current node id to nostr under that `name` so a dialer can find it by name. The TUI header shows the **node id** and the **auth token**.
 
-> **Important:** The node id is regenerated on every run (the identity is ephemeral), so re-copy it each time you start the listener.
+> **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — the dialer finds it by the listener's `name`.
 
 ### 2. Start the dialing instance
 
 On the second machine (also pointed at a config that declares its requests):
 
 ```bash
-duopipe start -c ./peer.toml
+duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. It prompts for the listener's **node id**, and for the **auth token** if one isn't already in config or the `DUOPIPE_AUTH_TOKEN` env var. Both are validated before connecting.
+When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Type the **identifier** of the peer you want — the listener's `name` (e.g. `web1`), which must differ from this peer's own `name` — and duopipe resolves it to that peer's current node id via nostr. The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
 
 Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
 
@@ -303,64 +301,53 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ## CLI Options
 
-### start
+Both interactive subcommands launch the same TUI; they differ only in mode. The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
 
-`duopipe start` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
+### quick (configless mode)
+
+`duopipe quick` runs everything ephemeral with **no config file** and **no nostr**: the node id changes every run and a dialer enters it by hand.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--config`, `-c` | - | Path to TOML config file |
-| `--default-config` | false | Load config from `~/.config/duopipe/peer.toml` |
+| `--auth-token-file` | - | Path to a file holding the shared auth token. Precedence: this flag > `DUOPIPE_AUTH_TOKEN`. Without either, a fresh ephemeral token is generated each run. |
 
-The connection role (listen/dial) and the dialer's target node id are chosen interactively in the TUI (or via env vars for tests — see [Test mode (testing only)](#test-mode-testing-only)).
+### nostr (config-driven mode)
+
+`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It **requires a provided auth token** (the nostr rendezvous secret) and a **`name`** (this peer's short identifier); it fails fast if either is missing. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--config`, `-c` | `~/.config/duopipe/peer.toml` | Path to TOML config file |
 
 **Environment variables:**
 
 | Env Var | Description |
 |---------|-------------|
-| `DUOPIPE_AUTH_TOKEN` | The shared auth token (highest precedence over config `auth_token` / `auth_token_file`). |
-| `DUOPIPE_ENCRYPTION_KEY_FILE` | Path to age identity file for decrypting age-encrypted config values. |
+| `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
 | `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
 
 ## Configuration Files
 
-Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). Prefer config files so your settings are saved and reusable. Only one of these may be used at a time. All config keys live at the top level.
+Config files are used by `duopipe nostr`: run it with no flag to load the default location, or `-c <path>` for a custom path (TOML). Prefer config files so your settings are saved and reusable. All config keys live at the top level.
 
-> **Security:** TOML config files **reject a plaintext `auth_token`**. You have three options: use `auth_token_file` (recommended), set the `DUOPIPE_AUTH_TOKEN` environment variable, or use an [age-encrypted inline value](#encrypted-config-values).
+> **Security:** Supply the auth token with `auth_token_file` or the `DUOPIPE_AUTH_TOKEN` environment variable — it is never written inline in the config file.
 
 **Default location:** `~/.config/duopipe/peer.toml`
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-The config file holds the tunnel requests, auth token, relays, DNS, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
+`duopipe nostr` requires a provided auth token and a `name`. The config holds the tunnel requests, the path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target identifier** are chosen interactively in the TUI, not in the config.
 
-### Encrypted Config Values
+### Node-id discovery
 
-Instead of separate `_file` variants, you can embed age-encrypted secrets directly in TOML config files. This is useful when managing configs for multiple peers — each config is self-contained with a single shared private key.
-
-**Setup:**
-
-```bash
-# 1. Generate an age keypair (run again to add keys for rotation)
-duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
-# Output: age1ql3z7hjy...  (this is your public key / recipient)
-
-# 2. Encrypt a secret value
-echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --recipient age1ql3z7hjy...
-```
-
-**Use in config:**
+Nostr discovery is active in `duopipe nostr`. The iroh node id is ephemeral, so each listener publishes its current node id to **nostr** under its `name`, and a dialer looks it up by typing the target peer's `name` — no manual copy needed. Both peers derive the same nostr *author* key from the shared auth token; each peer's record is then placed under a `d` tag of `duopipe:nodeid:<sha256(auth_token || name)>`, so several peers can share one auth token yet stay individually addressable (duplicate names just mean newest-wins). The name hash is **salted with the auth token**, so a short name can't be guessed or enumerated on relays. The node id in the event content is **encrypted** (NIP-44) under the shared auth-token-derived keypair, so it never appears on relays in the clear — and the auth token still gates the actual connection. Because the `d` tag is keyed on the stable `name`, a listener restart replaces its own record (no stale entries) and the dialer re-resolves by name on each reconnect. To dial a raw node id without nostr, use `duopipe quick`.
 
 ```toml
-encryption_key_file = "~/.config/duopipe/age.key"
-encryption_recipient = "age1ql3z7hjy..."
-
-auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
+# Relays default to a built-in public set; override if desired:
+# nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
 ```
-
-Each encrypted value is a single-line `ageenc:` prefixed string (base64-encoded age ciphertext). Age encryption applies only to `auth_token`. The `encryption_key_file` can also be specified via the `DUOPIPE_ENCRYPTION_KEY_FILE` env var.
 
 ### Transport Tuning
 
@@ -384,9 +371,13 @@ The same config shape is used by both peers; the role is chosen interactively at
 
 ```toml
 # Example peer configuration.
-# The connection role and dial target node id are chosen interactively in the TUI.
+# The connection role and the dialer's target identifier are chosen interactively.
 
-# Shared auth token (plaintext not allowed — use a file, env var, or ageenc: value)
+# This peer's short identifier (required in nostr mode). A dialer types it to find
+# this peer; the listener publishes its node id under this name.
+name = "web1"
+
+# Shared auth token — supply via a file (here) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/auth_token.txt"
 
 # relay_urls = ["https://relay.example.com"]
@@ -410,10 +401,10 @@ tcp = ["127.0.0.0/8"]
 
 ```bash
 # Load from default location (~/.config/duopipe/peer.toml)
-duopipe start --default-config
+duopipe nostr
 
 # Load from custom path
-duopipe start -c ./my-peer.toml
+duopipe nostr -c ./my-peer.toml
 ```
 
 ---
@@ -437,34 +428,6 @@ Auth token format: `i` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 4
 
 > **Note:** A listening instance that starts without a configured token generates one automatically and shows it in the TUI header, so generating one ahead of time is optional.
 
-## config-encryption
-
-Age encryption commands for config file secrets.
-
-### generate-key
-
-Generate an age keypair for encrypting config file secrets:
-
-```bash
-duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
-# Prints the public key (recipient) to stdout
-```
-
-Running again with the same `--output` appends a new keypair to the file, enabling key rotation. Use `--force` to overwrite the file and start fresh.
-
-### encrypt-value
-
-Encrypt a value for embedding in config files (reads plaintext from stdin):
-
-```bash
-echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --recipient age1...
-
-# Or read recipient from a config file
-echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --config peer.toml
-```
-
-Output is a single-line `ageenc:` string ready to paste into TOML config values.
-
 ---
 
 ## Security
@@ -473,7 +436,7 @@ Output is a single-line `ageenc:` string ready to paste into TOML config values.
 - The node id is a public key that identifies the listening peer. Because the identity is ephemeral, it changes every run.
 - **Fixed ALPN:** The QUIC protocol identifier is a fixed constant (`mf/2`). It is not used for access control.
 - **Token Authentication:** The dialing peer authenticates immediately after the QUIC connection via a dedicated auth stream, presenting the shared auth token. An invalid token is rejected with an `AuthResponse` and the connection is closed with an error code. See [Architecture: Token Authentication](docs/ARCHITECTURE.md#token-authentication-iroh-mode).
-- **Source allowlist:** After auth the peer may *request* tunnels, but each requested source is checked against our `[allowed_sources]` CIDR lists before we connect out. Empty or absent TCP or UDP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Requests are also activated interactively — nothing forwards until started. Only share the token with peers you trust, and keep the allowlist narrow.
+- **Source allowlist:** After auth the peer may *request* tunnels, but each requested source is checked against our `[allowed_sources]` CIDR lists before we connect out. Empty or absent TCP or UDP defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Requests are also activated interactively — nothing forwards until started. Keep the token only on devices you own (or otherwise fully trust), and keep the allowlist narrow.
 - Treat the auth token like a password
 
 ## Exit Codes
