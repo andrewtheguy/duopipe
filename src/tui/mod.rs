@@ -20,7 +20,9 @@ use ratatui::crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 
-use crate::app_state::{AppSnapshot, AppState, DialCommand, DialTarget, Role, TunnelCommand};
+use crate::app_state::{
+    AppSnapshot, AppState, DialCommand, DialTarget, NameCommand, NameConflict, Role, TunnelCommand,
+};
 use crate::config::{AllowedSources, RequestEntry, TransportTuning, validate_request_specs};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
@@ -55,6 +57,9 @@ pub struct TuiLaunch {
     /// This peer's own short identifier (config `name`), published under when
     /// listening in nostr mode. `None` in quick mode.
     pub peer_name: Option<String>,
+    /// Path to the loaded peer config file (nostr mode), for the name-conflict rename
+    /// nudge. `None` in quick mode.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 /// Run the interactive setup, then the live dashboard, until the user quits or
@@ -115,6 +120,11 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                     }
                     if let Some(form) = &ui_state.connect_form {
                         ui::render_connect_dialog(f, form, state.nostr_discovery);
+                    }
+                    // A name-conflict prompt is drawn last so it sits on top of any
+                    // other modal until the user resolves it.
+                    if let NameConflict::Prompt { message } = &snap.name_conflict {
+                        ui::render_name_conflict_dialog(f, message);
                     }
                 });
             }
@@ -178,6 +188,7 @@ fn build_peer_config(
         max_streams: launch.max_streams,
         transport: launch.transport.clone(),
         announce_endpoint: false,
+        config_path: launch.config_path.clone(),
         status: state,
     }
 }
@@ -234,6 +245,12 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         state.shutdown.cancel();
         return true;
+    }
+    // A name-conflict prompt is runtime-critical: it captures all keys until the user
+    // takes over, renames, or declines (the publisher then drives the outcome).
+    if let NameConflict::Prompt { .. } = state.name_conflict() {
+        handle_conflict_prompt(key, state);
+        return false;
     }
     // While a modal is open it captures all other keys (so `j`/`k`/`q` are text).
     if ui.add_form.is_some() {
@@ -317,6 +334,25 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         _ => {}
     }
     false
+}
+
+/// Handle a key while a name-conflict prompt is showing. The decision is sent to the
+/// publisher, which clears the prompt and acts (take over / rename nudge + decline /
+/// decline). No quit happens here: the publisher cancels the shared shutdown for a
+/// startup decline, which the dashboard loop already watches.
+fn handle_conflict_prompt(key: KeyEvent, state: &Arc<AppState>) {
+    match key.code {
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            state.send_name(NameCommand::TakeOver);
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            state.send_name(NameCommand::Rename);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            state.send_name(NameCommand::Decline);
+        }
+        _ => {}
+    }
 }
 
 fn hide_token_banner(ui: &mut UiState) {

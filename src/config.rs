@@ -393,9 +393,53 @@ fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
 }
 
+/// The duopipe config/state directory (`~/.config/duopipe/`). Used for the peer
+/// config file and for local state such as name-conflict flag files. `None` only if
+/// the home directory cannot be determined.
+pub fn duopipe_config_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".config").join("duopipe"))
+}
+
 /// Resolve the default peer config path (~/.config/duopipe/peer.toml).
 fn default_peer_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".config").join("duopipe").join("peer.toml"))
+    duopipe_config_dir().map(|dir| dir.join("peer.toml"))
+}
+
+/// Resolve the path `load_peer_config` would read from: the tilde-expanded explicit
+/// path, or the default location. Returned so the rename flow can persist a new
+/// `name` back to the same file. `None` only when no path is given and the default
+/// cannot be determined.
+pub fn resolve_peer_config_path(path: Option<&Path>) -> Option<PathBuf> {
+    match path {
+        Some(p) => Some(expand_tilde(p)),
+        None => default_peer_config_path(),
+    }
+}
+
+/// Marker prefix for the nudge comment, so we only append it once.
+const NAME_CONFLICT_COMMENT_MARKER: &str = "# duopipe-name-conflict:";
+
+/// Best-effort, non-destructive nudge: append a comment to the peer config file
+/// telling the user that `name` collided with another device and should be changed,
+/// without ever altering the `name` value itself. Idempotent (skips if the marker is
+/// already present). Used when the user resolves a name conflict by choosing
+/// "rename". Returns an error only if the file cannot be read or written.
+pub fn append_name_conflict_comment(path: &Path, name: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config to add rename nudge: {}", path.display()))?;
+    if content.contains(NAME_CONFLICT_COMMENT_MARKER) {
+        return Ok(());
+    }
+    let mut text = content;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\n{NAME_CONFLICT_COMMENT_MARKER} the name {name:?} was in use by another device.\n\
+         # Change the `name` value to a unique identifier and restart to avoid the conflict.\n"
+    ));
+    std::fs::write(path, text)
+        .with_context(|| format!("writing config to add rename nudge: {}", path.display()))
 }
 
 /// Load peer configuration from an explicit path, or from default location.
@@ -418,6 +462,27 @@ mod tests {
 
     fn peer_config(cfg: PeerConfig) -> PeerConfig {
         cfg
+    }
+
+    #[test]
+    fn name_conflict_comment_is_appended_once_and_preserves_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.toml");
+        let original = "name = \"homelab\"\nmax_streams = 50\n";
+        std::fs::write(&path, original).unwrap();
+
+        append_name_conflict_comment(&path, "homelab").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        // Original settings are untouched; the `name` value is not rewritten.
+        assert!(after.starts_with(original), "original content preserved: {after}");
+        assert!(after.contains(NAME_CONFLICT_COMMENT_MARKER));
+        assert!(after.contains("\"homelab\""));
+
+        // Idempotent: a second call does not append a duplicate comment.
+        append_name_conflict_comment(&path, "homelab").unwrap();
+        let after2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, after2, "second nudge is a no-op");
+        assert_eq!(after2.matches(NAME_CONFLICT_COMMENT_MARKER).count(), 1);
     }
 
     #[test]

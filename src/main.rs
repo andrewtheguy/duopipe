@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod iroh_mode;
 mod logging;
+mod name_conflict;
 mod net;
 mod nostr_discovery;
 mod peer_params;
@@ -245,6 +246,8 @@ async fn run_peer_headless(
         max_streams: cfg.max_streams,
         transport: cfg.transport.clone(),
         announce_endpoint: true,
+        // Headless test mode never uses nostr, so there is no name to rename.
+        config_path: None,
         status: state.clone(),
     };
 
@@ -318,6 +321,7 @@ async fn run_inner() -> Result<()> {
                 PeerConfig::default(),
                 ConfigSource::None,
                 auth_token_file.as_deref(),
+                None,
                 &test_env,
                 log_buffer,
             )
@@ -327,7 +331,17 @@ async fn run_inner() -> Result<()> {
         // for node-id discovery. The token is required, from config/env only.
         Command::Nostr { config } => {
             let cfg = load_nostr_config(config.as_deref()).map_err(TunnelError::config)?;
-            run_start_peer(cfg, ConfigSource::File, None, &test_env, log_buffer).await
+            // Resolve the actual file path so a name-conflict rename can annotate it.
+            let config_path = crate::config::resolve_peer_config_path(config.as_deref());
+            run_start_peer(
+                cfg,
+                ConfigSource::File,
+                None,
+                config_path,
+                &test_env,
+                log_buffer,
+            )
+            .await
         }
         Command::GenerateAuthToken { count } => {
             for _ in 0..count {
@@ -347,6 +361,7 @@ async fn run_start_peer(
     cfg: PeerConfig,
     source: ConfigSource,
     cli_auth_token_file: Option<&Path>,
+    config_path: Option<PathBuf>,
     test_env: &Option<TestEnv>,
     log_buffer: Option<std::sync::Arc<logging::LogBuffer>>,
 ) -> Result<()> {
@@ -426,6 +441,7 @@ async fn run_start_peer(
         nostr_relays,
         nostr_discovery: nostr_discovery_enabled,
         peer_name,
+        config_path,
     };
 
     tui::run_tui(launch).await

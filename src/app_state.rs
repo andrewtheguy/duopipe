@@ -22,6 +22,7 @@ use crate::logging::LogBuffer;
 /// only bounds how far a lagging connection supervisor may fall behind).
 const TUNNEL_COMMAND_CAPACITY: usize = 64;
 const DIAL_COMMAND_CAPACITY: usize = 16;
+const NAME_COMMAND_CAPACITY: usize = 8;
 
 /// Stable identity for a tunnel request, allocated once when the request is added
 /// (config-seeded or runtime) and unchanged for the life of the session, including
@@ -52,6 +53,36 @@ pub enum DialCommand {
     Connect(DialTarget),
     /// Tear down the current dial session and return to idle.
     Disconnect,
+}
+
+/// A user decision on a nostr name conflict, sent by the TUI's conflict prompt to the
+/// node-id publisher. All unit variants — "rename" carries no new name: it appends a
+/// nudge comment to the config and then behaves like decline (the running name is never
+/// changed live).
+#[derive(Debug, Clone, Copy)]
+pub enum NameCommand {
+    /// Claim/reclaim the name: clear the flag and (re)publish, gaining precedence.
+    TakeOver,
+    /// Append a rename nudge to the config, then decline.
+    Rename,
+    /// Stop competing for the name (quit at startup / degraded serve-only mid-session).
+    Decline,
+}
+
+/// Surfaced state of the nostr name-conflict flow, polled by the TUI each tick. The
+/// publisher sets it; the TUI renders a modal (`Prompt`) or a persistent warning
+/// (`Degraded`) from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum NameConflict {
+    /// No conflict: publishing normally (or nostr discovery is off).
+    #[default]
+    Inactive,
+    /// A conflict needs a user decision; `message` is the full prompt body (the
+    /// publisher bakes in the situation and the per-key consequences).
+    Prompt { message: String },
+    /// The user declined or renamed mid-session: serving continues but the name is no
+    /// longer published. `message` is a persistent warning.
+    Degraded { message: String },
 }
 
 /// What to dial, as typed at runtime: a full node id (quick mode) or a peer name
@@ -265,6 +296,10 @@ pub struct AppState {
     tunnel_tx: broadcast::Sender<TunnelCommand>,
     /// Broadcast channel for dial connect/disconnect commands (TUI -> dial manager).
     dial_tx: broadcast::Sender<DialCommand>,
+    /// Broadcast channel for name-conflict decisions (TUI -> node-id publisher).
+    name_tx: broadcast::Sender<NameCommand>,
+    /// Current nostr name-conflict state, surfaced to the TUI.
+    name_conflict: RwLock<NameConflict>,
     /// Display string for the current dial target (`Some` while a session is up or
     /// being established), shown in the header. `None` when idle (serving only).
     dial_target: RwLock<Option<String>>,
@@ -289,6 +324,7 @@ impl AppState {
     ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
+        let (name_tx, _) = broadcast::channel(NAME_COMMAND_CAPACITY);
         // Assign a stable id to each config-seeded request; runtime adds continue
         // from the same counter via `alloc_id`.
         let requests: Vec<Request> = requests
@@ -316,6 +352,8 @@ impl AppState {
             streams_max: RwLock::new(0),
             tunnel_tx,
             dial_tx,
+            name_tx,
+            name_conflict: RwLock::new(NameConflict::Inactive),
             dial_target: RwLock::new(None),
             nostr_discovery,
             own_name,
@@ -345,6 +383,32 @@ impl AppState {
     /// (the manager hasn't started yet or has exited), so the caller can surface it.
     pub fn send_dial(&self, cmd: DialCommand) -> bool {
         self.dial_tx.send(cmd).is_ok()
+    }
+
+    /// Subscribe to name-conflict decisions. The node-id publisher subscribes once.
+    pub fn subscribe_name(&self) -> broadcast::Receiver<NameCommand> {
+        self.name_tx.subscribe()
+    }
+
+    /// Send a name-conflict decision to the publisher (TUI take over/rename/decline).
+    /// Returns `true` if delivered to a live subscriber.
+    pub fn send_name(&self, cmd: NameCommand) -> bool {
+        self.name_tx.send(cmd).is_ok()
+    }
+
+    /// Set the current name-conflict state (publisher -> TUI).
+    pub fn set_name_conflict(&self, conflict: NameConflict) {
+        *self.name_conflict.write() = conflict;
+    }
+
+    /// Clear the name-conflict state back to `Inactive`.
+    pub fn clear_name_conflict(&self) {
+        *self.name_conflict.write() = NameConflict::Inactive;
+    }
+
+    /// Current name-conflict state, cloned (read by the TUI key handler).
+    pub fn name_conflict(&self) -> NameConflict {
+        self.name_conflict.read().clone()
     }
 
     /// Set (or clear) the current dial target's display string.
@@ -519,6 +583,7 @@ impl AppState {
             conn_status: self.conn_status.read().clone(),
             path: self.path.read().clone(),
             dial_target: self.dial_target.read().clone(),
+            name_conflict: self.name_conflict.read().clone(),
             peers: self.peers.read().clone(),
             tunnels: self.tunnels.read().clone(),
             streams_used,
@@ -540,6 +605,8 @@ pub struct AppSnapshot {
     pub path: PathInfo,
     /// Current dial target's display string; `None` when idle (serving only).
     pub dial_target: Option<String>,
+    /// Current nostr name-conflict state (drives the conflict modal / warning).
+    pub name_conflict: NameConflict,
     pub peers: Vec<PeerRow>,
     pub tunnels: Vec<TunnelRow>,
     pub streams_used: usize,
@@ -648,5 +715,34 @@ mod tests {
 
         assert!(snap.nostr_discovery);
         assert_eq!(snap.own_name.as_deref(), Some("web1"));
+    }
+
+    #[test]
+    fn name_conflict_state_transitions_in_snapshot() {
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), vec![], true, None);
+        assert_eq!(state.snapshot().name_conflict, NameConflict::Inactive);
+
+        state.set_name_conflict(NameConflict::Prompt {
+            message: "in use".to_string(),
+        });
+        assert!(matches!(
+            state.name_conflict(),
+            NameConflict::Prompt { .. }
+        ));
+        assert!(matches!(
+            state.snapshot().name_conflict,
+            NameConflict::Prompt { .. }
+        ));
+
+        state.set_name_conflict(NameConflict::Degraded {
+            message: "serving only".to_string(),
+        });
+        assert!(matches!(
+            state.snapshot().name_conflict,
+            NameConflict::Degraded { .. }
+        ));
+
+        state.clear_name_conflict();
+        assert_eq!(state.snapshot().name_conflict, NameConflict::Inactive);
     }
 }
