@@ -49,10 +49,11 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # Nostr node-id discovery is active whenever a config file is loaded. Both peers
 # derive a shared nostr key from the auth_token above; the listener publishes its
 # current ephemeral node id under its 'name' and the dialer looks it up by that
-# name, so the node id never has to be exchanged by hand. The node id is public
-# (auth_token still gates the connection), so nothing here is a secret; the name is
-# hashed (salted with the auth_token) into the lookup key so it cannot be guessed
-# off the relays.
+# name, so the node id never has to be exchanged by hand. The published node id is
+# encrypted (NIP-44) under the shared auth_token-derived key, and the 'name' is
+# hashed (salted with the auth_token) into the lookup key — so neither the node id
+# nor the name can be read or guessed off the relays without the token. The
+# auth_token still gates the actual connection.
 #
 # Relays default to a built-in public set; override here if you want specific ones:
 # nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]

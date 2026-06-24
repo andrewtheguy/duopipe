@@ -16,6 +16,12 @@
 //! stable identifier (not the volatile node id), a listener restart replaces its own
 //! record — no stale accumulation.
 //!
+//! The node id in the event content is **encrypted** (NIP-44) under the shared
+//! auth-token-derived keypair — the listener encrypts to its own derived public key
+//! and any peer with the same `auth_token` derives the same key to decrypt. This
+//! keeps the node id off the relays in the clear (the `auth_token` still gates the
+//! actual connection).
+//!
 //! Discovery therefore requires a *shared* `auth_token`: a listener that
 //! autogenerates a token publishes under a key the dialer cannot derive until that
 //! token reaches it (which it must anyway, for auth).
@@ -119,8 +125,18 @@ pub async fn publish_node_id(
     relays: &[String],
 ) -> Result<()> {
     let keys = derive_keys(auth_token)?;
+    // Encrypt the node id under the shared (auth-token-derived) keypair so it does
+    // not appear on relays in the clear. Self-encryption: encrypt to our own derived
+    // public key — any peer with the same auth token derives the same key to decrypt.
+    let content = nip44::encrypt(
+        keys.secret_key(),
+        &keys.public_key(),
+        node_id.to_string(),
+        nip44::Version::V2,
+    )
+    .context("encrypting node id for nostr")?;
     let client = connect_client(relays).await?;
-    let event = EventBuilder::new(nodeid_kind(), node_id.to_string())
+    let event = EventBuilder::new(nodeid_kind(), content)
         .tags([Tag::identifier(identifier_dtag(auth_token, identifier))])
         .sign_with_keys(&keys)
         .context("signing node-id event")?;
@@ -153,8 +169,9 @@ pub async fn lookup_node_id(
             identifier.trim()
         )
     })?;
-    latest
-        .content
+    let node_id = nip44::decrypt(keys.secret_key(), &keys.public_key(), &latest.content)
+        .context("decrypting nostr node-id record (wrong auth token?)")?;
+    node_id
         .trim()
         .parse::<EndpointId>()
         .context("nostr node-id record is not a valid node id")
@@ -201,19 +218,50 @@ mod tests {
     }
 
     #[test]
-    fn node_id_round_trips_through_event_content() {
+    fn node_id_round_trips_through_encrypted_event_content() {
         let token = "round-trip-token";
         let keys = derive_keys(token).unwrap();
         let node_id = iroh::SecretKey::generate().public();
-        let event = EventBuilder::new(nodeid_kind(), node_id.to_string())
+        // Mirror publish: encrypt the node id to our own derived key.
+        let content = nip44::encrypt(
+            keys.secret_key(),
+            &keys.public_key(),
+            node_id.to_string(),
+            nip44::Version::V2,
+        )
+        .expect("encrypt node id");
+        let event = EventBuilder::new(nodeid_kind(), content)
             .tags([Tag::identifier(identifier_dtag(token, "web1"))])
             .sign_with_keys(&keys)
             .expect("sign node-id event");
-        let parsed: EndpointId = event
-            .content
-            .trim()
-            .parse()
-            .expect("event content parses as a node id");
+        // The ciphertext must not contain the cleartext node id.
+        assert!(
+            !event.content.contains(&node_id.to_string()),
+            "node id leaked in cleartext"
+        );
+        // Mirror lookup: decrypt with the same shared key.
+        let decrypted = nip44::decrypt(keys.secret_key(), &keys.public_key(), &event.content)
+            .expect("decrypt node id");
+        let parsed: EndpointId = decrypted.trim().parse().expect("decrypts to a node id");
         assert_eq!(parsed.to_string(), node_id.to_string());
+    }
+
+    #[test]
+    fn wrong_auth_token_cannot_decrypt_node_id() {
+        let node_id = iroh::SecretKey::generate().public();
+        let publisher = derive_keys("the-real-token").unwrap();
+        let content = nip44::encrypt(
+            publisher.secret_key(),
+            &publisher.public_key(),
+            node_id.to_string(),
+            nip44::Version::V2,
+        )
+        .expect("encrypt node id");
+        // A peer with a different auth token derives a different key and cannot read it.
+        let attacker = derive_keys("a-different-token").unwrap();
+        assert!(
+            nip44::decrypt(attacker.secret_key(), &attacker.public_key(), &content).is_err(),
+            "decryption must fail under a different auth token"
+        );
     }
 }

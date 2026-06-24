@@ -56,8 +56,11 @@ it up, then dials. The `d`-tag hash is salted with the `auth_token` so a short,
 low-entropy name can't be guessed or enumerated on relays without the token. Several
 peers can share one `auth_token` and be reached individually by name; duplicate names
 just clobber (replaceable, newest wins), which is acceptable for this convenience
-layer. The node id is public — the `auth_token` still gates the connection — so it is
-not encrypted.
+layer. The node id in the event content is **encrypted** (NIP-44) under the shared
+auth-token-derived keypair (self-encryption: the listener encrypts to its own derived
+public key; any peer with the same `auth_token` derives the same key to decrypt), so
+it does not appear on relays in the clear — and the `auth_token` still gates the
+actual connection.
 
 Because the `d` tag is keyed on the *stable* name (not the volatile node id), a
 listener restart replaces its own record — no stale accumulation. The dialer
