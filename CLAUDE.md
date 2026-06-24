@@ -66,7 +66,10 @@ actual connection.
 Because the `d` tag is keyed on the *stable* name (not the volatile node id), a
 listener restart replaces its own record — no stale accumulation. The dialer
 re-looks-up by name on every connect attempt, so a listener that restarted with a
-fresh node id self-heals on the next attempt (no persistent subscription). Relays
+fresh node id self-heals on the next attempt (no persistent subscription). As a
+safety net, `run_dial` refuses to connect to a resolved node id equal to its own
+(a self-dial) — whether a quick-mode node id pasted by mistake or a nostr name that
+maps back to this peer. Relays
 default to a built-in public set (`nostr_discovery::DEFAULT_NOSTR_RELAYS`); override
 with `nostr_relay_urls`. To dial a raw node id without nostr, use quick mode.
 

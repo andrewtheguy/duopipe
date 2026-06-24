@@ -324,7 +324,8 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
     )
     .await?;
 
-    config.status.set_endpoint_id(endpoint.id().to_string());
+    let own_id = endpoint.id();
+    config.status.set_endpoint_id(own_id.to_string());
 
     let shutdown = config.status.shutdown.clone();
     let config = Arc::new(config);
@@ -372,6 +373,17 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
                 }
             }
         };
+
+        // Refuse to dial ourselves: a quick-mode node id pasted by mistake, or a
+        // nostr identifier that maps back to this peer. Fatal — the target won't
+        // change without reconfiguring, so retrying can't help.
+        if let Ok(id) = &target
+            && *id == own_id
+        {
+            anyhow::bail!(
+                "Refusing to dial this peer's own node id ({own_id}). Set a different target node id (quick mode) or peer identifier (nostr mode)."
+            );
+        }
 
         let connect = match target {
             Ok(id) => {
