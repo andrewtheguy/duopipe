@@ -149,10 +149,16 @@ fn build_peer_config(
     state: Arc<AppState>,
 ) -> crate::iroh_mode::PeerConfig {
     // The nostr identifier is role-dependent: a listener publishes under its own
-    // name (config), a dialer looks up the target's name (entered in setup).
+    // name (config), a dialer looks up the target's name (entered in setup). A dual
+    // process does both — it publishes under its own name and carries the target name
+    // separately in `dial_target_identifier` for `run_dual` to route to its dial half.
     let nostr_identifier = match resolved.role {
-        Role::Listen => launch.peer_name.clone(),
+        Role::Listen | Role::Both => launch.peer_name.clone(),
         Role::Dial => resolved.peer_identifier.clone(),
+    };
+    let dial_target_identifier = match resolved.role {
+        Role::Both => resolved.peer_identifier.clone(),
+        Role::Listen | Role::Dial => None,
     };
     crate::iroh_mode::PeerConfig {
         role: resolved.role,
@@ -163,6 +169,8 @@ fn build_peer_config(
         nostr_relays: launch.nostr_relays.clone(),
         nostr_discovery: launch.nostr_discovery,
         nostr_identifier,
+        dial_target_identifier,
+        report_endpoint_id: true,
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),
@@ -247,8 +255,8 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     let total = state.logs.len();
     let tunnels = state.tunnel_count();
     match key.code {
-        // Tunnels are dial-role only; the listener is a pure server and initiates none.
-        KeyCode::Char('a') if state.role == Role::Dial => {
+        // Tunnels are driven by the dial half; the pure listener initiates none.
+        KeyCode::Char('a') if matches!(state.role, Role::Dial | Role::Both) => {
             ui.add_form = Some(AddRequestForm::default());
         }
         KeyCode::Char('h') => {
@@ -309,7 +317,7 @@ fn maybe_auto_hide_generated_token_banner(ui: &mut UiState, snap: &AppSnapshot, 
         return;
     }
 
-    if snap.role != Role::Listen || !snap.token_generated {
+    if !matches!(snap.role, Role::Listen | Role::Both) || !snap.token_generated {
         ui.token_banner_auto_hide_at = None;
         return;
     }
@@ -433,7 +441,7 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         "node id:   {}",
         snap.endpoint_id.as_deref().unwrap_or("(pending)")
     );
-    if snap.role == Role::Dial {
+    if matches!(snap.role, Role::Dial | Role::Both) {
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
     }

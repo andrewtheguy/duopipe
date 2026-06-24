@@ -232,6 +232,10 @@ async fn run_peer_headless(
         nostr_relays: vec![],
         nostr_discovery: false,
         nostr_identifier: None,
+        // Headless test mode is single-role (listen or dial), so the dual-only fields
+        // are inert: no separate dial target, and this endpoint reports its own id.
+        dial_target_identifier: None,
+        report_endpoint_id: true,
         relay_urls,
         relay_only,
         dns_server: cfg.dns_server.clone(),

@@ -21,14 +21,26 @@ use crate::auth;
 use crate::config::{AllowedSources, validate_cidr};
 use crate::peer_params::ResolvedPeer;
 
-/// The two roles offered on the start screen, in display order. Index 0 (listen)
-/// is the default highlight.
-const CONNECT_OPTIONS: [&str; 2] = [
+/// The roles offered on the start screen, in display order. Index 0 (listen) is the
+/// default highlight. Keep [`role_for_choice`] in sync with this order.
+const CONNECT_OPTIONS: [&str; 3] = [
     "Start a new instance (listen for a connection)",
     "Connect to an existing instance (dial)",
+    "Serve and dial (both directions, one process)",
 ];
 /// Index of the "dial" option within [`CONNECT_OPTIONS`].
 const CONNECT_DIAL: usize = 1;
+/// Index of the "both" (dual-role) option within [`CONNECT_OPTIONS`].
+const CONNECT_BOTH: usize = 2;
+
+/// Map a start-screen selection index to its [`Role`].
+fn role_for_choice(choice: usize) -> Role {
+    match choice {
+        CONNECT_DIAL => Role::Dial,
+        CONNECT_BOTH => Role::Both,
+        _ => Role::Listen,
+    }
+}
 
 /// Which question the setup screen is currently asking.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,9 +101,10 @@ pub struct SetupState {
     allowed_udp: Input,
     /// Allowlist resolved once the start screen is submitted, carried to `Done`.
     allowed_sources: AllowedSources,
-    /// Whether the dial role was chosen. The role can't be inferred from
-    /// `node_id` because a dialer may leave it blank and discover it via nostr.
-    dial: bool,
+    /// The role chosen on the start screen. Resolved from `connect_choice` at submit
+    /// time (the role can't be inferred from `node_id`, since a dialer may leave it
+    /// blank and discover it via nostr).
+    role: Role,
     /// Whether nostr discovery is active (nostr mode). When true the dialer enters a
     /// short peer *identifier* (looked up at runtime); when false (quick mode) it
     /// enters a full node id.
@@ -127,7 +140,7 @@ impl SetupState {
             allowed_tcp: Input::default(),
             allowed_udp: Input::default(),
             allowed_sources: AllowedSources::default(),
-            dial: false,
+            role: Role::Listen,
             nostr_discovery,
             node_id: None,
             peer_identifier: None,
@@ -172,13 +185,8 @@ fn proceed_after_node_id(state: &mut SetupState) -> Step {
 
 /// Build the final `ResolvedPeer` from accumulated state.
 fn build_resolved(state: &SetupState) -> ResolvedPeer {
-    let role = if state.dial {
-        Role::Dial
-    } else {
-        Role::Listen
-    };
     ResolvedPeer {
-        role,
+        role: state.role,
         peer_node_id: state.node_id,
         peer_identifier: state.peer_identifier.clone(),
         auth_token: state.auth_token.clone().unwrap_or_default(),
@@ -217,9 +225,11 @@ fn submit_start(state: &mut SetupState) -> Step {
         AllowedSources { tcp, udp }
     };
     state.allowed_sources = allowed;
-    state.dial = state.connect_choice == CONNECT_DIAL;
+    state.role = role_for_choice(state.connect_choice);
 
-    if state.dial {
+    // Dial and Both both need a dial target, so they go through the node-id phase.
+    // Both additionally serves, using the allowlist resolved just above.
+    if matches!(state.role, Role::Dial | Role::Both) {
         state.phase = SetupPhase::NodeId;
         state.buffer.reset();
         Step::Continue
@@ -775,17 +785,20 @@ mod tests {
         // Up at the top clamps.
         handle_key(key(KeyCode::Up), &mut s);
         assert_eq!(s.connect_choice, 0);
-        // Down moves to the dial option and clamps at the bottom.
+        // Down moves to the dial option, then the both option, and clamps at the bottom.
         handle_key(key(KeyCode::Down), &mut s);
         assert_eq!(s.connect_choice, CONNECT_DIAL);
         handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.connect_choice, CONNECT_DIAL);
-        // Enter on the dial option advances to the node id prompt.
+        assert_eq!(s.connect_choice, CONNECT_BOTH);
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.connect_choice, CONNECT_BOTH);
+        // Enter on the both option advances to the node id prompt (it needs a target).
         assert!(matches!(
             handle_key(key(KeyCode::Enter), &mut s),
             Step::Continue
         ));
         assert_eq!(s.phase, SetupPhase::NodeId);
+        assert_eq!(s.role, Role::Both);
     }
 
     #[test]

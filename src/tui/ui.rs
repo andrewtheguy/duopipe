@@ -111,8 +111,9 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
 
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
-    let show_token_banner =
-        snap.role == Role::Listen && snap.token_generated && !ui.token_banner_hidden;
+    let show_token_banner = matches!(snap.role, Role::Listen | Role::Both)
+        && snap.token_generated
+        && !ui.token_banner_hidden;
     render_header(frame, header_area, snap, show_token_banner);
     render_tunnels(frame, tunnels_area, snap, ui);
     render_peers(frame, peers_area, snap);
@@ -141,7 +142,8 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
         Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
     ];
 
-    if snap.role == Role::Dial {
+    // The dial half (Dial or Both) shows its outbound connection status + path.
+    if matches!(snap.role, Role::Dial | Role::Both) {
         lines.push(Line::from(vec![
             Span::raw("status: "),
             Span::styled(
@@ -151,35 +153,38 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
             Span::raw("   path: "),
             Span::raw(snap.path.describe()),
         ]));
-    } else if show_token_banner {
-        // Listen + freshly generated token, not yet dismissed: surface the token so
-        // the dialer can copy it. Hidden once a peer connects or the user presses `h`.
-        let token = snap.auth_token.as_deref().unwrap_or("(pending)");
-        lines.push(Line::from(vec![
-            Span::raw("auth token: "),
-            Span::styled(
-                token.to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  (hides after 10m, h to hide now)",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    } else {
-        // Listen role: the node id (above) is ephemeral and stays visible so the
-        // dialer can copy it. The token itself is not shown here.
-        let hint = if snap.token_generated {
-            "auth token generated for this session"
+    }
+    // The listen half (Listen or Both) shows the auth-token banner/hint, since its
+    // node id is ephemeral and a dialer needs the shared token to connect.
+    if matches!(snap.role, Role::Listen | Role::Both) {
+        if show_token_banner {
+            // Freshly generated token, not yet dismissed: surface it so the dialer can
+            // copy it. Hidden once a peer connects or the user presses `h`.
+            let token = snap.auth_token.as_deref().unwrap_or("(pending)");
+            lines.push(Line::from(vec![
+                Span::raw("auth token: "),
+                Span::styled(
+                    token.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  (hides after 10m, h to hide now)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
         } else {
-            "auth token loaded from config"
-        };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        )));
+            let hint = if snap.token_generated {
+                "auth token generated for this session"
+            } else {
+                "auth token loaded from config"
+            };
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
@@ -297,7 +302,8 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
     // no tunnels of its own, so its table stays empty.
     let empty_msg = match snap.role {
         Role::Listen => "(serving peers — this side initiates no tunnels)",
-        Role::Dial => "(no tunnels configured)",
+        // Both runs a dial half, so its tunnel table is interactive like Dial.
+        Role::Dial | Role::Both => "(no tunnels configured)",
     };
     let rows: Vec<Row> = if snap.tunnels.is_empty() {
         vec![Row::new(["", "", empty_msg, "", ""])]
@@ -316,7 +322,9 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
         Constraint::Percentage(25),
     ];
     let title = match snap.role {
-        Role::Dial => " Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] ",
+        Role::Dial | Role::Both => {
+            " Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] "
+        }
         Role::Listen => " Tunnels ",
     };
     let table = Table::new(rows, widths)
@@ -348,14 +356,15 @@ fn tunnel_row(t: &TunnelRow, selected: bool) -> Row<'static> {
 fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
     let title = match snap.role {
         // The listener serves many peers at once; all currently-connected ones show here.
-        Role::Listen => " Connected peers ",
+        // Both runs a listen half too, so it shows the same inbound-peers list.
+        Role::Listen | Role::Both => " Connected peers ",
         Role::Dial => " Connection ",
     };
     let header = Row::new(["REMOTE ID", "SINCE", "PATH"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = match snap.role {
-        Role::Listen => {
+        Role::Listen | Role::Both => {
             if !snap.peers.is_empty() {
                 snap.peers.iter().map(peer_row).collect()
             } else {

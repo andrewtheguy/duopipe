@@ -47,6 +47,11 @@ pub enum TunnelCommand {
 pub enum Role {
     Dial,
     Listen,
+    /// Both at once in one process: serve inbound peers (listen) *and* maintain one
+    /// outbound connection that requests tunnels (dial). Each underlying connection
+    /// still has exactly one requester and one server — the two roles run side by
+    /// side over separate endpoints and never interact at the connection layer.
+    Both,
 }
 
 impl Role {
@@ -54,6 +59,7 @@ impl Role {
         match self {
             Role::Dial => "Dial",
             Role::Listen => "Listen",
+            Role::Both => "Serve + Dial",
         }
     }
 }

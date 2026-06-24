@@ -17,6 +17,9 @@ use crate::config::AllowedSources;
 ///   the target peer's name, resolved to a node id at runtime via `auth_token`).
 /// - `Listen` ⇒ `peer_node_id` and `peer_identifier` are `None`; `auth_token` is a
 ///   valid supplied token or a freshly generated one.
+/// - `Both` ⇒ serves *and* dials from one process: like `Dial`, exactly one target is
+///   set (`peer_node_id` or `peer_identifier`); like `Listen`, `allowed_sources` gates
+///   what inbound peers may request. `auth_token` is valid (supplied or generated).
 #[derive(Clone)]
 pub struct ResolvedPeer {
     pub role: Role,
