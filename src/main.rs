@@ -267,7 +267,6 @@ async fn run() -> i32 {
                 .map(|e| match e.category {
                     ErrorCategory::Config => 2,
                     ErrorCategory::Auth => 3,
-                    ErrorCategory::Rejected => 4,
                     ErrorCategory::Connection => 10,
                     ErrorCategory::ConnectionLost => 11,
                 })

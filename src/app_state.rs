@@ -5,6 +5,11 @@
 //! writers are synchronous and never hold a lock across `.await`, so the
 //! `parking_lot` locks are safe inside async tasks. The session gauge reads the
 //! live [`Semaphore`] so it can never drift from the real limiter.
+//!
+//! Tunnel state is **per connected peer**: each live connection owns a
+//! [`PeerSession`] (its tunnel table, command channel, and path). A listener may
+//! hold several at once; a dialer holds at most one. The prefilled `[[request]]`
+//! list is a *template* held on [`AppState`] that seeds every new session.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,9 +26,9 @@ use crate::logging::LogBuffer;
 /// only bounds how far a lagging connection supervisor may fall behind).
 const TUNNEL_COMMAND_CAPACITY: usize = 64;
 
-/// Stable identity for a tunnel request, allocated once when the request is added
-/// (config-seeded or runtime) and unchanged for the life of the session, including
-/// across reconnect reseeds. Identity is decoupled from the vec position so requests
+/// Stable identity for a tunnel request within a [`PeerSession`], allocated once
+/// when the request is added (template-seeded or runtime) and unchanged for the
+/// life of that session. Identity is decoupled from the vec position so requests
 /// can be removed without disturbing the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TunnelId(u64);
@@ -35,7 +40,7 @@ impl std::fmt::Display for TunnelId {
 }
 
 /// A request to start or stop a configured tunnel, addressed by its stable
-/// [`TunnelId`]. Sent by the TUI, consumed by the connection supervisor.
+/// [`TunnelId`]. Sent by the TUI, consumed by a peer's connection supervisor.
 #[derive(Debug, Clone, Copy)]
 pub enum TunnelCommand {
     Start(TunnelId),
@@ -59,7 +64,7 @@ impl Role {
 }
 
 /// High-level connection status (primarily meaningful for the dial role, which
-/// has a single connection at a time).
+/// has a single connection at a time and surfaces its reconnect state here).
 #[derive(Clone, PartialEq)]
 pub enum ConnStatus {
     Connecting,
@@ -162,8 +167,9 @@ pub struct TunnelRow {
     pub detail: String,
 }
 
-/// A configured tunnel request paired with its stable id. The authoritative spec
-/// list (`AppState::requests`) is seeded from config and appended to at runtime.
+/// A configured tunnel request paired with its stable id. Each [`PeerSession`]
+/// owns its own list, seeded from the [`AppState`] template and appended to at
+/// runtime.
 struct Request {
     id: TunnelId,
     entry: RequestEntry,
@@ -181,131 +187,65 @@ fn tunnel_row_for(id: TunnelId, entry: &RequestEntry) -> TunnelRow {
     }
 }
 
-/// A currently-connected, authenticated peer (listen role; at most one at a time
-/// under the single-session model).
-#[derive(Clone)]
-pub struct PeerRow {
+/// Per-connected-peer tunnel runtime. Created when a connection authenticates
+/// (seeded from the [`AppState`] request template) and dropped when it closes.
+/// Owns its own tunnel table, command channel, and observed network path, so
+/// peers are fully independent: starting a tunnel addresses exactly one peer.
+pub struct PeerSession {
+    /// The authenticated peer's node id (its stable identity for the session).
     pub remote_id: String,
+    /// When this connection was admitted.
     pub connected_since: Instant,
-    pub path: PathInfo,
-}
-
-/// Sticky single-session binding state for the listen role. Set once on the first
-/// successful auth and held for the program's lifetime (see [`AppState::session`]).
-#[derive(Default)]
-struct SessionBinding {
-    /// Node id bound on first successful auth; cleared only by
-    /// [`AppState::unbind_session`] or process exit.
-    bound_id: Option<String>,
-    /// Whether a connection from the bound peer is currently live (concurrency guard
-    /// against a second connection duplicating tunnel binds).
-    connected: bool,
-}
-
-/// Outcome of an authenticated peer trying to take the single session.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PeerAdmission {
-    /// Admitted: the session is now bound to this peer and marked connected.
-    Admitted,
-    /// A live connection already holds the session (same bound peer, old connection
-    /// still tearing down). Transient — the dialer should retry with backoff.
-    Busy,
-    /// The session is bound to a different node id. Sticky — the dialer must not
-    /// retry (its node id won't match until the listener unbinds or restarts).
-    WrongPeer,
-}
-
-/// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
-pub struct AppState {
-    pub role: Role,
-    /// This machine's hostname, shown in the dashboard title.
-    pub hostname: String,
-    /// `true` when the auth token was freshly generated (not supplied by
-    /// config/env), so the dashboard flags it for the user to copy.
-    pub token_generated: bool,
-    /// The shared auth token, shown in the listen-role dashboard so the dialer
-    /// can copy it (it may be freshly generated each run).
-    auth_token: RwLock<Option<String>>,
-    endpoint_id: RwLock<Option<String>>,
-    conn_status: RwLock<ConnStatus>,
+    /// Observed network path to this peer.
     path: RwLock<PathInfo>,
-    peers: RwLock<Vec<PeerRow>>,
-    /// Sticky single-session binding for the listen role. The first peer to
-    /// authenticate binds the session to its `remote_id` for the lifetime of the
-    /// program; only that node id may (re)connect afterwards. Any other node id is
-    /// rejected until the operator unbinds (TUI `u`) or restarts. The `connected`
-    /// flag is the concurrency guard that stops a second live connection from
-    /// duplicating tunnel binds while one is already active.
-    session: RwLock<SessionBinding>,
-    /// Monotonic allocator for [`TunnelId`]s. Never reused within a session.
+    /// Monotonic allocator for this session's [`TunnelId`]s.
     next_id: AtomicU64,
-    /// Authoritative tunnel-request list, seeded from config and appended to at
-    /// runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this (same
-    /// order), but identity is the [`TunnelId`], not the vec position.
+    /// Authoritative tunnel-request list for this peer (template-seeded, then
+    /// appended to via [`PeerSession::add_request`]). `tunnels` mirrors it 1:1.
     requests: RwLock<Vec<Request>>,
     tunnels: RwLock<Vec<TunnelRow>>,
-    /// Live stream limiter; `used = max - available_permits()`. Caps concurrent
-    /// forwarded connections across all tunnels in the one session.
-    semaphore: RwLock<Option<Arc<Semaphore>>>,
-    streams_max: RwLock<usize>,
-    /// Broadcast channel for tunnel start/stop commands (TUI -> connection supervisor).
+    /// Tunnel start/stop commands (TUI -> this peer's connection supervisor).
     tunnel_tx: broadcast::Sender<TunnelCommand>,
-    pub shutdown: CancellationToken,
-    pub logs: Arc<LogBuffer>,
 }
 
-impl AppState {
-    pub fn new(
-        role: Role,
-        token_generated: bool,
-        logs: Arc<LogBuffer>,
-        requests: Vec<RequestEntry>,
-    ) -> Arc<Self> {
+impl PeerSession {
+    /// Create a session for `remote_id`, seeding its tunnel table from `template`.
+    fn new(remote_id: String, template: &[RequestEntry]) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
-        // Assign a stable id to each config-seeded request; runtime adds continue
-        // from the same counter via `alloc_id`.
-        let requests: Vec<Request> = requests
-            .into_iter()
+        let requests: Vec<Request> = template
+            .iter()
             .enumerate()
             .map(|(i, entry)| Request {
                 id: TunnelId(i as u64),
-                entry,
+                entry: entry.clone(),
             })
             .collect();
-        let next_id = AtomicU64::new(requests.len() as u64);
+        let tunnels = requests
+            .iter()
+            .map(|r| tunnel_row_for(r.id, &r.entry))
+            .collect();
         Arc::new(Self {
-            role,
-            hostname: gethostname::gethostname().to_string_lossy().into_owned(),
-            token_generated,
-            auth_token: RwLock::new(None),
-            endpoint_id: RwLock::new(None),
-            conn_status: RwLock::new(ConnStatus::Connecting),
+            remote_id,
+            connected_since: Instant::now(),
             path: RwLock::new(PathInfo::establishing()),
-            peers: RwLock::new(Vec::new()),
-            session: RwLock::new(SessionBinding::default()),
-            next_id,
+            next_id: AtomicU64::new(requests.len() as u64),
             requests: RwLock::new(requests),
-            tunnels: RwLock::new(Vec::new()),
-            semaphore: RwLock::new(None),
-            streams_max: RwLock::new(0),
+            tunnels: RwLock::new(tunnels),
             tunnel_tx,
-            shutdown: CancellationToken::new(),
-            logs,
         })
     }
 
-    /// Subscribe to tunnel commands. Each connection supervisor subscribes once;
-    /// only commands sent after subscribing are delivered (so reconnects start clean).
+    /// Subscribe to this session's tunnel commands. The connection supervisor
+    /// subscribes once; only commands sent after subscribing are delivered.
     pub fn subscribe_commands(&self) -> broadcast::Receiver<TunnelCommand> {
         self.tunnel_tx.subscribe()
     }
 
-    /// Send a tunnel command to any active connection supervisor(s).
+    /// Send a tunnel command to this session's supervisor (no-op if none is live).
     pub fn send_command(&self, cmd: TunnelCommand) {
         let _ = self.tunnel_tx.send(cmd);
     }
 
-    /// Allocate a fresh, never-reused tunnel id.
     fn alloc_id(&self) -> TunnelId {
         TunnelId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -326,97 +266,8 @@ impl AppState {
         self.send_command(cmd);
     }
 
-    pub fn set_endpoint_id(&self, id: String) {
-        *self.endpoint_id.write() = Some(id);
-    }
-
-    pub fn set_auth_token(&self, token: String) {
-        *self.auth_token.write() = Some(token);
-    }
-
-    pub fn set_conn_status(&self, status: ConnStatus) {
-        *self.conn_status.write() = status;
-    }
-
     pub fn set_path(&self, path: PathInfo) {
         *self.path.write() = path;
-    }
-
-    /// Record the live stream limiter so the gauge tracks it exactly.
-    pub fn set_semaphore(&self, semaphore: Arc<Semaphore>, max: usize) {
-        *self.semaphore.write() = Some(semaphore);
-        *self.streams_max.write() = max;
-    }
-
-    /// Update the path of a connected peer (listen role), matched by `remote_id`.
-    pub fn set_peer_path(&self, remote_id: &str, path: PathInfo) {
-        let mut peers = self.peers.write();
-        if let Some(peer) = peers.iter_mut().find(|p| p.remote_id == remote_id) {
-            peer.path = path;
-        }
-    }
-
-    /// Decide whether an authenticated `remote_id` may take the single session
-    /// (listen role). The write lock serializes simultaneous auths so exactly one
-    /// peer wins the bind. See [`PeerAdmission`]. On `Admitted` the session is bound
-    /// (first time) and marked connected; the caller owns the live connection.
-    pub fn admit_peer(&self, remote_id: &str) -> PeerAdmission {
-        let mut b = self.session.write();
-        if b.bound_id.as_deref().is_some_and(|id| id != remote_id) {
-            return PeerAdmission::WrongPeer;
-        }
-        if b.connected {
-            return PeerAdmission::Busy;
-        }
-        b.bound_id.get_or_insert_with(|| remote_id.to_string());
-        b.connected = true;
-        PeerAdmission::Admitted
-    }
-
-    /// Mark the live connection gone, keeping the sticky binding so the same peer
-    /// may reconnect but a different node id still cannot. Called on teardown by the
-    /// connection that was `Admitted`.
-    pub fn disconnect_peer(&self) {
-        self.session.write().connected = false;
-    }
-
-    /// Clear the sticky binding so a different node id may bind next (TUI `u`). The
-    /// `connected` guard is left untouched: any in-flight connection runs to its end.
-    pub fn unbind_session(&self) {
-        self.session.write().bound_id = None;
-    }
-
-    /// The node id currently bound to the session, if any (for display).
-    pub fn bound_peer(&self) -> Option<String> {
-        self.session.read().bound_id.clone()
-    }
-
-    pub fn add_peer(&self, remote_id: String) {
-        let mut peers = self.peers.write();
-        if !peers.iter().any(|p| p.remote_id == remote_id) {
-            peers.push(PeerRow {
-                remote_id,
-                connected_since: Instant::now(),
-                path: PathInfo::establishing(),
-            });
-        }
-    }
-
-    pub fn remove_peer(&self, remote_id: &str) {
-        self.peers.write().retain(|p| p.remote_id != remote_id);
-    }
-
-    /// Rebuild the tunnel table from the current request list (all `Idle`), carrying
-    /// each request's stable id. Called once per (re)connection; runtime additions
-    /// and deletions persist because they live in `requests`.
-    pub fn seed_tunnels_from_requests(&self) {
-        let rows = self
-            .requests
-            .read()
-            .iter()
-            .map(|r| tunnel_row_for(r.id, &r.entry))
-            .collect();
-        *self.tunnels.write() = rows;
     }
 
     /// The request with `id`, cloned (used by the connection supervisor on `Start`).
@@ -428,8 +279,7 @@ impl AppState {
             .map(|r| r.entry.clone())
     }
 
-    /// Ids of all configured tunnel requests, in display order (used by the autostart
-    /// path to start each one).
+    /// Ids of all this session's tunnel requests, in display order.
     pub fn request_ids(&self) -> Vec<TunnelId> {
         self.requests.read().iter().map(|r| r.id).collect()
     }
@@ -440,9 +290,8 @@ impl AppState {
         let id = self.alloc_id();
         let row = tunnel_row_for(id, &entry);
         // Hold both locks for the duration so `requests` and `tunnels` are never
-        // observed out of sync. Lock order is requests-then-tunnels, matching
-        // `seed_tunnels_from_requests`; no site takes them the other way, so this
-        // can't deadlock.
+        // observed out of sync. Lock order is requests-then-tunnels; no site takes
+        // them the other way, so this can't deadlock.
         let mut requests = self.requests.write();
         let mut tunnels = self.tunnels.write();
         requests.push(Request { id, entry });
@@ -450,12 +299,10 @@ impl AppState {
         id
     }
 
-    /// Remove the tunnel `id` from the session (config is never touched). If it is
-    /// running, a `Stop` is broadcast first so the supervisor cancels its task and
-    /// frees the bound local port; the row is then dropped from both lists.
+    /// Remove the tunnel `id` from this session. If it is running, a `Stop` is
+    /// broadcast first so the supervisor cancels its task and frees the bound local
+    /// port; the row is then dropped from both lists.
     pub fn delete_request(&self, id: TunnelId) {
-        // Free the port if running. `Stop` for a non-running id is a harmless no-op in
-        // the supervisor, so we send unconditionally.
         self.send_command(TunnelCommand::Stop(id));
         let mut requests = self.requests.write();
         let mut tunnels = self.tunnels.write();
@@ -468,19 +315,143 @@ impl AppState {
         self.tunnels.read().len()
     }
 
-    /// The id of the tunnel at display position `pos`, if any. Resolves the TUI's
-    /// transient cursor position to a stable id at action time.
+    /// The id of the tunnel at display position `pos`, if any.
     pub fn tunnel_id_at(&self, pos: usize) -> Option<TunnelId> {
         self.tunnels.read().get(pos).map(|t| t.id)
     }
 
-    /// Update the status/detail of the tunnel `id` (no-op if it has been deleted, so a
-    /// late update from a just-stopped task is harmless).
+    /// Update the status/detail of the tunnel `id` (no-op if it has been deleted, so
+    /// a late update from a just-stopped task is harmless).
     pub fn update_tunnel(&self, id: TunnelId, status: TunnelStatus, detail: impl Into<String>) {
         let mut tunnels = self.tunnels.write();
         if let Some(row) = tunnels.iter_mut().find(|t| t.id == id) {
             row.status = status;
             row.detail = detail.into();
+        }
+    }
+
+    fn snapshot(&self) -> PeerSnapshot {
+        PeerSnapshot {
+            remote_id: self.remote_id.clone(),
+            connected_since: self.connected_since,
+            path: self.path.read().clone(),
+            tunnels: self.tunnels.read().clone(),
+        }
+    }
+}
+
+/// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
+pub struct AppState {
+    pub role: Role,
+    /// This machine's hostname, shown in the dashboard title.
+    pub hostname: String,
+    /// `true` when the auth token was freshly generated (not supplied by
+    /// config/env), so the dashboard flags it for the user to copy.
+    pub token_generated: bool,
+    /// The shared auth token, shown in the listen-role dashboard so the dialer
+    /// can copy it (it may be freshly generated each run).
+    auth_token: RwLock<Option<String>>,
+    endpoint_id: RwLock<Option<String>>,
+    /// High-level connection status for the dial role (its single connection /
+    /// reconnect state). Unused by the listen role, which tracks per-peer status.
+    conn_status: RwLock<ConnStatus>,
+    /// Prefilled `[[request]]` list. A *template* only: each new [`PeerSession`] is
+    /// seeded from it, then evolves independently.
+    request_template: Vec<RequestEntry>,
+    /// Live per-peer sessions, one per authenticated connection. The listen role
+    /// may hold several; the dial role holds at most one.
+    peers: RwLock<Vec<Arc<PeerSession>>>,
+    /// Live stream limiter; `used = max - available_permits()`. A single global cap
+    /// on concurrent forwarded streams across *all* peers.
+    semaphore: RwLock<Option<Arc<Semaphore>>>,
+    streams_max: RwLock<usize>,
+    pub shutdown: CancellationToken,
+    pub logs: Arc<LogBuffer>,
+}
+
+impl AppState {
+    pub fn new(
+        role: Role,
+        token_generated: bool,
+        logs: Arc<LogBuffer>,
+        requests: Vec<RequestEntry>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            role,
+            hostname: gethostname::gethostname().to_string_lossy().into_owned(),
+            token_generated,
+            auth_token: RwLock::new(None),
+            endpoint_id: RwLock::new(None),
+            conn_status: RwLock::new(ConnStatus::Connecting),
+            request_template: requests,
+            peers: RwLock::new(Vec::new()),
+            semaphore: RwLock::new(None),
+            streams_max: RwLock::new(0),
+            shutdown: CancellationToken::new(),
+            logs,
+        })
+    }
+
+    pub fn set_endpoint_id(&self, id: String) {
+        *self.endpoint_id.write() = Some(id);
+    }
+
+    pub fn set_auth_token(&self, token: String) {
+        *self.auth_token.write() = Some(token);
+    }
+
+    pub fn set_conn_status(&self, status: ConnStatus) {
+        *self.conn_status.write() = status;
+    }
+
+    /// Record the live stream limiter so the gauge tracks it exactly. Set once at
+    /// startup; the same global semaphore is shared by every peer.
+    pub fn set_semaphore(&self, semaphore: Arc<Semaphore>, max: usize) {
+        *self.semaphore.write() = Some(semaphore);
+        *self.streams_max.write() = max;
+    }
+
+    /// Admit an authenticated peer: register a fresh [`PeerSession`] (seeded from
+    /// the request template) and return it. Returns `None` if a session for this
+    /// `remote_id` is already live — the caller should reject the duplicate as
+    /// transiently busy so a reconnect race can't bind the same local ports twice.
+    ///
+    /// This is the **only** admission rule and it is **role-agnostic**: node-id
+    /// dedup, nothing more. There is deliberately no per-role peer cap here. The
+    /// "a dialer holds at most one peer" property is a structural consequence of
+    /// `run_dial` dialing a single target in a sequential loop (each `attach_peer`
+    /// is paired with a `detach_peer` inside one `handle_connection`), not an
+    /// invariant enforced at this layer — so do not gate it on `self.role`.
+    pub fn attach_peer(&self, remote_id: String) -> Option<Arc<PeerSession>> {
+        let mut peers = self.peers.write();
+        if peers.iter().any(|p| p.remote_id == remote_id) {
+            return None;
+        }
+        let session = PeerSession::new(remote_id, &self.request_template);
+        peers.push(session.clone());
+        Some(session)
+    }
+
+    /// Drop the session for `remote_id` on connection teardown.
+    pub fn detach_peer(&self, remote_id: &str) {
+        self.peers.write().retain(|p| p.remote_id != remote_id);
+    }
+
+    /// The live session at display position `index`, if any (resolves the TUI's
+    /// transient peer cursor to a concrete session at action time).
+    pub fn peer_at(&self, index: usize) -> Option<Arc<PeerSession>> {
+        self.peers.read().get(index).cloned()
+    }
+
+    /// Number of live peer sessions (used to clamp the TUI peer cursor).
+    pub fn peer_count(&self) -> usize {
+        self.peers.read().len()
+    }
+
+    /// Update the observed path of a connected peer, matched by `remote_id`.
+    pub fn set_peer_path(&self, remote_id: &str, path: PathInfo) {
+        if let Some(peer) = self.peers.read().iter().find(|p| p.remote_id == remote_id) {
+            peer.set_path(path);
         }
     }
 
@@ -493,6 +464,7 @@ impl AppState {
             .as_ref()
             .map(|s| streams_max.saturating_sub(s.available_permits()))
             .unwrap_or(0);
+        let peers = self.peers.read().iter().map(|p| p.snapshot()).collect();
         AppSnapshot {
             role: self.role,
             hostname: self.hostname.clone(),
@@ -500,14 +472,20 @@ impl AppState {
             endpoint_id: self.endpoint_id.read().clone(),
             auth_token: self.auth_token.read().clone(),
             conn_status: self.conn_status.read().clone(),
-            path: self.path.read().clone(),
-            peers: self.peers.read().clone(),
-            bound_peer: self.bound_peer(),
-            tunnels: self.tunnels.read().clone(),
+            peers,
             streams_used,
             streams_max,
         }
     }
+}
+
+/// Owned, lock-free view of a [`PeerSession`] for a single render pass.
+#[derive(Clone)]
+pub struct PeerSnapshot {
+    pub remote_id: String,
+    pub connected_since: Instant,
+    pub path: PathInfo,
+    pub tunnels: Vec<TunnelRow>,
 }
 
 /// Owned, lock-free view of [`AppState`] for a single render pass.
@@ -517,13 +495,10 @@ pub struct AppSnapshot {
     pub token_generated: bool,
     pub endpoint_id: Option<String>,
     pub auth_token: Option<String>,
+    /// Dial-role connection/reconnect status (the listen role uses per-peer rows).
     pub conn_status: ConnStatus,
-    pub path: PathInfo,
-    pub peers: Vec<PeerRow>,
-    /// Node id bound to the session (listen role), even when no peer is currently
-    /// connected. Drives the "bound — waiting" display and the unbind hint.
-    pub bound_peer: Option<String>,
-    pub tunnels: Vec<TunnelRow>,
+    /// Live peer sessions, each with its own tunnels and path.
+    pub peers: Vec<PeerSnapshot>,
     pub streams_used: usize,
     pub streams_max: usize,
 }
@@ -542,81 +517,113 @@ mod tests {
     }
 
     #[test]
-    fn add_request_appends_request_and_idle_row() {
+    fn attached_session_seeds_tunnels_from_template() {
         let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed);
-        // Rows mirror the requests only after seeding.
-        state.seed_tunnels_from_requests();
-        assert_eq!(state.request_ids().len(), 1);
-        assert_eq!(state.tunnel_count(), 1);
-        let db_id = state.tunnel_id_at(0).expect("seeded id");
+        let session = state.attach_peer("peer-a".into()).expect("first attach");
+        assert_eq!(session.tunnel_count(), 1);
+        let db_id = session.tunnel_id_at(0).expect("seeded id");
+        assert_eq!(session.get_request(db_id).unwrap().name, "db");
+    }
 
-        let id = state.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
-        assert_ne!(id, db_id, "append allocates a fresh id");
-        assert_eq!(state.request_ids().len(), 2);
-        assert_eq!(state.tunnel_count(), 2);
+    #[test]
+    fn multiple_distinct_peers_attach_independently() {
+        let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed);
 
-        // The request round-trips and the row is Idle with the right spec.
-        let got = state.get_request(id).expect("request present");
+        let a = state.attach_peer("peer-a".into()).expect("a attaches");
+        let b = state.attach_peer("peer-b".into()).expect("b attaches too");
+        assert_eq!(state.peer_count(), 2);
+
+        // Each peer has its own independently-seeded tunnel table.
+        let a_id = a.tunnel_id_at(0).unwrap();
+        a.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
+        assert_eq!(a.tunnel_count(), 2);
+        assert_eq!(b.tunnel_count(), 1, "b is unaffected by a's runtime add");
+
+        // A second concurrent connection from an already-connected id is refused.
+        assert!(
+            state.attach_peer("peer-a".into()).is_none(),
+            "duplicate live remote_id is rejected as busy"
+        );
+        assert_eq!(state.peer_count(), 2);
+
+        // Detaching frees the id so the same peer may reconnect later.
+        state.detach_peer("peer-a");
+        assert_eq!(state.peer_count(), 1);
+        let a2 = state.attach_peer("peer-a".into()).expect("reattach after detach");
+        assert_eq!(
+            a2.tunnel_count(),
+            1,
+            "reconnect re-seeds from the template (runtime add not preserved)"
+        );
+        // The original handle still resolves; its id space is its own.
+        assert!(a.get_request(a_id).is_some());
+    }
+
+    /// `attach_peer` is the uniform admission primitive: it dedups by node id and
+    /// is otherwise role-agnostic. The "a dialer holds at most one peer" rule is a
+    /// structural consequence of `run_dial` dialing a single target sequentially
+    /// (attach paired with detach inside one `handle_connection`), NOT a cap
+    /// enforced here. This test pins that decision so the single-peer-dialer rule
+    /// isn't mistakenly re-added to the shared admission path.
+    #[test]
+    fn attach_peer_dedups_by_node_id_regardless_of_role() {
+        let state = AppState::new(Role::Dial, false, LogBuffer::new(16), vec![]);
+        // Distinct ids both attach: attach_peer imposes no per-role peer cap even
+        // in the dial role.
+        assert!(state.attach_peer("peer-a".into()).is_some());
+        assert!(state.attach_peer("peer-b".into()).is_some());
+        // The sole admission rule — node-id dedup — applies in the dial role too.
+        assert!(
+            state.attach_peer("peer-a".into()).is_none(),
+            "a duplicate live node id is refused regardless of role"
+        );
+        assert_eq!(state.peer_count(), 2);
+    }
+
+    #[test]
+    fn add_request_appends_request_and_idle_row() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        let session = state.attach_peer("peer-a".into()).unwrap();
+
+        let id = session.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
+        assert_eq!(session.tunnel_count(), 1);
+        let got = session.get_request(id).expect("request present");
         assert_eq!(got.remote_source, "tcp://127.0.0.1:22");
-        let row = state.snapshot().tunnels[1].clone();
+        let row = session.snapshot().tunnels[0].clone();
         assert_eq!(row.id, id);
         assert_eq!(row.name, "ssh");
         assert_eq!(row.spec, "127.0.0.1:2222 <- tcp://127.0.0.1:22");
         assert_eq!(row.status, TunnelStatus::Idle);
 
         // A second append keeps allocating distinct ids.
-        let id2 = state.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
+        let id2 = session.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
         assert_ne!(id2, id);
-        assert_eq!(state.get_request(db_id).unwrap().name, "db");
     }
 
     #[test]
     fn delete_request_drops_row_and_preserves_other_ids() {
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
-        let a = state.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        let b = state.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
-        let c = state.add_request(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
-        assert_eq!(state.tunnel_count(), 3);
+        let session = state.attach_peer("peer-a".into()).unwrap();
+        let a = session.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        let b = session.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        let c = session.add_request(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
+        assert_eq!(session.tunnel_count(), 3);
 
         // Delete the middle tunnel.
-        state.delete_request(b);
-        assert_eq!(state.tunnel_count(), 2);
-        assert!(state.get_request(b).is_none(), "deleted request is gone");
+        session.delete_request(b);
+        assert_eq!(session.tunnel_count(), 2);
+        assert!(session.get_request(b).is_none(), "deleted request is gone");
 
         // The survivors keep their ids and shift up by one position.
-        assert_eq!(state.get_request(a).unwrap().name, "a");
-        assert_eq!(state.get_request(c).unwrap().name, "c");
-        assert_eq!(state.tunnel_id_at(0), Some(a));
-        assert_eq!(state.tunnel_id_at(1), Some(c));
+        assert_eq!(session.get_request(a).unwrap().name, "a");
+        assert_eq!(session.get_request(c).unwrap().name, "c");
+        assert_eq!(session.tunnel_id_at(0), Some(a));
+        assert_eq!(session.tunnel_id_at(1), Some(c));
 
         // Deleting an unknown id is a no-op.
-        state.delete_request(b);
-        assert_eq!(state.tunnel_count(), 2);
-    }
-
-    #[test]
-    fn session_binds_to_first_peer_and_stays_sticky() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
-
-        // First peer to authenticate binds the session.
-        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Admitted);
-        // A different node id is rejected as the wrong peer while bound.
-        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::WrongPeer);
-        // A second live connection from the same peer is transient-busy.
-        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Busy);
-
-        // The binding is sticky: even after the peer disconnects, a different node
-        // id still cannot bind...
-        state.disconnect_peer();
-        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::WrongPeer);
-        // ...but the originally-bound peer may reconnect.
-        assert_eq!(state.admit_peer("peer-a"), PeerAdmission::Admitted);
-
-        // Unbinding (TUI `u`) frees the session for a new node id once the current
-        // connection ends.
-        state.disconnect_peer();
-        state.unbind_session();
-        assert_eq!(state.admit_peer("peer-b"), PeerAdmission::Admitted);
+        session.delete_request(b);
+        assert_eq!(session.tunnel_count(), 2);
     }
 }
