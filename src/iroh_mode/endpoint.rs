@@ -1,6 +1,6 @@
 //! Common endpoint helpers for iroh tunnel connections.
 
-use crate::app_state::{AppState, PathInfo, PathKind, Role};
+use crate::app_state::{AppState, PathInfo, PathKind};
 use crate::config::{
     CongestionController, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, TransportTuning,
 };
@@ -483,6 +483,7 @@ pub fn watch_connection_paths(
     conn: &iroh::endpoint::Connection,
     state: Arc<AppState>,
     remote_id: String,
+    is_dialer: bool,
 ) -> PathWatcherGuard {
     let conn = conn.clone();
     PathWatcherGuard(tokio::spawn(async move {
@@ -493,9 +494,13 @@ pub fn watch_connection_paths(
         let mut last_key = None;
         while let Some(paths) = stream.next().await {
             let info = classify_paths(&paths);
-            match state.role {
-                Role::Dial => state.set_path(info),
-                Role::Listen => state.set_peer_path(&remote_id, info),
+            // A dialer drives one outbound connection (the single `path`); a listener
+            // updates the matching inbound peer. Keyed off this connection's role, not
+            // the process role, so it stays correct in a dual-role process.
+            if is_dialer {
+                state.set_path(info);
+            } else {
+                state.set_peer_path(&remote_id, info);
             }
             let key = paths_key(&paths);
             if last_key.as_ref() != Some(&key) {

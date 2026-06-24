@@ -1,12 +1,15 @@
-//! Interactive in-TUI setup: collect role, allowlist, target node id, and auth
-//! token before the runtime starts.
+//! Interactive in-TUI setup: collect the serving allowlist and confirm token
+//! generation before the runtime starts.
 //!
-//! Pure state machine ([`SetupState`] + [`handle_key`]) plus a pure [`render`].
-//! The driver lives in [`super::run_setup`]. Validation (CRC16 on the auth token,
-//! `EndpointId` parse on the node id, CIDR parse on the allowlist) happens here, so
-//! the dialer never attempts a connection with bad inputs.
+//! There is no role question: every interactive run is always listening, and the
+//! single outbound dial session is started on demand from the dashboard (see
+//! `super::handle_key`). Setup therefore only resolves the serving `[allowed_sources]`
+//! (when config supplies none) and the auth token (supplied, or freshly generated).
+//!
+//! Pure state machine ([`SetupState`] + [`handle_key`]) plus a pure [`render`]. The
+//! driver lives in [`super::run_setup`]. Validation (CRC16 on a supplied token, CIDR
+//! parse on the allowlist) happens here.
 
-use iroh::EndpointId;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -21,37 +24,21 @@ use crate::auth;
 use crate::config::{AllowedSources, validate_cidr};
 use crate::peer_params::ResolvedPeer;
 
-/// The two roles offered on the start screen, in display order. Index 0 (listen)
-/// is the default highlight.
-const CONNECT_OPTIONS: [&str; 2] = [
-    "Start a new instance (listen for a connection)",
-    "Connect to an existing instance (dial)",
-];
-/// Index of the "dial" option within [`CONNECT_OPTIONS`].
-const CONNECT_DIAL: usize = 1;
-
 /// Which question the setup screen is currently asking.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SetupPhase {
-    /// Combined start screen: pick the role and — when config supplies no
-    /// `[allowed_sources]` — enter the TCP/UDP CIDR allowlists. The allowlist
-    /// applies to either role, so it is collected here up front.
+    /// Start screen: a summary plus — when config supplies no `[allowed_sources]` — the
+    /// TCP/UDP CIDR allowlists gating what inbound peers may request. Enter proceeds.
     Start,
-    /// Listen only, when no config token: confirm a fresh token will be
-    /// generated for this run before generating it.
+    /// When no token came from config/env: confirm a fresh one will be generated for
+    /// this run before generating it.
     ConfirmGenerateToken,
-    /// Dial only: the dial target. In nostr mode this is the peer's short
-    /// identifier (looked up via nostr); in quick mode it is a full node id.
-    NodeId,
-    /// Dial only: the auth token (skipped when one came from config/env).
-    AuthToken,
 }
 
-/// Which part of the [`SetupPhase::Start`] screen currently has focus. The
-/// allowlist sections only exist when config supplies no `[allowed_sources]`.
+/// Which CIDR field of the [`SetupPhase::Start`] screen has focus. Only relevant when
+/// config supplies no `[allowed_sources]` (otherwise there are no editable fields).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StartSection {
-    Role,
     AllowedTcp,
     AllowedUdp,
 }
@@ -73,15 +60,11 @@ pub enum Step {
 pub struct SetupState {
     phase: SetupPhase,
     /// A valid auth token already supplied by config/env (pre-validated in main).
-    /// Used directly for Listen, and skips the token prompt for Dial.
     config_auth_token: Option<String>,
-    /// Allowlist supplied by config. When non-empty the interactive allowlist
-    /// fields are hidden (config wins); when empty they are shown on the start
-    /// screen.
+    /// Allowlist supplied by config. When non-empty the interactive allowlist fields
+    /// are hidden (config wins); when empty they are shown on the start screen.
     config_allowed_sources: AllowedSources,
-    /// Highlighted option in the start screen's role list.
-    connect_choice: usize,
-    /// Focused section of the start screen.
+    /// Focused CIDR field (only used when the allowlist fields are shown).
     section: StartSection,
     /// TCP/UDP CIDR text entered on the start screen (only used when
     /// `config_allowed_sources` is empty).
@@ -89,24 +72,13 @@ pub struct SetupState {
     allowed_udp: Input,
     /// Allowlist resolved once the start screen is submitted, carried to `Done`.
     allowed_sources: AllowedSources,
-    /// Whether the dial role was chosen. The role can't be inferred from
-    /// `node_id` because a dialer may leave it blank and discover it via nostr.
-    dial: bool,
-    /// Whether nostr discovery is active (nostr mode). When true the dialer enters a
-    /// short peer *identifier* (looked up at runtime); when false (quick mode) it
-    /// enters a full node id.
+    /// Whether nostr discovery is active (nostr mode) — display only, for the summary.
     nostr_discovery: bool,
-    node_id: Option<EndpointId>,
-    /// Target peer's nostr identifier (nostr-mode dial); `None` in quick mode.
-    peer_identifier: Option<String>,
-    /// This peer's own identifier (config `name`), used to reject a dialer entering
-    /// its own id (which would resolve to itself). `None` in quick mode.
+    /// This machine's own nostr name (config `name`) — display only, for the summary.
     own_name: Option<String>,
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
     token_generated: bool,
-    /// Current text field contents (node id / token).
-    buffer: Input,
     /// Inline error from the last failed validation; cleared on the next keypress.
     error: Option<String>,
 }
@@ -122,65 +94,37 @@ impl SetupState {
             phase: SetupPhase::Start,
             config_auth_token,
             config_allowed_sources,
-            connect_choice: 0,
-            section: StartSection::Role,
+            section: StartSection::AllowedTcp,
             allowed_tcp: Input::default(),
             allowed_udp: Input::default(),
             allowed_sources: AllowedSources::default(),
-            dial: false,
             nostr_discovery,
-            node_id: None,
-            peer_identifier: None,
             own_name,
             auth_token: None,
             token_generated: false,
-            buffer: Input::default(),
             error: None,
         }
     }
 }
 
-/// Resolve the Listen credential (config/env token or a fresh one) and finish.
-fn finalize_listen(state: &mut SetupState) -> Step {
+/// Resolve the credential (config/env token or a freshly generated one) and finish.
+fn finalize(state: &mut SetupState) -> Step {
     let (auth_token, token_generated) = match state.config_auth_token.clone() {
         Some(token) => (token, false),
         None => (auth::generate_token(), true),
     };
     state.auth_token = Some(auth_token);
     state.token_generated = token_generated;
-    state.node_id = None;
     Step::Done(build_resolved(state))
 }
 
-/// After the dial target is resolved (a node id in quick mode, or a peer identifier
-/// in nostr mode), either finish (a config/env token is present) or advance to the
-/// token prompt.
-fn proceed_after_node_id(state: &mut SetupState) -> Step {
-    match state.config_auth_token.clone() {
-        Some(token) => {
-            state.auth_token = Some(token);
-            state.token_generated = false;
-            Step::Done(build_resolved(state))
-        }
-        None => {
-            state.phase = SetupPhase::AuthToken;
-            state.buffer.reset();
-            Step::Continue
-        }
-    }
-}
-
-/// Build the final `ResolvedPeer` from accumulated state.
+/// Build the final `ResolvedPeer`. Interactive runs are always `Role::Both` (serve
+/// always + dial on demand); the dial target is supplied at runtime, not here.
 fn build_resolved(state: &SetupState) -> ResolvedPeer {
-    let role = if state.dial {
-        Role::Dial
-    } else {
-        Role::Listen
-    };
     ResolvedPeer {
-        role,
-        peer_node_id: state.node_id,
-        peer_identifier: state.peer_identifier.clone(),
+        role: Role::Both,
+        peer_node_id: None,
+        peer_identifier: None,
         auth_token: state.auth_token.clone().unwrap_or_default(),
         token_generated: state.token_generated,
         allowed_sources: state.allowed_sources.clone(),
@@ -192,8 +136,9 @@ fn allowlist_fields_shown(state: &SetupState) -> bool {
     state.config_allowed_sources.is_empty()
 }
 
-/// Submit the start screen: resolve the allowlist (from config or the entered
-/// CIDRs), then advance by role. A bad CIDR keeps the screen open with an error.
+/// Submit the start screen: resolve the allowlist (from config or the entered CIDRs),
+/// then finish (a token is present) or confirm token generation. A bad CIDR keeps the
+/// screen open with an error.
 fn submit_start(state: &mut SetupState) -> Step {
     let allowed = if !allowlist_fields_shown(state) {
         state.config_allowed_sources.clone()
@@ -217,25 +162,19 @@ fn submit_start(state: &mut SetupState) -> Step {
         AllowedSources { tcp, udp }
     };
     state.allowed_sources = allowed;
-    state.dial = state.connect_choice == CONNECT_DIAL;
 
-    if state.dial {
-        state.phase = SetupPhase::NodeId;
-        state.buffer.reset();
-        Step::Continue
-    } else if state.config_auth_token.is_some() {
-        // Listen with a config/env token: used as-is, no confirmation.
-        finalize_listen(state)
+    if state.config_auth_token.is_some() {
+        // A config/env token is used as-is, no confirmation.
+        finalize(state)
     } else {
-        // Listen without a token: confirm before generating a fresh one.
+        // No token: confirm before generating a fresh one.
         state.phase = SetupPhase::ConfirmGenerateToken;
-        state.buffer.reset();
         Step::Continue
     }
 }
 
-/// Parse a line of space/comma-separated CIDRs, validating each. Empty input
-/// yields an empty list; `run_peer` later applies the localhost default.
+/// Parse a line of space/comma-separated CIDRs, validating each. Empty input yields an
+/// empty list; `run_peer` later applies the localhost default.
 fn parse_cidr_list(buffer: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for tok in buffer.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
@@ -260,132 +199,41 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
             KeyCode::Esc => Step::Quit,
             KeyCode::Enter => submit_start(state),
             KeyCode::Tab => {
-                // Cycle Role -> TCP -> UDP -> Role, but only when the allowlist
-                // fields exist.
+                // Toggle between the two CIDR fields, but only when they exist.
                 if allowlist_fields_shown(state) {
                     state.section = match state.section {
-                        StartSection::Role => StartSection::AllowedTcp,
                         StartSection::AllowedTcp => StartSection::AllowedUdp,
-                        StartSection::AllowedUdp => StartSection::Role,
+                        StartSection::AllowedUdp => StartSection::AllowedTcp,
                     };
                 }
                 Step::Continue
             }
-            _ => match state.section {
-                StartSection::Role => match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.connect_choice = state.connect_choice.saturating_sub(1);
-                        Step::Continue
+            _ => {
+                if allowlist_fields_shown(state) {
+                    match state.section {
+                        StartSection::AllowedTcp => {
+                            handle_edit(&mut state.allowed_tcp, key, is_cidr_char)
+                        }
+                        StartSection::AllowedUdp => {
+                            handle_edit(&mut state.allowed_udp, key, is_cidr_char)
+                        }
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        state.connect_choice =
-                            (state.connect_choice + 1).min(CONNECT_OPTIONS.len() - 1);
-                        Step::Continue
-                    }
-                    _ => Step::Continue,
-                },
-                StartSection::AllowedTcp => {
-                    handle_edit(&mut state.allowed_tcp, key, is_cidr_char);
-                    Step::Continue
                 }
-                StartSection::AllowedUdp => {
-                    handle_edit(&mut state.allowed_udp, key, is_cidr_char);
-                    Step::Continue
-                }
-            },
+                Step::Continue
+            }
         },
         SetupPhase::ConfirmGenerateToken => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => finalize_listen(state),
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => finalize(state),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 state.phase = SetupPhase::Start;
-                state.buffer.reset();
                 Step::Continue
             }
             _ => Step::Continue,
         },
-        SetupPhase::NodeId => match key.code {
-            KeyCode::Esc => {
-                state.phase = SetupPhase::Start;
-                state.buffer.reset();
-                Step::Continue
-            }
-            KeyCode::Enter => {
-                let raw = state.buffer.value().trim();
-                if state.nostr_discovery {
-                    // Nostr mode: the entry is the target peer's short identifier,
-                    // looked up via nostr at runtime.
-                    if raw.is_empty() {
-                        state.error = Some("Enter the peer's identifier".to_string());
-                        Step::Continue
-                    } else if state.own_name.as_deref().map(str::trim) == Some(raw) {
-                        // Dialing our own identifier would resolve to ourselves.
-                        state.error = Some(
-                            "That is this peer's own identifier; enter the other peer's identifier"
-                                .to_string(),
-                        );
-                        Step::Continue
-                    } else {
-                        state.peer_identifier = Some(raw.to_string());
-                        state.node_id = None;
-                        proceed_after_node_id(state)
-                    }
-                } else if raw.is_empty() {
-                    // Quick mode: a full node id is required.
-                    state.error = Some("Enter the peer's node id".to_string());
-                    Step::Continue
-                } else {
-                    match raw.parse::<EndpointId>() {
-                        Ok(id) => {
-                            state.node_id = Some(id);
-                            state.peer_identifier = None;
-                            proceed_after_node_id(state)
-                        }
-                        Err(_) => {
-                            state.error = Some("Invalid node id".to_string());
-                            Step::Continue
-                        }
-                    }
-                }
-            }
-            _ => {
-                handle_edit(&mut state.buffer, key, is_input_char);
-                Step::Continue
-            }
-        },
-        SetupPhase::AuthToken => match key.code {
-            KeyCode::Esc => {
-                state.phase = SetupPhase::NodeId;
-                state.buffer.reset();
-                Step::Continue
-            }
-            KeyCode::Enter => {
-                let token = state.buffer.value().trim().to_string();
-                match auth::validate_token(&token) {
-                    Ok(()) => {
-                        state.auth_token = Some(token);
-                        state.token_generated = false;
-                        Step::Done(build_resolved(state))
-                    }
-                    Err(e) => {
-                        state.error = Some(format!("Invalid auth token: {e}"));
-                        Step::Continue
-                    }
-                }
-            }
-            _ => {
-                handle_edit(&mut state.buffer, key, is_input_char);
-                Step::Continue
-            }
-        },
     }
 }
 
-/// Accept printable ASCII (node ids and tokens are ASCII; no spaces).
-fn is_input_char(c: char) -> bool {
-    c.is_ascii_graphic()
-}
-
-/// CIDR entry additionally accepts spaces/commas as separators between entries.
+/// CIDR entry accepts printable ASCII plus spaces/commas as separators between entries.
 fn is_cidr_char(c: char) -> bool {
     c.is_ascii_graphic() || c == ' '
 }
@@ -413,20 +261,19 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
 
     match state.phase {
         SetupPhase::Start => {
-            lines.push(Line::from("How do you want to start?"));
-            lines.push(Line::raw(""));
-            for (i, label) in CONNECT_OPTIONS.iter().enumerate() {
-                if i == state.connect_choice {
-                    lines.push(Line::from(Span::styled(
-                        format!("  ▶ {label}"),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                } else {
-                    lines.push(Line::from(format!("    {label}")));
-                }
+            lines.push(Line::from("This instance will always listen for peers."));
+            if state.nostr_discovery
+                && let Some(name) = &state.own_name
+            {
+                lines.push(Line::from(Span::styled(
+                    format!("  Reachable via nostr as \"{name}\"."),
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
+            lines.push(Line::from(Span::styled(
+                "  Dial a peer on demand from the dashboard (press c).",
+                Style::default().fg(Color::DarkGray),
+            )));
             if allowlist_fields_shown(state) {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(
@@ -461,23 +308,6 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
             )));
             lines.push(Line::from("Proceed? (Y/n)"));
         }
-        SetupPhase::NodeId => {
-            if state.nostr_discovery {
-                lines.push(Line::from("Peer identifier:"));
-                lines.push(field_input_line(&state.buffer, true));
-                lines.push(Line::from(Span::styled(
-                    "  the target peer's name (its config `name`); looked up via nostr",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            } else {
-                lines.push(Line::from("Existing instance node id:"));
-                lines.push(field_input_line(&state.buffer, true));
-            }
-        }
-        SetupPhase::AuthToken => {
-            lines.push(Line::from("Auth token:"));
-            lines.push(field_input_line(&state.buffer, true));
-        }
     }
 
     if let Some(err) = &state.error {
@@ -492,20 +322,12 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     let footer = match state.phase {
         SetupPhase::Start => {
             if allowlist_fields_shown(state) {
-                match state.section {
-                    StartSection::Role => {
-                        "↑/↓ choose role · Tab next field · Enter continue · Esc / Ctrl-C quit"
-                    }
-                    StartSection::AllowedTcp | StartSection::AllowedUdp => {
-                        "Tab next field · Enter continue · Esc / Ctrl-C quit"
-                    }
-                }
+                "Tab next field · Enter start · Esc / Ctrl-C quit"
             } else {
-                "↑/↓ select · Enter continue · Esc / Ctrl-C quit"
+                "Enter start · Esc / Ctrl-C quit"
             }
         }
         SetupPhase::ConfirmGenerateToken => "Esc back · Ctrl-C quit",
-        SetupPhase::NodeId | SetupPhase::AuthToken => "Enter confirm · Esc back · Ctrl-C quit",
     };
     lines.push(Line::from(Span::styled(
         footer,
@@ -520,8 +342,8 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     frame.render_widget(para, area);
 }
 
-/// A text-input line. When `active`, a block cursor marks the edit position;
-/// otherwise the value is shown plainly.
+/// A text-input line. When `active`, a block cursor marks the edit position; otherwise
+/// the value is shown plainly.
 fn field_input_line(buffer: &Input, active: bool) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
     let style = Style::default().fg(Color::Cyan);
@@ -547,19 +369,7 @@ mod tests {
         }
     }
 
-    /// Move the start-screen role selection to the dial option and confirm it.
-    fn choose_dial(state: &mut SetupState) -> Step {
-        handle_key(key(KeyCode::Down), state);
-        handle_key(key(KeyCode::Enter), state)
-    }
-
-    /// Confirm the default (listen) role on the start screen.
-    fn choose_listen(state: &mut SetupState) -> Step {
-        handle_key(key(KeyCode::Enter), state)
-    }
-
-    /// A non-empty config allowlist so the start screen shows only the role list
-    /// (the interactive allowlist fields appear only when config supplies none).
+    /// A non-empty config allowlist so the start screen shows no editable fields.
     fn from_config() -> AllowedSources {
         AllowedSources {
             tcp: vec!["127.0.0.0/8".into()],
@@ -568,30 +378,43 @@ mod tests {
     }
 
     #[test]
-    fn listen_generates_token_when_none() {
-        let mut s = SetupState::new(None, from_config(), false, None);
-        // Without a config token, choosing listen first asks for confirmation.
-        assert!(matches!(choose_listen(&mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
-        // Confirming generates a fresh token and finishes (config supplies the allowlist).
-        match handle_key(key(KeyCode::Char('y')), &mut s) {
+    fn start_with_config_token_finishes_as_both() {
+        let token = auth::generate_token();
+        let mut s = SetupState::new(Some(token.clone()), from_config(), true, Some("hl".into()));
+        match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
-                assert_eq!(r.role, Role::Listen);
+                assert_eq!(r.role, Role::Both);
                 assert!(r.peer_node_id.is_none());
-                assert!(r.token_generated);
-                assert!(auth::validate_token(&r.auth_token).is_ok());
+                assert!(r.peer_identifier.is_none());
+                assert!(!r.token_generated);
+                assert_eq!(r.auth_token, token);
                 assert_eq!(r.allowed_sources.tcp, vec!["127.0.0.0/8".to_string()]);
             }
-            _ => panic!("expected Done(Listen)"),
+            _ => panic!("expected Done(Both)"),
         }
     }
 
     #[test]
-    fn listen_no_token_confirm_back_returns_to_start() {
+    fn start_without_token_confirms_then_generates() {
         let mut s = SetupState::new(None, from_config(), false, None);
-        assert!(matches!(choose_listen(&mut s), Step::Continue));
+        // Without a config token, the start screen first asks for confirmation.
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
-        // Declining the confirmation returns to the start screen.
+        match handle_key(key(KeyCode::Char('y')), &mut s) {
+            Step::Done(r) => {
+                assert_eq!(r.role, Role::Both);
+                assert!(r.token_generated);
+                assert!(auth::validate_token(&r.auth_token).is_ok());
+            }
+            _ => panic!("expected Done(Both)"),
+        }
+    }
+
+    #[test]
+    fn confirm_decline_returns_to_start() {
+        let mut s = SetupState::new(None, from_config(), false, None);
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
         assert!(matches!(
             handle_key(key(KeyCode::Char('n')), &mut s),
             Step::Continue
@@ -600,192 +423,57 @@ mod tests {
     }
 
     #[test]
-    fn listen_on_enter_reuses_config_token() {
-        let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), false, None);
+    fn start_screen_collects_tcp_then_udp_allowlist() {
+        // Empty config allowlist -> the two CIDR fields appear; TCP is focused first.
+        let mut s = SetupState::new(
+            Some(auth::generate_token()),
+            AllowedSources::default(),
+            false,
+            None,
+        );
+        type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
+        handle_key(key(KeyCode::Tab), &mut s); // -> AllowedUdp
+        type_str(&mut s, "10.0.0.0/8");
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
-                assert_eq!(r.role, Role::Listen);
-                assert_eq!(r.auth_token, token);
+                assert_eq!(r.role, Role::Both);
+                assert_eq!(
+                    r.allowed_sources.tcp,
+                    vec!["127.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
+                );
+                assert_eq!(r.allowed_sources.udp, vec!["10.0.0.0/8".to_string()]);
             }
-            _ => panic!("expected Done(Listen)"),
+            _ => panic!("expected Done(Both) with the entered allowlist"),
         }
     }
 
     #[test]
-    fn dial_rejects_bad_node_id_and_keeps_editing() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
-        assert!(matches!(choose_dial(&mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        type_str(&mut s, "not-a-node-id");
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
+    fn bad_cidr_keeps_screen_open_with_error() {
+        let mut s = SetupState::new(
+            Some(auth::generate_token()),
+            AllowedSources::default(),
+            false,
+            None,
+        );
+        type_str(&mut s, "not-a-cidr");
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert!(s.error.is_some());
+        assert_eq!(s.phase, SetupPhase::Start);
     }
 
     #[test]
-    fn dial_full_flow_with_config_token_skips_token_prompt() {
-        let token = auth::generate_token();
-        let node_id = iroh::SecretKey::generate().public().to_string();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), false, None);
-        choose_dial(&mut s);
-        type_str(&mut s, &node_id);
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert_eq!(r.role, Role::Dial);
-                assert_eq!(r.peer_node_id.map(|id| id.to_string()), Some(node_id));
-                assert_eq!(r.auth_token, token);
-            }
-            _ => panic!("expected Done(Dial) without a token prompt"),
-        }
-    }
-
-    #[test]
-    fn dial_nostr_mode_takes_identifier_not_node_id() {
-        // In nostr mode the dialer types a short identifier; it resolves to a Dial
-        // with a peer_identifier and no node id (looked up at runtime).
-        let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), true, None);
-        choose_dial(&mut s);
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        type_str(&mut s, "web1");
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert_eq!(r.role, Role::Dial);
-                assert_eq!(r.peer_identifier.as_deref(), Some("web1"));
-                assert!(r.peer_node_id.is_none(), "nostr mode dials by identifier");
-                assert_eq!(r.auth_token, token);
-            }
-            _ => panic!("expected Done(Dial) with a peer identifier"),
-        }
-    }
-
-    #[test]
-    fn dial_nostr_mode_blank_identifier_rejected() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), true, None);
-        choose_dial(&mut s);
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        // Blank identifier keeps the prompt open with an error.
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        assert!(s.error.is_some());
-        assert_eq!(s.phase, SetupPhase::NodeId);
-    }
-
-    #[test]
-    fn dial_nostr_mode_rejects_own_identifier() {
-        // Entering this peer's own name (from config) would resolve to itself. The
-        // config name carries surrounding whitespace to exercise the trim.
-        let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token), from_config(), true, Some("  web1  ".to_string()));
-        choose_dial(&mut s);
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        type_str(&mut s, "web1");
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        assert!(s.error.is_some(), "own identifier must be rejected");
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        assert!(s.peer_identifier.is_none());
-
-        // A different identifier is accepted.
-        for _ in 0.."web1".len() {
-            handle_key(key(KeyCode::Backspace), &mut s);
-        }
-        type_str(&mut s, "web2");
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => assert_eq!(r.peer_identifier.as_deref(), Some("web2")),
-            _ => panic!("expected Done(Dial) for a different identifier"),
-        }
-    }
-
-    #[test]
-    fn dial_quick_mode_blank_node_id_rejected() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
-        choose_dial(&mut s);
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        // Blank entry in quick mode keeps the prompt open with an error.
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        assert!(s.error.is_some());
-        assert_eq!(s.phase, SetupPhase::NodeId);
-    }
-
-    #[test]
-    fn dial_prompts_token_when_absent_and_validates_it() {
-        let node_id = iroh::SecretKey::generate().public().to_string();
-        let token = auth::generate_token();
-        let mut s = SetupState::new(None, from_config(), false, None);
-        choose_dial(&mut s);
-        type_str(&mut s, &node_id);
-        // Valid node id with no config token -> advance to the token prompt.
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        // A bad token is rejected inline.
-        type_str(&mut s, "short");
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        assert!(s.error.is_some());
-        // Clear and enter a valid token.
-        for _ in 0.."short".len() {
-            handle_key(key(KeyCode::Backspace), &mut s);
-        }
-        type_str(&mut s, &token);
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert_eq!(r.role, Role::Dial);
-                assert_eq!(r.auth_token, token);
-            }
-            _ => panic!("expected Done(Dial)"),
-        }
-    }
-
-    #[test]
-    fn node_id_field_supports_cursor_editing() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
-        choose_dial(&mut s); // -> NodeId
+    fn allowlist_field_supports_cursor_editing() {
+        let mut s = SetupState::new(
+            Some(auth::generate_token()),
+            AllowedSources::default(),
+            false,
+            None,
+        );
         type_str(&mut s, "abcd");
-        // Move left twice and insert in the middle.
         handle_key(key(KeyCode::Left), &mut s);
         handle_key(key(KeyCode::Left), &mut s);
         type_str(&mut s, "XY");
-        assert_eq!(s.buffer.value(), "abXYcd");
-        // Home, then delete-forward removes the first char.
-        handle_key(key(KeyCode::Home), &mut s);
-        handle_key(key(KeyCode::Delete), &mut s);
-        assert_eq!(s.buffer.value(), "bXYcd");
-    }
-
-    #[test]
-    fn start_role_selection_navigates_and_clamps() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
-        // Default highlight is the listen option.
-        assert_eq!(s.connect_choice, 0);
-        // Up at the top clamps.
-        handle_key(key(KeyCode::Up), &mut s);
-        assert_eq!(s.connect_choice, 0);
-        // Down moves to the dial option and clamps at the bottom.
-        handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.connect_choice, CONNECT_DIAL);
-        handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.connect_choice, CONNECT_DIAL);
-        // Enter on the dial option advances to the node id prompt.
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        assert_eq!(s.phase, SetupPhase::NodeId);
+        assert_eq!(s.allowed_tcp.value(), "abXYcd");
     }
 
     #[test]
@@ -793,77 +481,5 @@ mod tests {
         let mut s = SetupState::new(None, from_config(), false, None);
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(handle_key(k, &mut s), Step::Quit));
-    }
-
-    #[test]
-    fn start_screen_collects_tcp_then_udp_allowlist() {
-        // Empty config allowlist -> the two CIDR fields appear on the start screen,
-        // reached with Tab.
-        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false, None);
-        handle_key(key(KeyCode::Tab), &mut s); // Role -> AllowedTcp
-        type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
-        handle_key(key(KeyCode::Tab), &mut s); // -> AllowedUdp
-        type_str(&mut s, "10.0.0.0/8");
-        // Enter submits the whole screen; listen with a config token finishes.
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert_eq!(r.role, Role::Listen);
-                assert_eq!(
-                    r.allowed_sources.tcp,
-                    vec!["127.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
-                );
-                assert_eq!(r.allowed_sources.udp, vec!["10.0.0.0/8".to_string()]);
-            }
-            _ => panic!("expected Done(Listen) with the entered allowlist"),
-        }
-    }
-
-    #[test]
-    fn dial_carries_start_screen_allowlist() {
-        // The allowlist entered on the start screen reaches a dial result too.
-        let token = auth::generate_token();
-        let node_id = iroh::SecretKey::generate().public().to_string();
-        let mut s = SetupState::new(Some(token), AllowedSources::default(), false, None);
-        handle_key(key(KeyCode::Down), &mut s); // role -> dial
-        handle_key(key(KeyCode::Tab), &mut s); // -> AllowedTcp
-        type_str(&mut s, "10.0.0.0/8");
-        handle_key(key(KeyCode::Enter), &mut s); // submit -> NodeId
-        assert_eq!(s.phase, SetupPhase::NodeId);
-        type_str(&mut s, &node_id);
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert_eq!(r.role, Role::Dial);
-                assert_eq!(r.allowed_sources.tcp, vec!["10.0.0.0/8".to_string()]);
-                assert!(r.allowed_sources.udp.is_empty());
-            }
-            _ => panic!("expected Done(Dial)"),
-        }
-    }
-
-    #[test]
-    fn allowlist_rejects_invalid_cidr_inline() {
-        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false, None);
-        handle_key(key(KeyCode::Tab), &mut s); // -> AllowedTcp
-        type_str(&mut s, "not-a-cidr");
-        assert!(matches!(
-            handle_key(key(KeyCode::Enter), &mut s),
-            Step::Continue
-        ));
-        assert!(s.error.is_some());
-        assert_eq!(s.phase, SetupPhase::Start); // stays put
-        assert_eq!(s.section, StartSection::AllowedTcp);
-    }
-
-    #[test]
-    fn allowlist_blank_entries_yield_empty_lists() {
-        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false, None);
-        // Blank TCP/UDP, default listen role: Enter finishes with empty lists.
-        // `run_peer` later defaults empty protocol lists to localhost.
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert!(r.allowed_sources.is_empty());
-            }
-            _ => panic!("expected Done with empty allowlist"),
-        }
     }
 }

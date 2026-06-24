@@ -20,13 +20,14 @@ use ratatui::crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 
-use crate::app_state::{AppSnapshot, AppState, Role, TunnelCommand};
+use crate::app_state::{AppSnapshot, AppState, DialCommand, DialTarget, Role, TunnelCommand};
 use crate::config::{AllowedSources, RequestEntry, TransportTuning, validate_request_specs};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
+use iroh::EndpointId;
 use setup::{SetupOutcome, SetupState, Step};
 use textinput::handle_edit;
-use ui::{AddField, AddRequestForm, UiState};
+use ui::{AddField, AddRequestForm, ConnectForm, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
@@ -62,7 +63,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut events = EventStream::new();
 
-    // Phase 1: resolve role/target/token via the interactive setup screen.
+    // Phase 1: resolve the serving allowlist and auth token via the setup screen.
     let resolved = match run_setup(
         &mut terminal,
         &mut events,
@@ -86,6 +87,8 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         resolved.token_generated,
         launch.logs.clone(),
         launch.requests.clone(),
+        launch.nostr_discovery,
+        launch.peer_name.clone(),
     );
     let cfg = build_peer_config(&resolved, &launch, state.clone());
     let mut runtime = tokio::spawn(crate::iroh_mode::run_peer(cfg));
@@ -109,6 +112,9 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                     ui::render(f, &snap, &logs, &ui_state);
                     if let Some(form) = &ui_state.add_form {
                         ui::render_add_request_dialog(f, form);
+                    }
+                    if let Some(form) = &ui_state.connect_form {
+                        ui::render_connect_dialog(f, form, state.nostr_discovery);
                     }
                 });
             }
@@ -148,10 +154,12 @@ fn build_peer_config(
     launch: &TuiLaunch,
     state: Arc<AppState>,
 ) -> crate::iroh_mode::PeerConfig {
-    // The nostr identifier is role-dependent: a listener publishes under its own
-    // name (config), a dialer looks up the target's name (entered in setup).
+    // The nostr identifier is role-dependent: a listener (or the always-on serve half
+    // of an interactive `Both` process) publishes under its own name; a headless dialer
+    // looks up the target's name. Interactive dial targets are supplied at runtime via
+    // DialCommand, so `Both` carries only the own name here.
     let nostr_identifier = match resolved.role {
-        Role::Listen => launch.peer_name.clone(),
+        Role::Listen | Role::Both => launch.peer_name.clone(),
         Role::Dial => resolved.peer_identifier.clone(),
     };
     crate::iroh_mode::PeerConfig {
@@ -163,6 +171,7 @@ fn build_peer_config(
         nostr_relays: launch.nostr_relays.clone(),
         nostr_discovery: launch.nostr_discovery,
         nostr_identifier,
+        report_endpoint_id: true,
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
         dns_server: launch.dns_server.clone(),
@@ -226,9 +235,13 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         state.shutdown.cancel();
         return true;
     }
-    // While the modal is open it captures all other keys (so `j`/`k`/`q` are text).
+    // While a modal is open it captures all other keys (so `j`/`k`/`q` are text).
     if ui.add_form.is_some() {
         handle_add_form(key, ui, state);
+        return false;
+    }
+    if ui.connect_form.is_some() {
+        handle_connect_form(key, ui, state);
         return false;
     }
 
@@ -247,9 +260,17 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     let total = state.logs.len();
     let tunnels = state.tunnel_count();
     match key.code {
-        // Tunnels are dial-role only; the listener is a pure server and initiates none.
-        KeyCode::Char('a') if state.role == Role::Dial => {
+        // Tunnels are driven by the dial half; the pure listener initiates none.
+        KeyCode::Char('a') if matches!(state.role, Role::Dial | Role::Both) => {
             ui.add_form = Some(AddRequestForm::default());
+        }
+        // Connect / change the on-demand dial target (interactive serve+dial mode).
+        KeyCode::Char('c') if state.role == Role::Both => {
+            ui.connect_form = Some(ConnectForm::default());
+        }
+        // Disconnect the current dial session, returning to serve-only.
+        KeyCode::Char('D') if state.role == Role::Both => {
+            state.send_dial(DialCommand::Disconnect);
         }
         KeyCode::Char('h') => {
             hide_token_banner(ui);
@@ -309,7 +330,7 @@ fn maybe_auto_hide_generated_token_banner(ui: &mut UiState, snap: &AppSnapshot, 
         return;
     }
 
-    if snap.role != Role::Listen || !snap.token_generated {
+    if !matches!(snap.role, Role::Listen | Role::Both) || !snap.token_generated {
         ui.token_banner_auto_hide_at = None;
         return;
     }
@@ -411,6 +432,76 @@ fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     }
 }
 
+/// Handle a key while the connect modal is open. Enter validates the target and (on
+/// success) starts the on-demand dial session; Esc cancels.
+fn handle_connect_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
+    let Some(form) = ui.connect_form.as_mut() else {
+        return;
+    };
+    form.error = None;
+    match key.code {
+        KeyCode::Esc => {
+            ui.connect_form = None;
+        }
+        KeyCode::Enter => submit_connect_form(ui, state),
+        _ => handle_edit(&mut form.target, key, |c| c.is_ascii_graphic()),
+    }
+}
+
+/// Validate the connect modal's target and, on success, set the display target and
+/// dispatch `DialCommand::Connect` (replacing any current session). In nostr mode the
+/// entry is a peer name (rejecting our own); in quick mode a node id (rejecting our own
+/// published id).
+fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
+    let Some(form) = ui.connect_form.as_mut() else {
+        return;
+    };
+    let raw = form.target.value().trim().to_string();
+    let target = if state.nostr_discovery {
+        if raw.is_empty() {
+            form.error = Some("Enter the peer's name".to_string());
+            return;
+        }
+        if state.own_name.as_deref().map(str::trim) == Some(raw.as_str()) {
+            form.error =
+                Some("That is this peer's own name; enter the other peer's name".to_string());
+            return;
+        }
+        DialTarget::Name(raw)
+    } else {
+        if raw.is_empty() {
+            form.error = Some("Enter the peer's node id".to_string());
+            return;
+        }
+        match raw.parse::<EndpointId>() {
+            Ok(id) => {
+                // Reject dialing our own published node id (a self-dial loop).
+                if let Some(own) = state.snapshot().endpoint_id
+                    && own.parse::<EndpointId>().ok() == Some(id)
+                {
+                    form.error = Some("That is this peer's own node id".to_string());
+                    return;
+                }
+                DialTarget::NodeId(id)
+            }
+            Err(_) => {
+                form.error = Some("Invalid node id".to_string());
+                return;
+            }
+        }
+    };
+    // Only commit the displayed target and close the modal if the command actually
+    // reached the dial manager; otherwise keep the form open with an error rather than
+    // silently showing a target that never connects.
+    let display = target.describe();
+    if state.send_dial(DialCommand::Connect(target)) {
+        state.set_dial_target(Some(display));
+        ui.connect_form = None;
+    } else {
+        form.error = Some("Dial manager is not running; cannot connect".to_string());
+    }
+}
+
 /// Write the current connection info to a timestamped file in the system temp
 /// directory (`/tmp` on Linux) and return its path. The auth token is
 /// deliberately excluded so the dump is safe to share. Used by the `d` shortcut.
@@ -427,15 +518,21 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
     let _ = writeln!(out, "duopipe connection info");
     let _ = writeln!(out, "generated: {}", now.strftime("%Y-%m-%d %H:%M:%S"));
     let _ = writeln!(out, "host:      {}", snap.hostname);
-    let _ = writeln!(out, "role:      {}", snap.role.label());
+    let _ = writeln!(out, "mode:      {}", ui::mode_label(snap));
+    if let Some(name) = ui::own_name_display(snap) {
+        let _ = writeln!(out, "name:      {name}");
+    }
     let _ = writeln!(
         out,
         "node id:   {}",
         snap.endpoint_id.as_deref().unwrap_or("(pending)")
     );
-    if snap.role == Role::Dial {
+    if let Some(target) = snap.dial_target.as_deref() {
+        let _ = writeln!(out, "dial:      {target}");
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
+    } else {
+        let _ = writeln!(out, "dial:      not connected (press c)");
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
 
@@ -486,17 +583,49 @@ mod tests {
     }
 
     fn state() -> Arc<AppState> {
-        AppState::new(Role::Dial, false, LogBuffer::new(16), Vec::new())
+        AppState::new(Role::Dial, false, LogBuffer::new(16), Vec::new(), false, None)
     }
 
     fn listen_generated_state() -> Arc<AppState> {
-        AppState::new(Role::Listen, true, LogBuffer::new(16), Vec::new())
+        AppState::new(Role::Listen, true, LogBuffer::new(16), Vec::new(), false, None)
     }
 
     fn type_str(ui: &mut UiState, st: &Arc<AppState>, s: &str) {
         for c in s.chars() {
             handle_add_form(key(KeyCode::Char(c)), ui, st);
         }
+    }
+
+    fn type_connect_target(ui: &mut UiState, st: &Arc<AppState>, s: &str) {
+        for c in s.chars() {
+            handle_connect_form(key(KeyCode::Char(c)), ui, st);
+        }
+    }
+
+    #[test]
+    fn connect_submit_keeps_modal_open_when_dial_manager_is_absent() {
+        let st = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            Vec::new(),
+            true,
+            Some("web1".to_string()),
+        );
+        let mut ui = UiState {
+            connect_form: Some(ConnectForm::default()),
+            ..Default::default()
+        };
+
+        type_connect_target(&mut ui, &st, "homelab");
+        handle_connect_form(key(KeyCode::Enter), &mut ui, &st);
+
+        let form = ui.connect_form.as_ref().expect("form stays open");
+        assert_eq!(
+            form.error.as_deref(),
+            Some("Dial manager is not running; cannot connect")
+        );
+        assert_eq!(st.snapshot().dial_target, None);
     }
 
     #[test]
@@ -675,6 +804,30 @@ mod tests {
 
         assert!(ui.token_banner_hidden);
         assert!(ui.token_banner_auto_hide_at.is_none());
+    }
+
+    #[test]
+    fn dump_connection_info_uses_mode_name_and_omits_idle_path() {
+        let st = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            Vec::new(),
+            true,
+            Some("web1".to_string()),
+        );
+        st.set_endpoint_id("node-123".to_string());
+
+        let path = dump_connection_info(&st.snapshot()).expect("dump path");
+        let text = std::fs::read_to_string(&path).expect("dump contents");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(text.contains("mode:      nostr"));
+        assert!(text.contains("name:      web1"));
+        assert!(text.contains("dial:      not connected (press c)"));
+        assert!(!text.contains("role:"));
+        assert!(!text.contains("status:"));
+        assert!(!text.contains("path:"));
     }
 
     #[test]

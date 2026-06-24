@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use iroh::EndpointId;
 use parking_lot::RwLock;
 use tokio::sync::{Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,7 @@ use crate::logging::LogBuffer;
 /// Capacity of the tunnel-command broadcast channel (commands are tiny; this
 /// only bounds how far a lagging connection supervisor may fall behind).
 const TUNNEL_COMMAND_CAPACITY: usize = 64;
+const DIAL_COMMAND_CAPACITY: usize = 16;
 
 /// Stable identity for a tunnel request, allocated once when the request is added
 /// (config-seeded or runtime) and unchanged for the life of the session, including
@@ -42,11 +44,48 @@ pub enum TunnelCommand {
     Stop(TunnelId),
 }
 
+/// A runtime request to the dial manager to (re)point or tear down the single
+/// outbound dial session. Sent by the TUI, consumed by `run_dial_manager`.
+#[derive(Debug, Clone)]
+pub enum DialCommand {
+    /// Start a dial session to this target, replacing any current one.
+    Connect(DialTarget),
+    /// Tear down the current dial session and return to idle.
+    Disconnect,
+}
+
+/// What to dial, as typed at runtime: a full node id (quick mode) or a peer name
+/// looked up via nostr (nostr mode).
+#[derive(Debug, Clone)]
+pub enum DialTarget {
+    NodeId(EndpointId),
+    Name(String),
+}
+
+impl DialTarget {
+    /// Short human-readable form for the TUI (`dial → …`).
+    pub fn describe(&self) -> String {
+        match self {
+            DialTarget::NodeId(id) => {
+                let s = id.to_string();
+                // Mirror the peer-list short id (first 12 chars).
+                s.chars().take(12).collect::<String>() + "…"
+            }
+            DialTarget::Name(name) => name.clone(),
+        }
+    }
+}
+
 /// Connection role for this peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Dial,
     Listen,
+    /// Both at once in one process: serve inbound peers (listen) *and* maintain one
+    /// outbound connection that requests tunnels (dial). Each underlying connection
+    /// still has exactly one requester and one server — the two roles run side by
+    /// side over separate endpoints and never interact at the connection layer.
+    Both,
 }
 
 impl Role {
@@ -54,6 +93,7 @@ impl Role {
         match self {
             Role::Dial => "Dial",
             Role::Listen => "Listen",
+            Role::Both => "Serve + Dial",
         }
     }
 }
@@ -62,6 +102,8 @@ impl Role {
 /// has a single connection at a time).
 #[derive(Clone, PartialEq)]
 pub enum ConnStatus {
+    /// No dial session: serving only, waiting for the user to dial a peer.
+    Idle,
     Connecting,
     Authenticating,
     Connected,
@@ -72,6 +114,7 @@ pub enum ConnStatus {
 impl ConnStatus {
     pub fn label(&self) -> String {
         match self {
+            ConnStatus::Idle => "Idle".to_string(),
             ConnStatus::Connecting => "Connecting".to_string(),
             ConnStatus::Authenticating => "Authenticating".to_string(),
             ConnStatus::Connected => "Connected".to_string(),
@@ -220,6 +263,17 @@ pub struct AppState {
     streams_max: RwLock<usize>,
     /// Broadcast channel for tunnel start/stop commands (TUI -> connection supervisor).
     tunnel_tx: broadcast::Sender<TunnelCommand>,
+    /// Broadcast channel for dial connect/disconnect commands (TUI -> dial manager).
+    dial_tx: broadcast::Sender<DialCommand>,
+    /// Display string for the current dial target (`Some` while a session is up or
+    /// being established), shown in the header. `None` when idle (serving only).
+    dial_target: RwLock<Option<String>>,
+    /// Whether nostr discovery is active (nostr mode). Read by the connect prompt to
+    /// decide whether the user types a peer name (true) or a node id (false).
+    pub nostr_discovery: bool,
+    /// This machine's own nostr name (config `name`), used by the connect prompt to
+    /// reject dialing ourselves. `None` in quick mode.
+    pub own_name: Option<String>,
     pub shutdown: CancellationToken,
     pub logs: Arc<LogBuffer>,
 }
@@ -230,8 +284,11 @@ impl AppState {
         token_generated: bool,
         logs: Arc<LogBuffer>,
         requests: Vec<RequestEntry>,
+        nostr_discovery: bool,
+        own_name: Option<String>,
     ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
+        let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
         // Assign a stable id to each config-seeded request; runtime adds continue
         // from the same counter via `alloc_id`.
         let requests: Vec<Request> = requests
@@ -258,6 +315,10 @@ impl AppState {
             semaphore: RwLock::new(None),
             streams_max: RwLock::new(0),
             tunnel_tx,
+            dial_tx,
+            dial_target: RwLock::new(None),
+            nostr_discovery,
+            own_name,
             shutdown: CancellationToken::new(),
             logs,
         })
@@ -272,6 +333,23 @@ impl AppState {
     /// Send a tunnel command to any active connection supervisor(s).
     pub fn send_command(&self, cmd: TunnelCommand) {
         let _ = self.tunnel_tx.send(cmd);
+    }
+
+    /// Subscribe to dial commands. The dial manager subscribes once at startup.
+    pub fn subscribe_dial(&self) -> broadcast::Receiver<DialCommand> {
+        self.dial_tx.subscribe()
+    }
+
+    /// Send a dial command to the dial manager (TUI connect/disconnect). Returns
+    /// `true` if it was delivered to a live manager; `false` if there is no subscriber
+    /// (the manager hasn't started yet or has exited), so the caller can surface it.
+    pub fn send_dial(&self, cmd: DialCommand) -> bool {
+        self.dial_tx.send(cmd).is_ok()
+    }
+
+    /// Set (or clear) the current dial target's display string.
+    pub fn set_dial_target(&self, target: Option<String>) {
+        *self.dial_target.write() = target;
     }
 
     /// Allocate a fresh, never-reused tunnel id.
@@ -434,10 +512,13 @@ impl AppState {
             role: self.role,
             hostname: self.hostname.clone(),
             token_generated: self.token_generated,
+            nostr_discovery: self.nostr_discovery,
+            own_name: self.own_name.clone(),
             endpoint_id: self.endpoint_id.read().clone(),
             auth_token: self.auth_token.read().clone(),
             conn_status: self.conn_status.read().clone(),
             path: self.path.read().clone(),
+            dial_target: self.dial_target.read().clone(),
             peers: self.peers.read().clone(),
             tunnels: self.tunnels.read().clone(),
             streams_used,
@@ -451,10 +532,14 @@ pub struct AppSnapshot {
     pub role: Role,
     pub hostname: String,
     pub token_generated: bool,
+    pub nostr_discovery: bool,
+    pub own_name: Option<String>,
     pub endpoint_id: Option<String>,
     pub auth_token: Option<String>,
     pub conn_status: ConnStatus,
     pub path: PathInfo,
+    /// Current dial target's display string; `None` when idle (serving only).
+    pub dial_target: Option<String>,
     pub peers: Vec<PeerRow>,
     pub tunnels: Vec<TunnelRow>,
     pub streams_used: usize,
@@ -477,7 +562,7 @@ mod tests {
     #[test]
     fn add_request_appends_request_and_idle_row() {
         let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed, false, None);
         // Rows mirror the requests only after seeding.
         state.seed_tunnels_from_requests();
         assert_eq!(state.request_ids().len(), 1);
@@ -506,7 +591,7 @@ mod tests {
 
     #[test]
     fn delete_request_drops_row_and_preserves_other_ids() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
         let a = state.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
         let b = state.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
         let c = state.add_request(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
@@ -530,7 +615,7 @@ mod tests {
 
     #[test]
     fn listener_tracks_multiple_peers() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![]);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
 
         // Many distinct peers connect at once — all are tracked.
         state.add_peer("peer-a".into());
@@ -546,5 +631,22 @@ mod tests {
         let peers = state.snapshot().peers;
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].remote_id, "peer-b");
+    }
+
+    #[test]
+    fn snapshot_carries_mode_metadata() {
+        let state = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            vec![],
+            true,
+            Some("web1".to_string()),
+        );
+
+        let snap = state.snapshot();
+
+        assert!(snap.nostr_discovery);
+        assert_eq!(snap.own_name.as_deref(), Some("web1"));
     }
 }

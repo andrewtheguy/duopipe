@@ -10,21 +10,32 @@ that one person; it is not a public service or a multi-tenant gateway. Two mutua
 trusting parties *can* use it, but that is not the primary design point.
 
 # Usage model
-This project is meant for interactive usage: a TUI asks, on startup, whether to
-connect to an existing instance. There are two interactive subcommands, one per
-mode:
+This project is meant for interactive usage. Every interactive run is **always
+listening** (serving inbound peers) from launch; there is **no listen/dial role
+choice at startup**. The single outbound **dial session is started on demand from
+the dashboard** (press `c`, type the target), can be disconnected (`D`), and
+re-pointed at a different peer — one outbound session at a time. Setup only collects
+the serving `[allowed_sources]` (when config supplies none) and the auth token
+(supplied, or generated with a confirm). There are two interactive subcommands, one
+per mode — they differ only in how a dial target is named:
 - Configless mode — `duopipe quick [--auth-token-file <path>]`: ephemeral node id,
   no nostr, no config file. The auth token is generated fresh each run (shown in
-  the TUI), or loaded from `--auth-token-file` / `DUOPIPE_AUTH_TOKEN`. A dialer
-  enters the peer's node id manually (there is no nostr side channel to discover it).
+  the TUI), or loaded from `--auth-token-file` / `DUOPIPE_AUTH_TOKEN`. To dial, the
+  user types the *peer's node id* in the connect prompt (no nostr side channel to
+  discover it).
 - Nostr mode — `duopipe nostr [-c <file>]`: reads a config file (the `-c` path, or
   the default `~/.config/duopipe/peer.toml`) and requires both a *provided* auth
   token (it is the nostr rendezvous secret — a generated one couldn't be discovered
-  by the peer) and a `name` (this peer's short identifier). Startup fails fast if
-  either is missing. Nostr publishes/looks up the node id by name (see below): when
-  connecting, the dialer types the *target peer's* identifier (its `name`) — setup
-  rejects entering this peer's own `name`, which would resolve to itself. There is
-  no raw node-id entry in nostr mode — use quick mode for that.
+  by the peer) and a `name` (this peer's short identifier, published so peers can
+  reach it). Startup fails fast if either is missing. To dial, the user types the
+  *target peer's* `name` in the connect prompt — it rejects entering this peer's own
+  `name` (which would resolve to itself). For a raw node id, use quick mode.
+
+Internally the interactive process runs as one dual role (`Role::Both`): an
+always-on serve half plus a dial manager that drives the on-demand session over a
+separate endpoint. Each *connection* is still strictly one-directional (one
+requester, one server). Single-role `Role::Listen`/`Role::Dial` exist only for the
+headless test path below.
 
 Token precedence is `--auth-token-file` (quick only) > `DUOPIPE_AUTH_TOKEN` > config
 `auth_token_file` (nostr only).
@@ -71,28 +82,27 @@ it does not appear on relays in the clear — and the `auth_token` still gates t
 actual connection.
 
 Because the `d` tag is keyed on the *stable* name (not the volatile node id), a
-listener restart replaces its own record — no stale accumulation. The dialer
-re-looks-up by name on every connect attempt, so a listener that restarted with a
-fresh node id self-heals on the next attempt (no persistent subscription). As a
-safety net, `run_dial` refuses to connect to a resolved node id equal to its own
-(a self-dial) — whether a quick-mode node id pasted by mistake or a nostr name that
-maps back to this peer. Relays
-default to a built-in public set (`nostr_discovery::DEFAULT_NOSTR_RELAYS`); override
-with `nostr_relay_urls`. To dial a raw node id without nostr, use quick mode.
+listener restart replaces its own record — no stale accumulation. The dial session
+re-looks-up by name on every connect attempt, so a peer that restarted with a fresh
+node id self-heals on the next attempt (no persistent subscription). As a safety net,
+the connect prompt rejects a target equal to this peer's own name / published node id,
+and the dial session refuses to connect to a resolved node id equal to its own (a
+self-dial) — ending that session rather than the process. Relays default to a built-in
+public set (`nostr_discovery::DEFAULT_NOSTR_RELAYS`); override with `nostr_relay_urls`.
+To dial a raw node id without nostr, use quick mode.
 
-Tunnel model: the **dialer requests** tunnels; the **listener is a pure server**.
-Each `[[request]]` (dial role) binds a local `local_listen` address and asks the
-listener to connect out to a `remote_source`, bridging the two — SSH `-L`-style local
-forwarding. The listener initiates no tunnels of its own; it only serves, gating each
-incoming request against its `[allowed_sources]` CIDR lists (`tcp`/`udp`); an
-empty/absent `tcp` list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`),
-and an empty/absent `udp` list uses the same default. To expose a service that lives
-near the listener box, run that box as the dialer instead.
+Tunnel model: within any one connection the **dialer requests** tunnels and the
+**server side is pure** (initiates none). An interactive process is both at once: its
+always-on serve half gates each incoming request against its `[allowed_sources]` CIDR
+lists (`tcp`/`udp`; an empty/absent list defaults to dual-stack localhost
+`127.0.0.0/8`, `::1/128`), while its dial session requests tunnels from whatever peer
+it is connected to. Each `[[request]]` is a tunnel template (dial side): it binds a
+local `local_listen` address and asks the connected peer to connect out to a
+`remote_source`, bridging the two — SSH `-L`-style local forwarding. Tunnels are
+started interactively (`Enter`) or added at runtime (`a`).
 
-Multiple peers: a listener accepts **many concurrent dialers** over its one iroh
+Multiple peers: the serve half accepts **many concurrent inbound peers** over its iroh
 endpoint — there is no single-peer session binding (authentication is the only gate).
-Each dialer is its own process binding its own local ports, so N dialers can all
-request the same listener source (e.g. `127.0.0.1:5678`) at once with no conflict —
-the listener just makes N independent outbound connects. The TUI lists connected
-peers on the listener; tunnels live on the dial side. One global `max_streams`
-semaphore caps concurrent forwarded streams across all peers.
+The dial side holds **one** outbound session at a time (re-pointable on demand). The
+TUI lists connected inbound peers and the outbound dial session + its tunnels. One
+global `max_streams` semaphore caps concurrent forwarded streams across both halves.

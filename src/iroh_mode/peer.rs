@@ -1,11 +1,11 @@
-//! Symmetric iroh peer: one connection, request-based tunnels.
+//! iroh peer runtime: always-on serving plus request-based dial sessions.
 //!
-//! A peer either dials another peer (`Role::Dial`) or listens for one
-//! (`Role::Listen`). Connection *setup* is asymmetric (QUIC needs a dialer and
-//! an acceptor), but once a connection is established each side *requests*
-//! tunnels from the other: a request binds a local listener and asks the peer to
-//! connect out to a remote `source`, bridging the two. Requests are activated
-//! on demand (the TUI sends start/stop commands); nothing starts automatically
+//! Interactive peers run as `Role::Both`: an always-on `Role::Listen` half that
+//! serves inbound peers, plus a dial manager that owns at most one outbound
+//! `Role::Dial` session. Within any one connection, only the dialer requests
+//! tunnels: a request binds a local listener and asks the connected peer to
+//! connect out to a remote `source`, bridging the two. Requests are activated on
+//! demand (the TUI sends start/stop commands); nothing starts automatically
 //! unless `DUOPIPE_AUTOSTART_REQUESTS` is set (test mode only).
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
@@ -20,14 +20,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iroh::EndpointId;
 use iroh::endpoint::ConnectionError;
+use iroh::{Endpoint, EndpointId};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::app_state::{AppState, ConnStatus, Role, TunnelCommand, TunnelId, TunnelStatus};
+use crate::app_state::{
+    AppState, ConnStatus, DialCommand, DialTarget, Role, TunnelCommand, TunnelId, TunnelStatus,
+};
 use crate::auth::is_token_valid;
 use crate::config::{AllowedSources, RequestEntry, TransportTuning};
 use crate::error::{ErrorCategory, TunnelError};
@@ -85,10 +87,12 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_INITIAL_CONNECT_ATTEMPTS: u32 = 10;
 
 /// Runtime configuration for a symmetric peer.
+#[derive(Clone)]
 pub struct PeerConfig {
-    /// Connection role (dial out or listen).
+    /// Connection role (dial out, listen, or both at once).
     pub role: Role,
-    /// EndpointId of the peer to dial (required for `Dial`).
+    /// EndpointId of the peer to dial (required for `Dial`; the dial half's target
+    /// for `Both` in quick mode).
     pub peer_node_id: Option<EndpointId>,
     /// CIDR allowlist gating which of our sources the peer may request.
     /// Empty protocol allowlists are defaulted to localhost in `run_peer`.
@@ -111,6 +115,10 @@ pub struct PeerConfig {
     /// name this peer publishes its node id under; when dialing, the target peer's
     /// name to look up. `None` outside nostr mode.
     pub nostr_identifier: Option<String>,
+    /// Whether this config's endpoint owns the node id surfaced in the TUI / published
+    /// to nostr. Single roles set `true`; in `Role::Both` only the listen sub-config is
+    /// `true` so the dial half's separate ephemeral endpoint id doesn't clobber it.
+    pub report_endpoint_id: bool,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -140,6 +148,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("nostr_relays", &self.nostr_relays)
             .field("nostr_discovery", &self.nostr_discovery)
             .field("nostr_identifier", &self.nostr_identifier)
+            .field("report_endpoint_id", &self.report_endpoint_id)
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
@@ -159,9 +168,264 @@ pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
     // otherwise reject the common loopback-tunnel case.
     config.allowed_sources = config.allowed_sources.with_localhost_defaults();
 
+    // One global stream limiter for the whole process, created up front so a dual-role
+    // process shares a single cap across its listen and dial halves.
+    let semaphore = new_stream_semaphore(&config)?;
+
     match config.role {
-        Role::Listen => run_listen(config).await,
-        Role::Dial => run_dial(config).await,
+        Role::Listen => run_listen(config, semaphore).await,
+        Role::Dial => run_dial(config, semaphore).await,
+        Role::Both => run_serve_and_dial(config, semaphore).await,
+    }
+}
+
+/// Split the interactive `Role::Both` config into a listen sub-config (always serving)
+/// and a dial sub-config (used by the dial manager). Both share the same `Arc<AppState>`
+/// and the one stream semaphore; the dial target itself is supplied at runtime via
+/// [`DialCommand`], not by config.
+fn split_serve_dial_config(config: &PeerConfig) -> (PeerConfig, PeerConfig) {
+    let mut listen = config.clone();
+    listen.role = Role::Listen;
+    listen.peer_node_id = None;
+    listen.autostart_requests = false;
+    // The listen endpoint owns the displayed/published node id.
+    listen.report_endpoint_id = true;
+
+    let mut dial = config.clone();
+    dial.role = Role::Dial;
+    // No fixed target: the dial manager dials whatever the user requests at runtime.
+    dial.peer_node_id = None;
+    dial.nostr_identifier = None;
+    // The dial endpoint is secondary; its node id is internal.
+    dial.report_endpoint_id = false;
+
+    (listen, dial)
+}
+
+/// Interactive runtime: serve inbound peers from launch (listen half, always on) while a
+/// dial manager maintains at most one user-initiated outbound session. The two halves
+/// share `AppState` and the stream semaphore but never interact at the connection layer.
+/// If either half returns, the shared shutdown is cancelled so the other unwinds.
+async fn run_serve_and_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
+    let (listen_cfg, dial_cfg) = split_serve_dial_config(&config);
+    let shutdown = config.status.shutdown.clone();
+
+    let listen_sem = semaphore.clone();
+    let mut listen_task = tokio::spawn(run_listen(listen_cfg, listen_sem));
+    let mut dial_task = tokio::spawn(run_dial_manager(dial_cfg, semaphore));
+
+    let first = tokio::select! {
+        r = &mut listen_task => ("listen", r),
+        r = &mut dial_task => ("dial manager", r),
+    };
+    shutdown.cancel();
+    let second = if first.0 == "listen" {
+        ("dial manager", dial_task.await)
+    } else {
+        ("listen", listen_task.await)
+    };
+
+    for (which, joined) in [first, second] {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.context(format!("{which} half failed"))),
+            Err(e) => anyhow::bail!("{which} half panicked: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Drive the single on-demand dial session. Owns one reused client endpoint, idles until
+/// the TUI sends [`DialCommand::Connect`], runs a session until it is disconnected,
+/// replaced, or the process shuts down, then returns to idle. At most one session lives
+/// at a time, so a `Connect` while connected replaces the current target.
+async fn run_dial_manager(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
+    let endpoint = create_client_endpoint(
+        &config.relay_urls,
+        config.relay_only,
+        config.dns_server.as_deref(),
+        Some(&config.transport),
+    )
+    .await?;
+    let own_id = endpoint.id();
+    let shutdown = config.status.shutdown.clone();
+    let config = Arc::new(config);
+    let mut dial_rx = config.status.subscribe_dial();
+
+    // No session yet: serving only.
+    config.status.set_conn_status(ConnStatus::Idle);
+
+    // The single active dial session, if any: its cancel token + task handle.
+    let mut current: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            cmd = dial_rx.recv() => match cmd {
+                Ok(DialCommand::Connect(target)) => {
+                    // Single session: tear down any current one first.
+                    if let Some((tok, h)) = current.take() {
+                        tok.cancel();
+                        let _ = h.await;
+                    }
+                    config.status.set_dial_target(Some(target.describe()));
+                    config.status.set_conn_status(ConnStatus::Connecting);
+                    let tok = CancellationToken::new();
+                    let session_tok = tok.clone();
+                    let cfg = config.clone();
+                    let sem = semaphore.clone();
+                    let ep = endpoint.clone();
+                    let h = tokio::spawn(async move {
+                        run_managed_dial_session(cfg, sem, &ep, own_id, target, session_tok).await;
+                    });
+                    current = Some((tok, h));
+                }
+                Ok(DialCommand::Disconnect) => {
+                    if let Some((tok, h)) = current.take() {
+                        tok.cancel();
+                        let _ = h.await;
+                    }
+                    config.status.set_dial_target(None);
+                    config.status.set_conn_status(ConnStatus::Idle);
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("Dial command channel lagged by {n}");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    if let Some((tok, h)) = current.take() {
+        tok.cancel();
+        let _ = h.await;
+    }
+    endpoint.close().await;
+    Ok(())
+}
+
+/// One on-demand dial session against a single `target`. Mirrors `run_dial`'s
+/// connect/reconnect/backoff loop, but resolves the runtime-typed [`DialTarget`] each
+/// attempt, also bails on session `cancel` (disconnect/replace), and **ends the session
+/// rather than the process** on a fatal auth failure or self-dial (the serving half
+/// keeps running). Transient connect/disconnect just reconnects with backoff until the
+/// user disconnects.
+async fn run_managed_dial_session(
+    config: Arc<PeerConfig>,
+    semaphore: Arc<Semaphore>,
+    endpoint: &Endpoint,
+    own_id: EndpointId,
+    target: DialTarget,
+    cancel: CancellationToken,
+) {
+    let shutdown = config.status.shutdown.clone();
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        config.status.set_conn_status(ConnStatus::Connecting);
+
+        // Resolve the target each attempt: a nostr name re-resolves so a listener that
+        // restarted with a fresh ephemeral id self-heals on the next try.
+        let resolved: Result<EndpointId> = match &target {
+            DialTarget::NodeId(id) => Ok(*id),
+            DialTarget::Name(name) => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = cancel.cancelled() => return,
+                    r = crate::nostr_discovery::lookup_node_id(
+                        &config.auth_token,
+                        name,
+                        &config.nostr_relays,
+                    ) => match r {
+                        Ok(id) => {
+                            log::info!("Discovered peer '{name}' node id via nostr: {id}");
+                            Ok(id)
+                        }
+                        Err(e) => Err(e.context("nostr node-id lookup failed")),
+                    },
+                }
+            }
+        };
+
+        // Self-dial guard: end the session (not the process) — the target won't change.
+        // Reject both the dial endpoint's own id *and* this process's published (listen)
+        // node id, which is a separate endpoint in the dual-role process — so dialing our
+        // own published id (a quick-mode paste, or a name that resolves back to us) is
+        // caught here as a last line of defense behind the connect prompt's checks.
+        if let Ok(id) = &resolved {
+            let id_str = id.to_string();
+            let is_own_published =
+                config.status.snapshot().endpoint_id.as_deref() == Some(id_str.as_str());
+            if *id == own_id || is_own_published {
+                log::error!("Refusing to dial this peer's own node id ({id}); ending session.");
+                config.status.set_conn_status(ConnStatus::Closed);
+                config.status.set_dial_target(None);
+                return;
+            }
+        }
+
+        let connect = match resolved {
+            Ok(id) => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = cancel.cancelled() => return,
+                    c = connect_to_server(
+                        endpoint,
+                        id,
+                        &config.relay_urls,
+                        config.relay_only,
+                        ALPN,
+                    ) => c,
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        match connect {
+            Ok(conn) => {
+                config.status.set_conn_status(ConnStatus::Connected);
+                log::info!("Connected to peer!");
+                // handle_connection returns on conn-close or process shutdown; also race
+                // the session cancel so a disconnect/replace tears it down promptly.
+                let outcome = tokio::select! {
+                    r = handle_connection(conn, config.clone(), semaphore.clone(), true) => Some(r),
+                    _ = cancel.cancelled() => None,
+                };
+                match outcome {
+                    // Session cancelled (disconnect or replaced by a new target).
+                    None => return,
+                    Some(Ok(())) => {
+                        backoff = Duration::from_secs(1);
+                        log::info!("Connection closed; will reconnect");
+                    }
+                    Some(Err(e)) => {
+                        // Auth failures are fatal for this target (the shared token is
+                        // wrong for it) — end the session and surface it.
+                        if e.downcast_ref::<TunnelError>()
+                            .is_some_and(|te| matches!(te.category, ErrorCategory::Auth))
+                        {
+                            log::error!("Dial session ended (auth failure): {e}");
+                            config.status.set_conn_status(ConnStatus::Closed);
+                            config.status.set_dial_target(None);
+                            return;
+                        }
+                        log::warn!("Connection ended: {e}");
+                    }
+                }
+            }
+            Err(e) => log::warn!("Failed to connect to peer: {e}"),
+        }
+
+        config.status.set_conn_status(ConnStatus::Reconnecting {
+            backoff_secs: backoff.as_secs(),
+        });
+        log::info!("Reconnecting in {:?}...", backoff);
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
 }
 
@@ -185,7 +449,7 @@ fn new_stream_semaphore(config: &PeerConfig) -> Result<Arc<Semaphore>> {
     Ok(semaphore)
 }
 
-async fn run_listen(config: PeerConfig) -> Result<()> {
+async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
     log::info!("Symmetric Peer - Listen Mode");
     log::info!("============================");
 
@@ -199,7 +463,9 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     .await?;
 
     let endpoint_id = endpoint.id();
-    config.status.set_endpoint_id(endpoint_id.to_string());
+    if config.report_endpoint_id {
+        config.status.set_endpoint_id(endpoint_id.to_string());
+    }
     config.status.set_auth_token(config.auth_token.clone());
     if config.announce_endpoint {
         // Non-interactive mode: surface both on stderr for a test harness.
@@ -226,9 +492,6 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     };
 
     let shutdown = config.status.shutdown.clone();
-    // One global stream limiter shared by every connected peer. Set once so the gauge
-    // tracks it exactly.
-    let semaphore = new_stream_semaphore(&config)?;
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
@@ -314,7 +577,7 @@ fn spawn_node_id_publisher(
 // Dial role
 // ============================================================================
 
-async fn run_dial(config: PeerConfig) -> Result<()> {
+async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
     if config.peer_node_id.is_none() && config.nostr_identifier.is_none() {
         anyhow::bail!(
             "dial role requires a peer node id (quick mode) or a peer identifier (nostr mode)"
@@ -333,11 +596,11 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
     .await?;
 
     let own_id = endpoint.id();
-    config.status.set_endpoint_id(own_id.to_string());
+    if config.report_endpoint_id {
+        config.status.set_endpoint_id(own_id.to_string());
+    }
 
     let shutdown = config.status.shutdown.clone();
-    // One global stream limiter, set once and reused across reconnects.
-    let semaphore = new_stream_semaphore(&config)?;
     let config = Arc::new(config);
     // The peer's node id: either supplied directly (manual entry / test fast-path)
     // or discovered via nostr. When discovered it is re-resolved on each connect
@@ -499,7 +762,8 @@ async fn handle_connection(
         log::info!("Peer {remote_id} authenticated");
     }
 
-    let _path_watcher = watch_connection_paths(&conn, config.status.clone(), remote_id.to_string());
+    let _path_watcher =
+        watch_connection_paths(&conn, config.status.clone(), remote_id.to_string(), is_dialer);
 
     let conn = Arc::new(conn);
 
@@ -1026,7 +1290,7 @@ mod tests {
     }
 
     fn test_peer_config(role: Role, token: &str) -> Arc<PeerConfig> {
-        let status = AppState::new(role, false, LogBuffer::new(16), vec![]);
+        let status = AppState::new(role, false, LogBuffer::new(16), vec![], false, None);
         Arc::new(PeerConfig {
             role,
             peer_node_id: None,
@@ -1036,6 +1300,7 @@ mod tests {
             nostr_relays: vec![],
             nostr_discovery: false,
             nostr_identifier: None,
+            report_endpoint_id: true,
             relay_urls: vec![],
             relay_only: false,
             dns_server: Some("none".to_string()),
@@ -1044,6 +1309,85 @@ mod tests {
             announce_endpoint: false,
             status,
         })
+    }
+
+    /// `split_serve_dial_config` keeps the serving allowlist + own name on an always-on
+    /// listen half (which owns the reported node id), gives the dial half no fixed
+    /// target, and shares one `AppState`.
+    #[test]
+    fn split_serve_dial_config_shapes_both_halves() {
+        let status = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            vec![],
+            true,
+            Some("homelab".to_string()),
+        );
+        let both = PeerConfig {
+            role: Role::Both,
+            peer_node_id: None,
+            allowed_sources: AllowedSources {
+                tcp: vec!["10.0.0.0/8".to_string()],
+                udp: vec![],
+            },
+            autostart_requests: true,
+            auth_token: "tok".to_string(),
+            nostr_relays: vec![],
+            nostr_discovery: true,
+            nostr_identifier: Some("homelab".to_string()),
+            report_endpoint_id: true,
+            relay_urls: vec![],
+            relay_only: false,
+            dns_server: Some("none".to_string()),
+            max_streams: None,
+            transport: TransportTuning::default(),
+            announce_endpoint: false,
+            status,
+        };
+
+        let (listen, dial) = split_serve_dial_config(&both);
+
+        assert_eq!(listen.role, Role::Listen);
+        assert_eq!(dial.role, Role::Dial);
+
+        // Listen publishes under its own name and owns the reported node id.
+        assert_eq!(listen.nostr_identifier.as_deref(), Some("homelab"));
+        assert!(listen.report_endpoint_id);
+        assert!(!listen.autostart_requests);
+        assert_eq!(listen.allowed_sources.tcp, vec!["10.0.0.0/8".to_string()]);
+
+        // The dial half carries no fixed target (it dials runtime requests) and its
+        // endpoint id is internal.
+        assert_eq!(dial.peer_node_id, None);
+        assert_eq!(dial.nostr_identifier, None);
+        assert!(!dial.report_endpoint_id);
+
+        // Both halves share the one AppState.
+        assert!(Arc::ptr_eq(&both.status, &listen.status));
+        assert!(Arc::ptr_eq(&both.status, &dial.status));
+    }
+
+    /// Dial commands round-trip through the broadcast channel and `set_dial_target`
+    /// surfaces in the snapshot.
+    #[test]
+    fn dial_command_roundtrip_and_target_in_snapshot() {
+        let status = AppState::new(Role::Both, false, LogBuffer::new(16), vec![], true, None);
+        let mut rx = status.subscribe_dial();
+        status.set_dial_target(Some("laptop".to_string()));
+        assert_eq!(status.snapshot().dial_target.as_deref(), Some("laptop"));
+
+        status.send_dial(DialCommand::Connect(DialTarget::Name("laptop".to_string())));
+        match rx.try_recv() {
+            Ok(DialCommand::Connect(DialTarget::Name(n))) => assert_eq!(n, "laptop"),
+            other => panic!("expected Connect(Name), got {other:?}"),
+        }
+
+        status.send_dial(DialCommand::Disconnect);
+        assert!(matches!(rx.try_recv(), Ok(DialCommand::Disconnect)));
+
+        status.set_dial_target(None);
+        assert_eq!(status.snapshot().dial_target, None);
     }
 
     async fn hermetic_endpoint() -> Endpoint {

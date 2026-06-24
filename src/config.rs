@@ -2,16 +2,16 @@
 //!
 //! A single symmetric peer config with all keys at the top level.
 //!
-//! The connection role is chosen interactively at startup (or via env vars for
-//! tests), not in the config. Over one established connection a peer always
-//! *requests* tunnels from the other party: each `[[request]]` names a remote
-//! `source` on the peer to connect out to and a local `listen` address where
-//! the traffic is delivered. Requests are activated interactively (nothing
-//! starts automatically). When the peer requests one of *our* sources, the
-//! `[allowed_sources]` CIDR lists gate what we are willing to expose. Empty or
-//! absent protocol lists default to dual-stack localhost (`127.0.0.0/8`,
-//! `::1/128`). `validate()` checks address and CIDR formats at parse time. The
-//! single `auth_token` is the shared secret used by both sides.
+//! Interactive runs always serve inbound peers, and the outbound dial target is
+//! chosen later from the dashboard, not in the config. Over one established dial
+//! connection, this peer's `[[request]]` entries name remote sources on the
+//! connected peer and local listener addresses where traffic is delivered.
+//! Requests are activated interactively (nothing starts automatically). When a
+//! connected peer requests one of *our* sources, the `[allowed_sources]` CIDR
+//! lists gate what we are willing to expose. Empty or absent protocol lists
+//! default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). `validate()`
+//! checks address and CIDR formats at parse time. The single `auth_token` is the
+//! shared secret used by both sides.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -346,9 +346,9 @@ pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Res
 impl PeerConfig {
     /// Validate config structure and address formats.
     ///
-    /// Note: the connection role (dial/listen) and the target node id are
-    /// resolved interactively at startup (or via env vars for tests), so they
-    /// are not part of the config and not checked here.
+    /// Note: the interactive dial target is entered from the dashboard, and the
+    /// headless test role is resolved from env vars, so neither is part of the
+    /// config or checked here.
     pub fn validate(&self) -> Result<()> {
         validate_request_specs(&self.request)?;
         validate_allowed_sources(&self.allowed_sources)?;
