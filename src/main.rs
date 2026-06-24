@@ -6,7 +6,6 @@ mod app_state;
 mod auth;
 mod buffer;
 mod config;
-mod encryption;
 mod error;
 mod iroh_mode;
 mod logging;
@@ -64,49 +63,13 @@ enum Command {
     },
     /// Generate an authentication token
     ///
-    /// The auth token is the shared secret presented by both sides. Store it with
-    /// `auth_token_file`, an age-encrypted config `auth_token`, or
-    /// DUOPIPE_AUTH_TOKEN. A fresh listening instance generates one automatically
-    /// if none is provided.
+    /// The auth token is the shared secret presented by both sides. Supply it with
+    /// `auth_token_file` or the DUOPIPE_AUTH_TOKEN env var. A fresh listening
+    /// instance generates one automatically if none is provided.
     GenerateAuthToken {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
         count: usize,
-    },
-    /// Age encryption commands for config file secrets
-    ConfigEncryption {
-        #[command(subcommand)]
-        action: ConfigEncryptionCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum ConfigEncryptionCommand {
-    /// Generate an age encryption keypair
-    ///
-    /// Without --output, prints both keys to stdout. With --output, saves the
-    /// private key to a file and prints the public key (recipient) to stdout.
-    GenerateKey {
-        /// Path where to save the age identity (private key) file
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Overwrite existing file if it exists (requires --output)
-        #[arg(long, requires = "output")]
-        force: bool,
-    },
-    /// Encrypt a value for use in config files (reads plaintext from stdin)
-    ///
-    /// Outputs an `ageenc:` prefixed single-line string that can be used directly
-    /// as a TOML config value.
-    EncryptValue {
-        /// Age recipient (public key, starts with "age1...")
-        #[arg(short, long)]
-        recipient: Option<String>,
-
-        /// Config file to read encryption_recipient from (alternative to --recipient)
-        #[arg(short, long)]
-        config: Option<PathBuf>,
     },
 }
 
@@ -120,15 +83,12 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the shared auth token from env (`DUOPIPE_AUTH_TOKEN`), then config
-/// `auth_token`, then `auth_token_file`. Validates the token's CRC when present.
-/// Returns `None` when none is configured (a fresh listening instance will
-/// generate one).
+/// Resolve the shared auth token from env (`DUOPIPE_AUTH_TOKEN`), then
+/// `auth_token_file`. Validates the token's CRC when present. Returns `None` when
+/// none is configured (a fresh listening instance will generate one).
 fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
     let token = if let Some(t) = env_var_opt("DUOPIPE_AUTH_TOKEN") {
         Some(t)
-    } else if let Some(t) = &cfg.auth_token {
-        Some(t.clone())
     } else if let Some(file) = &cfg.auth_token_file {
         let expanded = expand_tilde(file);
         Some(auth::load_auth_token_from_file(&expanded)?)
@@ -182,7 +142,7 @@ impl TestEnv {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("DUOPIPE_PEER_NODE_ID is not a valid node id."))?;
                 let auth_token = config_auth_token.context(
-                    "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN, auth_token_file, or an age-encrypted auth_token in the config.",
+                    "Non-interactive dial requires an auth token. Set DUOPIPE_AUTH_TOKEN or auth_token_file.",
                 )?;
                 Ok(ResolvedPeer {
                     role: Role::Dial,
@@ -335,18 +295,11 @@ async fn run_inner() -> Result<()> {
             config,
             default_config,
         } => {
-            let (mut cfg, source) = resolve_peer_config(config.clone(), *default_config)?;
+            let (cfg, source) = resolve_peer_config(config.clone(), *default_config)?;
 
             if source != ConfigSource::None {
-                cfg.validate(source).map_err(TunnelError::config)?;
+                cfg.validate().map_err(TunnelError::config)?;
             }
-
-            // Decrypt age-encrypted values if present.
-            let enc_key = env_var_opt("DUOPIPE_ENCRYPTION_KEY_FILE")
-                .map(PathBuf::from)
-                .or_else(|| cfg.encryption_key_file.clone())
-                .map(|p| expand_tilde(&p));
-            cfg.decrypt_secrets(enc_key.as_deref())?;
 
             // Requests, allowlist, relays, and transport now come from config only.
             validate_request_specs(&cfg.request).map_err(TunnelError::config)?;
@@ -412,68 +365,5 @@ async fn run_inner() -> Result<()> {
             }
             Ok(())
         }
-        Command::ConfigEncryption { action } => match action {
-            ConfigEncryptionCommand::GenerateKey { output, force } => {
-                let (secret_key, public_key) = encryption::generate_keypair();
-                if let Some(path) = output {
-                    let path = expand_tilde(path);
-                    encryption::write_identity_file(&path, &secret_key, &public_key, *force)?;
-                    log::info!("Encryption key saved to: {}", path.display());
-                    println!("{}", public_key);
-                } else {
-                    let now = jiff::Zoned::now().strftime("%Y-%m-%dT%H:%M:%S%:z");
-                    println!("# created: {}", now);
-                    println!("# public key: {}", public_key);
-                    println!("{}", secret_key);
-                }
-                Ok(())
-            }
-            ConfigEncryptionCommand::EncryptValue { recipient, config } => {
-                let recipient_str = match (recipient, config) {
-                    (Some(_), Some(_)) => {
-                        anyhow::bail!("Cannot combine --recipient and --config. Use only one.");
-                    }
-                    (Some(r), None) => r.clone(),
-                    (None, Some(config_path)) => {
-                        let expanded = expand_tilde(config_path);
-                        let content = std::fs::read_to_string(&expanded).with_context(|| {
-                            format!("Failed to read config: {}", expanded.display())
-                        })?;
-
-                        #[derive(serde::Deserialize)]
-                        struct MinimalConfig {
-                            encryption_recipient: Option<String>,
-                        }
-
-                        let cfg: MinimalConfig = toml::from_str(&content).with_context(|| {
-                            format!("Failed to parse config: {}", expanded.display())
-                        })?;
-                        cfg.encryption_recipient.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "No encryption_recipient found in {}",
-                                expanded.display()
-                            )
-                        })?
-                    }
-                    (None, None) => {
-                        anyhow::bail!(
-                            "Provide --recipient or --config to specify the age public key"
-                        );
-                    }
-                };
-
-                let mut plaintext = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut plaintext)
-                    .context("Failed to read plaintext from stdin")?;
-                let plaintext = plaintext.trim_end();
-                if plaintext.is_empty() {
-                    anyhow::bail!("No input provided on stdin");
-                }
-
-                let encrypted = encryption::encrypt_value(plaintext, &recipient_str)?;
-                println!("{}", encrypted);
-                Ok(())
-            }
-        },
     }
 }

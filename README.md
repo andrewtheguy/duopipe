@@ -147,9 +147,7 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The consequence is that the **listening** peer's **node id changes every run**: the TUI displays the current node id in its header, and you must copy it to the dialing peer each time you start a session.
-
-> **Note:** There is no `config-encryption` overlap to worry about here. The age encryption key (`config-encryption generate-key`) only protects secrets stored in config files; it has nothing to do with the peer's network identity.
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. To avoid copying it by hand each time, duopipe uses **nostr** as a side channel: both peers derive a shared nostr key from the auth token, the listener publishes its current node id, and the dialer looks it up automatically (see [Node-id discovery](#node-id-discovery)). The node id is still shown in the TUI header, and you can always enter it manually instead.
 
 ## Authentication
 
@@ -187,7 +185,7 @@ The same token is used by **both** sides: the listener accepts it, and the diale
 
 ### Configuration File
 
-> **Security:** A plaintext `auth_token` is **not allowed** in TOML config files. Use `auth_token_file`, set the `DUOPIPE_AUTH_TOKEN` environment variable, or embed the token directly with an [age-encrypted inline value](#encrypted-config-values).
+> **Security:** Supply the auth token with `auth_token_file` or the `DUOPIPE_AUTH_TOKEN` environment variable. The token is never written inline in the config file.
 
 A minimal config is essentially the requests you can make, the sources you'll expose, plus an optional shared token (`peer.toml`):
 ```toml
@@ -305,7 +303,7 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ### start
 
-`duopipe start` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token, encryption key) comes from the config file and/or environment variables.
+`duopipe start` launches the interactive TUI. It takes only config-selection flags; everything else (requests, relays, DNS, max-streams, relay-only, auth token) comes from the config file and/or environment variables.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -318,8 +316,7 @@ The connection role (listen/dial) and the dialer's target node id are chosen int
 
 | Env Var | Description |
 |---------|-------------|
-| `DUOPIPE_AUTH_TOKEN` | The shared auth token (highest precedence over config `auth_token` / `auth_token_file`). |
-| `DUOPIPE_ENCRYPTION_KEY_FILE` | Path to age identity file for decrypting age-encrypted config values. |
+| `DUOPIPE_AUTH_TOKEN` | The shared auth token (takes precedence over config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
 | `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
@@ -328,39 +325,24 @@ The connection role (listen/dial) and the dialer's target node id are chosen int
 
 Use `--default-config` to load from the default location, or `-c <path>` for a custom path (both TOML). Prefer config files so your settings are saved and reusable. Only one of these may be used at a time. All config keys live at the top level.
 
-> **Security:** TOML config files **reject a plaintext `auth_token`**. You have three options: use `auth_token_file` (recommended), set the `DUOPIPE_AUTH_TOKEN` environment variable, or use an [age-encrypted inline value](#encrypted-config-values).
+> **Security:** Supply the auth token with `auth_token_file` or the `DUOPIPE_AUTH_TOKEN` environment variable — it is never written inline in the config file.
 
 **Default location:** `~/.config/duopipe/peer.toml`
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-The config file holds the tunnel requests, auth token, relays, DNS, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
+The config file holds the tunnel requests, the path to the auth token, relays, DNS, nostr discovery settings, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
 
-### Encrypted Config Values
+### Node-id discovery
 
-Instead of separate `_file` variants, you can embed age-encrypted secrets directly in TOML config files. This is useful when managing configs for multiple peers — each config is self-contained with a single shared private key.
-
-**Setup:**
-
-```bash
-# 1. Generate an age keypair (run again to add keys for rotation)
-duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
-# Output: age1ql3z7hjy...  (this is your public key / recipient)
-
-# 2. Encrypt a secret value
-echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --recipient age1ql3z7hjy...
-```
-
-**Use in config:**
+The iroh node id is ephemeral, so the listener publishes its current node id to **nostr** and the dialer looks it up — no manual copy needed. Both peers derive the same nostr key from the shared auth token, so nothing extra is exchanged (the node id is public; the auth token still gates the connection, and the value is not encrypted).
 
 ```toml
-encryption_key_file = "~/.config/duopipe/age.key"
-encryption_recipient = "age1ql3z7hjy..."
-
-auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
+# Relays default to a built-in public set; override if desired:
+# nostr_relay_urls = ["wss://nos.lol", "wss://relay.nostr.net"]
+# Discovery is on by default; set false to require entering the node id manually:
+# nostr_discovery = false
 ```
-
-Each encrypted value is a single-line `ageenc:` prefixed string (base64-encoded age ciphertext). Age encryption applies only to `auth_token`. The `encryption_key_file` can also be specified via the `DUOPIPE_ENCRYPTION_KEY_FILE` env var.
 
 ### Transport Tuning
 
@@ -386,7 +368,7 @@ The same config shape is used by both peers; the role is chosen interactively at
 # Example peer configuration.
 # The connection role and dial target node id are chosen interactively in the TUI.
 
-# Shared auth token (plaintext not allowed — use a file, env var, or ageenc: value)
+# Shared auth token — supply via a file (here) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/auth_token.txt"
 
 # relay_urls = ["https://relay.example.com"]
@@ -436,34 +418,6 @@ duopipe generate-auth-token -c 5
 Auth token format: `i` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total.
 
 > **Note:** A listening instance that starts without a configured token generates one automatically and shows it in the TUI header, so generating one ahead of time is optional.
-
-## config-encryption
-
-Age encryption commands for config file secrets.
-
-### generate-key
-
-Generate an age keypair for encrypting config file secrets:
-
-```bash
-duopipe config-encryption generate-key --output ~/.config/duopipe/age.key
-# Prints the public key (recipient) to stdout
-```
-
-Running again with the same `--output` appends a new keypair to the file, enabling key rotation. Use `--force` to overwrite the file and start fresh.
-
-### encrypt-value
-
-Encrypt a value for embedding in config files (reads plaintext from stdin):
-
-```bash
-echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --recipient age1...
-
-# Or read recipient from a config file
-echo -n "$AUTH_TOKEN" | duopipe config-encryption encrypt-value --config peer.toml
-```
-
-Output is a single-line `ageenc:` string ready to paste into TOML config values.
 
 ---
 

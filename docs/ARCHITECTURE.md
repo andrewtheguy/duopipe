@@ -429,12 +429,12 @@ graph TB
     end
 
     subgraph "Options"
-        E[auth_token* — single shared token<br/>both peers]
+        E[auth_token_file — path to the single shared token<br/>both peers]
         G[request[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
-        K[encryption_key_file / encryption_recipient]
+        K[nostr_relay_urls / nostr_discovery]
     end
 
     A --> S[Validation]
@@ -454,32 +454,20 @@ The role (listen vs dial) and the dialer's target node id are not config fields.
 
 `iroh` mode uses a **single** shared credential, the auth token. The ALPN is a fixed constant (`mf/2`) and carries no credential.
 
-| Credential | Env Var | Config Key (TOML: use `_file` variant or age-encrypted inline) | Expected Usage |
+| Credential | Env Var | Config Key | Expected Usage |
 |------------|---------|-------------|----------------|
-| **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` or age-encrypted `auth_token` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. |
+| **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-`DUOPIPE_AUTH_TOKEN` takes precedence over the config `auth_token` / `auth_token_file`.
-
-Example config usage (a plaintext `auth_token` is not allowed in TOML config files — use `auth_token_file`, the `DUOPIPE_AUTH_TOKEN` env var, or an age-encrypted inline value):
+`DUOPIPE_AUTH_TOKEN` takes precedence over the config `auth_token_file`. The token is supplied only via a file or env var — never written inline in the config.
 
 ```toml
-# peer.toml — using the _file variant
+# peer.toml
 auth_token_file = "/etc/duopipe/auth_token.txt"
 
 [[request]]
 name = "ssh"
 remote_source = "tcp://127.0.0.1:22"
 local_listen = "127.0.0.1:2222"
-```
-
-```toml
-# peer.toml — using an age-encrypted inline value
-encryption_key_file = "~/.config/duopipe/age.key"
-
-auth_token = "ageenc:YWdlLWVuY3J5cHRpb24ub3JnL3Yx..."
-
-[allowed_sources]
-tcp = ["127.0.0.0/8"]
 ```
 
 ### Configuration Loading Flow
@@ -510,7 +498,7 @@ sequenceDiagram
 
     alt Config loaded
         Config->>Config: Parse TOML
-        Config->>Config: Validate structure, address formats, and secret rules
+        Config->>Config: Validate structure and address formats
         Config-->>Main: Validated config
         Main->>Main: Apply env overrides (DUOPIPE_AUTH_TOKEN wins)
     end
@@ -524,14 +512,11 @@ sequenceDiagram
 graph TB
     A[Load Config] --> F{Check fields}
 
-    F --> G{Plaintext auth_token in file?}
-    G -->|Yes| H[Error: use auth_token_file, env, or ageenc:]
-    G -->|No| I{Request + allowlist valid?}
+    F --> I{Request + allowlist valid?}
 
     I -->|No| J[Error: bad request address or CIDR]
     I -->|Yes| K[Validation Success]
 
-    style H fill:#FFCCBC
     style J fill:#FFCCBC
     style K fill:#C8E6C9
 ```
@@ -598,7 +583,7 @@ graph TB
 
 **Two trusted endpoints, coordinated out-of-band.** duopipe is built for a link between **two parties who trust each other** or **one person across their own devices** — not a public service or multi-tenant gateway. Several design choices follow directly from this assumption:
 
-- **Out-of-band credential exchange.** The ephemeral node id changes every run, and any generated auth token is per-run too. The node id and shared token carry no directory or discovery-by-name; the two operators pass them over a side channel they already share (chat, an existing SSH session, a password manager, a second device under their control) before connecting.
+- **Out-of-band credential exchange.** The shared auth token is passed over a side channel the two operators already share (chat, an existing SSH session, a password manager, a second device under their control). The ephemeral node id changes every run, but it no longer needs hand-copying: it is published to and looked up from nostr, keyed off that same shared token (see [Node-id discovery](#node-id-discovery-nostr)).
 - **Interactive, co-operated runtime.** Both ends run the TUI and watch shared status — connection state, the bound peer, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* happens between the two humans (or the one human on two screens), not automatically.
 - **Symmetric mutual trust.** Because either peer may *request* tunnels of the other once authenticated, the token should only ever be shared with an endpoint you trust; the `[allowed_sources]` allowlist then bounds what that trusted peer can actually reach.
 
@@ -618,7 +603,7 @@ Access control rests on a single shared auth token. The ALPN is a fixed constant
 
 #### Auth Token
 
-- **Auth Token** (`DUOPIPE_AUTH_TOKEN` env var / `auth_token_file` / age-encrypted `auth_token`): A single shared connection-level token, validated on the first bi-stream. Both peers use the **same** value. In code it is a 47-char `i...` token.
+- **Auth Token** (`DUOPIPE_AUTH_TOKEN` env var / `auth_token_file`): A single shared connection-level token, validated on the first bi-stream. Both peers use the **same** value. In code it is a 47-char `i...` token.
 
 1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or generates one if none is set, displaying it in the TUI).
 2. **Dial Peer Configuration**: The dial peer is configured with — or interactively prompted for — the same shared token.
@@ -698,7 +683,7 @@ graph TB
 
 ### Identity Management
 
-The iroh identity is **ephemeral**: iroh generates a fresh Ed25519 keypair on every run, so there is no key file to store or protect. The consequence is that the **listen peer's node id changes every run** and must be re-copied to the dial peer (the TUI displays the current node id). This avoids same-machine locking that could otherwise produce duplicate node ids.
+The iroh identity is **ephemeral**: iroh generates a fresh Ed25519 keypair on every run, so there is no key file to store or protect. The consequence is that the **listen peer's node id changes every run** (the TUI displays the current node id). This avoids same-machine locking that could otherwise produce duplicate node ids. Instead of re-copying the node id by hand, peers discover it via nostr (below).
 
 ```mermaid
 sequenceDiagram
@@ -711,8 +696,19 @@ sequenceDiagram
     TUI->>EP: Create endpoint (ephemeral identity)
     EP->>EP: Derive node id from fresh keypair
     EP-->>TUI: node id
-    TUI->>User: Display node id + auth token (copy to dial peer)
+    TUI->>User: Display node id + auth token
 ```
+
+### Node-id discovery (nostr)
+
+Because the node id is ephemeral, duopipe uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Implemented in `nostr_discovery.rs`:
+
+- **Shared key from the auth token.** Both peers derive the same nostr keypair via `sha256("duopipe:nostr-rendezvous:v1" || auth_token)`. No extra identifier is exchanged — the token both sides already share *is* the rendezvous. Discovery therefore only works when the token is shared (which the dialer needs anyway, for auth).
+- **Publish (listener).** `run_listen` spawns a background task that publishes a replaceable event (NIP-78 kind 30078, `d` tag `duopipe:nodeid`, content = the current node id string) at startup and refreshes it every ~5 minutes. Relay failures are logged but non-fatal.
+- **Lookup on demand (dialer).** When no node id was supplied directly, `run_dial` looks it up (filter by author = derived pubkey + kind + `d` tag, newest wins) at the top of *every* connect attempt, so a listener that restarted with a fresh node id self-heals on the next attempt. No persistent subscription.
+- **Not encrypted.** The node id is public; the auth token still gates the actual connection. Relays default to `DEFAULT_NOSTR_RELAYS`, overridable via `nostr_relay_urls`; the whole mechanism can be turned off with `nostr_discovery = false`.
+
+Hermetic tests bypass nostr entirely: when `DUOPIPE_PEER_NODE_ID` is set the dialer dials that id directly, so the test suite needs no live relays.
 
 ---
 
