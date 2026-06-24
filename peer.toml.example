@@ -17,19 +17,15 @@
 # discover it via nostr. This file supplies the rest: the shared auth token, tunnel
 # requests, the allowlist, relays, tuning, and the nostr relay override.
 #
-# Tunnel model: a side *requests* tunnels from a connected peer. A request binds a
-# local listener and asks the peer to connect out to a remote 'source'; traffic is
-# bridged between them. [[request]] is a PREFILLED TEMPLATE that seeds the tunnel
-# list for every connection (to save typing); tunnels are STARTED MANUALLY in the
-# TUI with Enter — nothing auto-connects (in test mode only, with DUOPIPE_TEST_MODE=1,
-# set DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start a peer's tunnels on connect).
+# Tunnel model: the DIALER *requests* tunnels; the LISTENER is a pure server. A
+# [[request]] (used when this peer dials) binds a local listener and asks the
+# listener peer to connect out to a remote 'source'; traffic is bridged between
+# them. Requests do NOT start automatically — the TUI lists them and you start/stop
+# each one with Enter (in test mode only, with DUOPIPE_TEST_MODE=1, set
+# DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start all on connect). When listening, this
+# peer serves any number of dialers at once and initiates no tunnels of its own.
 #
-# Multiple peers: a listener serves many dialers at once. Tunnel state is per peer —
-# each connection gets its own copy of the template list. The TUI shows a peer list
-# and the selected peer's tunnels; press Tab to switch focus, so a tunnel you start
-# targets exactly that peer.
-#
-# Trust model: once token auth succeeds the peer is trusted to *ask*, but when it
+# Trust model: once token auth succeeds the dialer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
 # (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
 # dual-stack localhost.
@@ -82,13 +78,12 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # dns_server = "none"
 
 # ============================================================================
-# Tunnel request template: each entry prefills a tunnel for every connected peer —
-# ask that peer to connect out to 'remote_source' and deliver traffic to a local
-# listener bound at 'local_listen'. The 'remote_source' scheme (tcp:// or udp://)
-# selects the protocol. 'name' is the label shown in the TUI. Entries are just
-# prefilled rows; nothing starts until you activate it (Enter in the TUI, or
-# DUOPIPE_AUTOSTART_REQUESTS=1 in test mode). You can also add tunnels at runtime
-# in the TUI with `a`.
+# Tunnel requests (used when this peer DIALS): ask the listener to connect out to
+# 'remote_source'; deliver traffic to a local listener bound at 'local_listen'. The
+# 'remote_source' scheme (tcp:// or udp://) selects the protocol. 'name' is the label
+# shown in the TUI. Nothing starts until you activate it (Enter in the TUI, or
+# DUOPIPE_AUTOSTART_REQUESTS=1 in test mode). Ignored when this peer is the listener
+# (the listener is a pure server and initiates no tunnels).
 # ============================================================================
 [[request]]
 name = "db"

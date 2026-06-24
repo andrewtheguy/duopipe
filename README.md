@@ -13,7 +13,7 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 **Features:**
 - **No account or registration required** — Just download and run
 - **No publicly accessible IPs or port forwarding required** — Automatic NAT hole punching
-- **Many peers, many tunnels in both directions** — A listener serves several dialers at once; each P2P link carries any number of requested tunnels, in either direction, with its own tunnel set
+- **Many peers, many tunnels** — A listener serves several dialers at once over one endpoint; each dialer requests any number of tunnels, each carrying bidirectional traffic
 - **Full TCP and UDP support** — Seamlessly tunnel any TCP or UDP traffic
 - **Cross-platform** — Works on Linux, macOS, and Windows
 - **No root required** — Runs as unprivileged user
@@ -36,7 +36,7 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 
 ## Overview
 
-duopipe runs as a symmetric peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. A listener accepts **many dialers at once** over one iroh endpoint; each connection runs **many tunnels in both directions at once**, with its own per-peer tunnel set. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
+duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. A listener accepts **many dialers at once** over one iroh endpoint. The **dialer requests** tunnels — SSH `-L`–style local forwarding: it binds a local listener and asks the listener peer to connect out to a remote source. The **listener is a pure server**: it serves those requests (each gated by its allowlist) and initiates none of its own.
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
@@ -45,19 +45,19 @@ On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the 
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
 
-Once a connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. A listener can hold several connections at once (laptop + phone + VPS all dialing one homelab box); tunnel state is **per peer**, so in the TUI you select a peer and manage its tunnels independently (`Tab` switches focus between the peer list and the selected peer's tunnels). iroh provides NAT traversal with relay fallback and automatic discovery.
+Once a connection is established and authenticated, the **dialer requests tunnels** and the **listener serves them** (gated by its `[allowed_sources]` allowlist). A listener can hold **many dialers at once** — laptop + phone + VPS all dialing one homelab box — each shown in its peer list. To reach a service that lives near the listener box, run that box as the dialer instead. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
 > **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS); the same auth token lives on each of your machines. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
 > - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth token is per-run too. Move the auth token between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in nostr mode the node id is then discovered automatically.
-> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, every connected peer, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; you decide *what* to expose and *when*. Config `[[request]]` entries are a *prefilled template* (they seed each peer's tunnel list to save typing), not instructions to auto-open anything.
-> - **Trust assumed, exposure narrowly scoped.** Either peer may *request* tunnels of the other, which is fine between your own devices; still keep each side's `[allowed_sources]` allowlist as tight as the task needs.
+> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, connected peers, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
+> - **Trust assumed, exposure narrowly scoped.** The dialer *requests* tunnels; the listener serves only what its `[allowed_sources]` allowlist permits — keep it as tight as the task needs.
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
 
 ### Tunnel requests at a glance
 
-Every tunnel is a **request** (SSH `-L`–style, pull direction): a peer declares `[[request]]` entries in config, and activating one binds a local listener and asks the other peer to connect out to a remote source.
+Every tunnel is a **request** (SSH `-L`–style, pull direction): the **dialer** declares `[[request]]` entries in config, and activating one binds a local listener and asks the **listener** peer to connect out to a remote source.
 
 | Field | Meaning |
 |-------|---------|
@@ -210,17 +210,17 @@ The connection role (listen vs dial) and the dialer's target node id are chosen 
 
 ## Architecture
 
-A single iroh connection carries requested tunnels. Each side *requests* a tunnel: it binds a local listener and asks the peer to connect out to a remote source. For example, a request for the peer's SSH server:
+Each iroh connection carries requested tunnels. The **dialer** *requests* a tunnel: it binds a local listener and asks the **listener** to connect out to a remote source. For example, a request for the listener's SSH server:
 
 ```
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
-| SSH Client      |  TCP   | requesting peer |  iroh  | serving peer    |  TCP   | SSH Server      |
+| SSH Client      |  TCP   | dialer (request)|  iroh  | listener (serve)|  TCP   | SSH Server      |
 |                 |<------>| listen :2222    |<======>| (allowlist gate)|<------>| source :22      |
 |                 |        |                 |  QUIC  |                 |        |                 |
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-The same connection may simultaneously carry requests in the opposite direction (the peer requesting our sources, gated by our `[allowed_sources]`), plus any number of additional TCP/UDP requests from either side.
+One connection can carry any number of TCP/UDP requests from the dialer at once, and one listener serves many dialers concurrently. The listener is a pure server — to reach a service that lives near the listener box, run that box as the dialer instead.
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -259,10 +259,10 @@ remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 ```
 
-- This request makes **this** peer listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **other** peer connects out to (subject to its `[allowed_sources]`).
-- To expose a service running on **this** peer instead, the **other** peer adds the matching `[[request]]` and you list that source in **your** `[allowed_sources]`.
+- This request makes the **dialer** listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **listener** connects out to (subject to its `[allowed_sources]`).
+- To expose a service that lives near the listener box, run that box as the **dialer** instead, with the matching `[[request]]`, and list that source in the serving peer's `[allowed_sources]`.
 
-Either peer may declare its own requests; they all share the one connection and are started/stopped independently in the TUI.
+The dialer's requests are started/stopped independently in the TUI. A single listener can serve several dialers at once, each with its own requests.
 
 ### 3. SSH over a requested tunnel
 
@@ -294,7 +294,7 @@ duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1`
 |---------|---------|
 | `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start a peer's template tunnels once connected. Test-only: the interactive TUI always starts tunnels by hand, so this is the only way to exercise tunnels headlessly. |
+| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start every configured `[[request]]` (dial role) once connected (nothing auto-starts otherwise). |
 | `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
 
 In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
@@ -326,7 +326,7 @@ Both interactive subcommands launch the same TUI; they differ only in mode. The 
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
-| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start a peer's template tunnels on connect. |
+| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all dial-role requests on connect. |
 
 ## Configuration Files
 
@@ -385,7 +385,7 @@ auth_token_file = "~/.config/duopipe/auth_token.txt"
 dns_server = "https://dns.example.com/pkarr"
 max_streams = 100   # max concurrent forwarded connections across all tunnels and peers
 
-# Tunnel requests (prefilled template): bind locally, ask the peer to connect out to source.
+# Tunnel requests (dial role): bind locally, ask the listener to connect out to source.
 [[request]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
@@ -462,5 +462,5 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
 6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response
    - *If authentication fails, the connection is closed and the following steps do not occur*
-7. **Auth, then a source allowlist:** once authenticated, either side may *request* tunnels of the other; each requested source is checked against the serving peer's `[allowed_sources]` CIDR lists before it connects out. Empty or absent TCP or UDP defaults to dual-stack localhost.
-8. Requested tunnels are negotiated over the single connection and traffic flows in both directions
+7. **Auth, then a source allowlist:** once authenticated, the **dialer** *requests* tunnels; the **listener serves** them, checking each requested source against its `[allowed_sources]` CIDR lists before it connects out. Empty or absent TCP or UDP defaults to dual-stack localhost. A listener admits many dialers concurrently (no single-peer binding).
+8. Requested tunnels are negotiated over the connection; within each tunnel, traffic flows in both directions

@@ -26,7 +26,7 @@ use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use setup::{SetupOutcome, SetupState, Step};
 use textinput::handle_edit;
-use ui::{AddField, AddRequestForm, Pane, UiState};
+use ui::{AddField, AddRequestForm, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
@@ -99,9 +99,6 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
             _ = tick.tick() => {
                 let snap = state.snapshot();
                 let logs = state.logs.snapshot();
-                // Peers and their tunnels come and go; keep both cursors in range so
-                // an action never targets a stale row.
-                clamp_cursors(&mut ui_state, &snap);
                 // Once a peer has connected, the generated-token banner is no longer
                 // needed (the dialer already has it); hide it for the rest of the run.
                 if !snap.peers.is_empty() {
@@ -217,12 +214,12 @@ async fn run_setup(
 
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
 ///
-/// `Tab` toggles focus between the peer list and the selected peer's tunnels.
-/// Arrows / `j`/`k` move the cursor in the focused pane; `Enter`/`Space` start or
-/// stop the selected tunnel of the selected peer; `a` opens the add-request modal
-/// (adds to the selected peer); `x`/`Del` removes the selected tunnel from that
-/// peer (config is untouched); `h` hides the generated-token banner. Logs scroll
-/// with `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits (or `Ctrl-C`).
+/// Tunnels are a dial-role concept (the dialer requests them); the listen role is a
+/// pure server and shows only its connected peers. Arrows / `j`/`k` move the tunnel
+/// selection cursor; `Enter`/`Space` start or stop the selected tunnel; `a` opens the
+/// add-request modal; `x`/`Del` removes the selected tunnel from the session (config
+/// is untouched); `h` hides the generated-token banner. Logs scroll with
+/// `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits (or `Ctrl-C`).
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     // Ctrl-C is an always-available emergency quit, even with the modal open.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -248,53 +245,34 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     ui.quit_armed = false;
 
     let total = state.logs.len();
-    let peer_count = state.peer_count();
-    let peer = state.peer_at(ui.selected_peer);
-    let tunnel_count = peer.as_ref().map(|p| p.tunnel_count()).unwrap_or(0);
+    let tunnels = state.tunnel_count();
     match key.code {
-        KeyCode::Tab => {
-            ui.focus = match ui.focus {
-                Pane::Tunnels => Pane::Peers,
-                Pane::Peers => Pane::Tunnels,
-            };
-        }
-        KeyCode::Char('a') => {
+        // Tunnels are dial-role only; the listener is a pure server and initiates none.
+        KeyCode::Char('a') if state.role == Role::Dial => {
             ui.add_form = Some(AddRequestForm::default());
         }
         KeyCode::Char('h') => {
             hide_token_banner(ui);
         }
-        KeyCode::Up | KeyCode::Char('k') => match ui.focus {
-            Pane::Peers => ui.selected_peer = ui.selected_peer.saturating_sub(1),
-            Pane::Tunnels => ui.selected = ui.selected.saturating_sub(1),
-        },
-        KeyCode::Down | KeyCode::Char('j') => match ui.focus {
-            Pane::Peers => {
-                if peer_count > 0 {
-                    ui.selected_peer = (ui.selected_peer + 1).min(peer_count - 1);
-                }
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.selected = ui.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if tunnels > 0 {
+                ui.selected = (ui.selected + 1).min(tunnels - 1);
             }
-            Pane::Tunnels => {
-                if tunnel_count > 0 {
-                    ui.selected = (ui.selected + 1).min(tunnel_count - 1);
-                }
-            }
-        },
+        }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if let Some(peer) = &peer
-                && let Some(id) = peer.tunnel_id_at(ui.selected)
-            {
-                peer.toggle_tunnel(id);
+            if let Some(id) = state.tunnel_id_at(ui.selected) {
+                state.toggle_tunnel(id);
             }
         }
         KeyCode::Char('x') | KeyCode::Delete => {
-            if let Some(peer) = &peer
-                && let Some(id) = peer.tunnel_id_at(ui.selected)
-            {
-                peer.delete_request(id);
+            if let Some(id) = state.tunnel_id_at(ui.selected) {
+                state.delete_request(id);
                 // The row is gone; keep the cursor on a valid row (clamp to the last
                 // remaining one, or 0 when the list is now empty).
-                ui.selected = ui.selected.min(peer.tunnel_count().saturating_sub(1));
+                ui.selected = ui.selected.min(state.tunnel_count().saturating_sub(1));
             }
         }
         KeyCode::Char(']') => {
@@ -323,19 +301,6 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
 fn hide_token_banner(ui: &mut UiState) {
     ui.token_banner_hidden = true;
     ui.token_banner_auto_hide_at = None;
-}
-
-/// Keep the peer and tunnel cursors within range as peers connect/disconnect and
-/// tunnels are added/removed, so a later keypress can't act on a stale row.
-fn clamp_cursors(ui: &mut UiState, snap: &AppSnapshot) {
-    let peer_count = snap.peers.len();
-    ui.selected_peer = ui.selected_peer.min(peer_count.saturating_sub(1));
-    let tunnel_count = snap
-        .peers
-        .get(ui.selected_peer)
-        .map(|p| p.tunnels.len())
-        .unwrap_or(0);
-    ui.selected = ui.selected.min(tunnel_count.saturating_sub(1));
 }
 
 fn maybe_auto_hide_generated_token_banner(ui: &mut UiState, snap: &AppSnapshot, now: Instant) {
@@ -408,17 +373,15 @@ fn next_field(field: AddField) -> AddField {
     }
 }
 
-/// Validate the modal's fields and, on success, append the request to the selected
-/// peer's session and dispatch a `Start` so it begins immediately. A blank `name`
-/// falls back to the `remote_source` string as the row label. Requires a selected
-/// peer (tunnels are always directed at one connection); with none, the form shows
-/// an error.
+/// Validate the modal's fields and, on success, append the request to `AppState`
+/// and dispatch a `Start` so it auto-starts. A blank `name` falls back to the
+/// `remote_source` string as the row label.
+///
+/// `Start` is broadcast: if currently disconnected there's no supervisor to
+/// receive it, so the row stays Idle until started (consistent with config
+/// requests after a reconnect).
 fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
-        return;
-    };
-    let Some(peer) = state.peer_at(ui.selected_peer) else {
-        form.error = Some("No peer connected to add a tunnel for".to_string());
         return;
     };
     // The user types only `host:port`; the selected protocol supplies the scheme.
@@ -436,10 +399,10 @@ fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     };
     match validate_request_specs(std::slice::from_ref(&req)) {
         Ok(()) => {
-            let id = peer.add_request(req);
-            peer.send_command(TunnelCommand::Start(id));
+            let id = state.add_request(req);
+            state.send_command(TunnelCommand::Start(id));
             // The new row is appended last; point the cursor at it.
-            ui.selected = peer.tunnel_count().saturating_sub(1);
+            ui.selected = state.tunnel_count().saturating_sub(1);
             ui.add_form = None;
         }
         Err(e) => {
@@ -472,8 +435,25 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
     );
     if snap.role == Role::Dial {
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
+        let _ = writeln!(out, "path:      {}", snap.path.describe());
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
+
+    let _ = writeln!(out, "\nTunnels:");
+    if snap.tunnels.is_empty() {
+        let _ = writeln!(out, "  (none configured)");
+    } else {
+        for t in &snap.tunnels {
+            let _ = writeln!(
+                out,
+                "  {:<16} {:<40} {:<10} {}",
+                t.name,
+                t.spec,
+                t.status.label(),
+                t.detail
+            );
+        }
+    }
 
     let _ = writeln!(out, "\nConnected peers:");
     if snap.peers.is_empty() {
@@ -487,20 +467,6 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
                 p.connected_since.elapsed().as_secs(),
                 p.path.describe()
             );
-            if p.tunnels.is_empty() {
-                let _ = writeln!(out, "    (no tunnels configured)");
-            } else {
-                for t in &p.tunnels {
-                    let _ = writeln!(
-                        out,
-                        "    {:<16} {:<40} {:<10} {}",
-                        t.name,
-                        t.spec,
-                        t.status.label(),
-                        t.detail
-                    );
-                }
-            }
         }
     }
 
@@ -536,7 +502,6 @@ mod tests {
     #[test]
     fn add_form_valid_submit_appends_and_closes() {
         let st = state();
-        let peer = st.attach_peer("peer-a".into()).unwrap();
         let mut ui = UiState {
             add_form: Some(AddRequestForm::default()),
             ..Default::default()
@@ -550,38 +515,18 @@ mod tests {
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
 
         assert!(ui.add_form.is_none(), "form closes on successful submit");
-        assert_eq!(peer.tunnel_count(), 1);
+        assert_eq!(st.tunnel_count(), 1);
         assert_eq!(ui.selected, 0);
-        let id = peer.tunnel_id_at(0).unwrap();
-        let req = peer.get_request(id).unwrap();
+        let id = st.tunnel_id_at(0).unwrap();
+        let req = st.get_request(id).unwrap();
         assert_eq!(req.name, "ssh");
         assert_eq!(req.remote_source, "tcp://127.0.0.1:22");
         assert_eq!(req.local_listen, "127.0.0.1:2222");
     }
 
     #[test]
-    fn add_form_without_a_peer_errors() {
-        let st = state(); // no peer attached
-        let mut ui = UiState {
-            add_form: Some(AddRequestForm::default()),
-            ..Default::default()
-        };
-        type_str(&mut ui, &st, "ssh");
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> Protocol
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> RemoteSource
-        type_str(&mut ui, &st, "127.0.0.1:22");
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
-        type_str(&mut ui, &st, "127.0.0.1:2222");
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
-
-        let form = ui.add_form.as_ref().expect("form stays open without a peer");
-        assert!(form.error.is_some());
-    }
-
-    #[test]
     fn add_form_protocol_selection_sets_udp_scheme() {
         let st = state();
-        let peer = st.attach_peer("peer-a".into()).unwrap();
         let mut ui = UiState {
             add_form: Some(AddRequestForm::default()),
             ..Default::default()
@@ -596,15 +541,14 @@ mod tests {
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
 
         assert!(ui.add_form.is_none());
-        let id = peer.tunnel_id_at(0).unwrap();
-        let req = peer.get_request(id).unwrap();
+        let id = st.tunnel_id_at(0).unwrap();
+        let req = st.get_request(id).unwrap();
         assert_eq!(req.remote_source, "udp://127.0.0.1:53");
     }
 
     #[test]
     fn add_form_invalid_source_keeps_form_open_with_error() {
         let st = state();
-        let peer = st.attach_peer("peer-a".into()).unwrap();
         let mut ui = UiState {
             add_form: Some(AddRequestForm::default()),
             ..Default::default()
@@ -619,7 +563,7 @@ mod tests {
 
         let form = ui.add_form.as_ref().expect("form stays open on error");
         assert!(form.error.is_some());
-        assert_eq!(peer.tunnel_count(), 0, "no request added on invalid input");
+        assert_eq!(st.tunnel_count(), 0, "no request added on invalid input");
     }
 
     fn req(name: &str, src: &str, listen: &str) -> RequestEntry {
@@ -633,9 +577,8 @@ mod tests {
     #[test]
     fn delete_key_removes_selected_tunnel_and_clamps_cursor() {
         let st = state();
-        let peer = st.attach_peer("peer-a".into()).unwrap();
-        peer.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        peer.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        st.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        st.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
         let mut ui = UiState {
             selected: 1,
             ..Default::default()
@@ -644,47 +587,17 @@ mod tests {
         // `x` deletes the selected (last) tunnel and clamps the cursor onto the
         // remaining row.
         assert!(!handle_key(key(KeyCode::Char('x')), &mut ui, &st));
-        assert_eq!(peer.tunnel_count(), 1);
+        assert_eq!(st.tunnel_count(), 1);
         assert_eq!(ui.selected, 0);
-        assert_eq!(
-            peer.tunnel_id_at(0)
-                .and_then(|id| peer.get_request(id))
-                .unwrap()
-                .name,
-            "a"
-        );
+        assert_eq!(st.tunnel_id_at(0).and_then(|id| st.get_request(id)).unwrap().name, "a");
 
         // `Delete` removes the last remaining tunnel; cursor clamps to 0.
         assert!(!handle_key(key(KeyCode::Delete), &mut ui, &st));
-        assert_eq!(peer.tunnel_count(), 0);
+        assert_eq!(st.tunnel_count(), 0);
         assert_eq!(ui.selected, 0);
         // Pressing delete on an empty list is a harmless no-op.
         assert!(!handle_key(key(KeyCode::Char('x')), &mut ui, &st));
-        assert_eq!(peer.tunnel_count(), 0);
-    }
-
-    #[test]
-    fn tab_toggles_focus_and_peer_cursor_moves() {
-        let st = state();
-        st.attach_peer("peer-a".into()).unwrap();
-        st.attach_peer("peer-b".into()).unwrap();
-        let mut ui = UiState::default();
-        assert_eq!(ui.focus, Pane::Tunnels);
-
-        // Tab moves focus to the peer pane; Down then advances the peer cursor.
-        handle_key(key(KeyCode::Tab), &mut ui, &st);
-        assert_eq!(ui.focus, Pane::Peers);
-        handle_key(key(KeyCode::Down), &mut ui, &st);
-        assert_eq!(ui.selected_peer, 1);
-        // Clamped at the last peer.
-        handle_key(key(KeyCode::Down), &mut ui, &st);
-        assert_eq!(ui.selected_peer, 1);
-
-        // Tab returns focus to tunnels; Down there no longer moves the peer cursor.
-        handle_key(key(KeyCode::Tab), &mut ui, &st);
-        assert_eq!(ui.focus, Pane::Tunnels);
-        handle_key(key(KeyCode::Down), &mut ui, &st);
-        assert_eq!(ui.selected_peer, 1, "tunnel-pane nav leaves the peer cursor put");
+        assert_eq!(st.tunnel_count(), 0);
     }
 
     #[test]
@@ -785,7 +698,6 @@ mod tests {
     #[test]
     fn add_form_esc_cancels() {
         let st = state();
-        let peer = st.attach_peer("peer-a".into()).unwrap();
         let mut ui = UiState {
             add_form: Some(AddRequestForm::default()),
             ..Default::default()
@@ -793,6 +705,6 @@ mod tests {
         type_str(&mut ui, &st, "x");
         handle_add_form(key(KeyCode::Esc), &mut ui, &st);
         assert!(ui.add_form.is_none());
-        assert_eq!(peer.tunnel_count(), 0);
+        assert_eq!(st.tunnel_count(), 0);
     }
 }

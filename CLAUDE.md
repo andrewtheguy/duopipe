@@ -35,9 +35,9 @@ to stderr, needs no terminal) and is required for the other test-only vars to ta
 effect.
 - `DUOPIPE_TEST_MODE=1` enables headless test mode and gates the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` present ⇒ dial that node id; absent ⇒ listen.
-- `DUOPIPE_AUTOSTART_REQUESTS=1` starts every template `[[request]]` for a peer once
-  its connection is up. Test-only: in the interactive TUI tunnels are always started
-  manually, so this is the sole way to exercise tunnels headlessly.
+- `DUOPIPE_AUTOSTART_REQUESTS=1` starts every configured `[[request]]` (dial role)
+  once the connection is up. Required to exercise tunnels in tests, since requests are
+  otherwise activated interactively in the TUI and nothing forwards automatically.
 - `DUOPIPE_AUTH_TOKEN=<token>` is the shared auth token (required to dial; for
   listen it is used if set, otherwise one is generated). Also honored outside test
   mode as a way to supply the token.
@@ -80,27 +80,19 @@ maps back to this peer. Relays
 default to a built-in public set (`nostr_discovery::DEFAULT_NOSTR_RELAYS`); override
 with `nostr_relay_urls`. To dial a raw node id without nostr, use quick mode.
 
-Tunnel model: a peer *requests* tunnels from a connected party. A request binds a
-local `local_listen` address and asks that peer to connect out to a `remote_source`,
-bridging the two. The serving side gates incoming requests with `[allowed_sources]`
-CIDR lists (`tcp`/`udp`); an empty/absent `tcp` list defaults to dual-stack localhost
-(`127.0.0.0/8`, `::1/128`), and an empty/absent `udp` list uses the same default.
+Tunnel model: the **dialer requests** tunnels; the **listener is a pure server**.
+Each `[[request]]` (dial role) binds a local `local_listen` address and asks the
+listener to connect out to a `remote_source`, bridging the two — SSH `-L`-style local
+forwarding. The listener initiates no tunnels of its own; it only serves, gating each
+incoming request against its `[allowed_sources]` CIDR lists (`tcp`/`udp`); an
+empty/absent `tcp` list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`),
+and an empty/absent `udp` list uses the same default. To expose a service that lives
+near the listener box, run that box as the dialer instead.
 
-`[[request]]` is a **prefilled template**: it seeds the tunnel list of every
-connection to save manual typing, but tunnels are **started manually** in the TUI
-(nothing auto-connects; the only autostart is the test-mode
-`DUOPIPE_AUTOSTART_REQUESTS` gate). It is not config to "open these tunnels."
-
-Multiple peers: a listener accepts **many concurrent dialers** at once (one iroh
-endpoint serves all of them — there is no single-peer session binding). Tunnel state
-is **per peer**: each connection (`PeerSession` in `app_state.rs`) has its own tunnel
-table seeded from the template, its own command channel, and its own observed path.
-Because a tunnel is always directed at one connection, the TUI carries a peer
-selector: `Tab` switches focus between the peer list and the selected peer's tunnels,
-so starting a tunnel targets exactly that peer. A dialer holds at most one peer; a
-listener holds one per connected device. The single global stream cap (`max_streams`)
-is shared across all peers. The only admission guard left is transient: a second
-*concurrent* connection from a node id that already has a live session is refused as
-`peer_busy` (so a reconnect race can't bind the same local ports twice); the dialer
-retries. Runtime-added tunnels are per-connection and do not survive that peer
-disconnecting (it re-seeds from the template on reconnect).
+Multiple peers: a listener accepts **many concurrent dialers** over its one iroh
+endpoint — there is no single-peer session binding (authentication is the only gate).
+Each dialer is its own process binding its own local ports, so N dialers can all
+request the same listener source (e.g. `127.0.0.1:5678`) at once with no conflict —
+the listener just makes N independent outbound connects. The TUI lists connected
+peers on the listener; tunnels live on the dial side. One global `max_streams`
+semaphore caps concurrent forwarded streams across all peers.
