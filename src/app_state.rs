@@ -415,6 +415,13 @@ impl AppState {
     /// the request template) and return it. Returns `None` if a session for this
     /// `remote_id` is already live — the caller should reject the duplicate as
     /// transiently busy so a reconnect race can't bind the same local ports twice.
+    ///
+    /// This is the **only** admission rule and it is **role-agnostic**: node-id
+    /// dedup, nothing more. There is deliberately no per-role peer cap here. The
+    /// "a dialer holds at most one peer" property is a structural consequence of
+    /// `run_dial` dialing a single target in a sequential loop (each `attach_peer`
+    /// is paired with a `detach_peer` inside one `handle_connection`), not an
+    /// invariant enforced at this layer — so do not gate it on `self.role`.
     pub fn attach_peer(&self, remote_id: String) -> Option<Arc<PeerSession>> {
         let mut peers = self.peers.write();
         if peers.iter().any(|p| p.remote_id == remote_id) {
@@ -552,6 +559,27 @@ mod tests {
         );
         // The original handle still resolves; its id space is its own.
         assert!(a.get_request(a_id).is_some());
+    }
+
+    /// `attach_peer` is the uniform admission primitive: it dedups by node id and
+    /// is otherwise role-agnostic. The "a dialer holds at most one peer" rule is a
+    /// structural consequence of `run_dial` dialing a single target sequentially
+    /// (attach paired with detach inside one `handle_connection`), NOT a cap
+    /// enforced here. This test pins that decision so the single-peer-dialer rule
+    /// isn't mistakenly re-added to the shared admission path.
+    #[test]
+    fn attach_peer_dedups_by_node_id_regardless_of_role() {
+        let state = AppState::new(Role::Dial, false, LogBuffer::new(16), vec![]);
+        // Distinct ids both attach: attach_peer imposes no per-role peer cap even
+        // in the dial role.
+        assert!(state.attach_peer("peer-a".into()).is_some());
+        assert!(state.attach_peer("peer-b".into()).is_some());
+        // The sole admission rule — node-id dedup — applies in the dial role too.
+        assert!(
+            state.attach_peer("peer-a".into()).is_none(),
+            "a duplicate live node id is refused regardless of role"
+        );
+        assert_eq!(state.peer_count(), 2);
     }
 
     #[test]
