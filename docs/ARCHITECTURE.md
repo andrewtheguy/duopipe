@@ -845,7 +845,7 @@ The `iroh::Endpoint` provides:
 
 ### Peer Runtime (iroh_mode/peer.rs)
 
-`run_peer(PeerConfig)` is the single entry point. It validates relay-only usage and dispatches on `config.role`: interactive runs use `Role::Both`, while headless test mode uses `Role::Listen` or `Role::Dial`. The ALPN is the fixed `ALPN` constant.
+`run_peer(crate::iroh_mode::PeerConfig)` is the single runtime entry point. The TOML `crate::config::PeerConfig` has no serialized role; runtime `Role` is synthesized before this point by `ResolvedPeer`: interactive setup always builds `Role::Both`, while headless test mode infers `Role::Dial` when `DUOPIPE_PEER_NODE_ID` is present and `Role::Listen` otherwise. `build_peer_config` / `run_peer_headless` copy that synthesized role into the runtime config. Inside `run_peer`, that runtime role selects `run_serve_and_dial`, `run_listen`, or `run_dial`. The ALPN is the fixed `ALPN` constant.
 
 - `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`. When `announce_endpoint` is set (non-interactive mode) it prints `node_id:` and `auth_token:` to stderr.
 - `run_dial_manager` — interactive-only manager for the single outbound session. It reuses one client endpoint, idles until a `DialCommand::Connect`, and replaces or disconnects the active session on dashboard commands.
