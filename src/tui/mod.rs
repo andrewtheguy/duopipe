@@ -490,9 +490,16 @@ fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
             }
         }
     };
-    state.set_dial_target(Some(target.describe()));
-    state.send_dial(DialCommand::Connect(target));
-    ui.connect_form = None;
+    // Only commit the displayed target and close the modal if the command actually
+    // reached the dial manager; otherwise keep the form open with an error rather than
+    // silently showing a target that never connects.
+    let display = target.describe();
+    if state.send_dial(DialCommand::Connect(target)) {
+        state.set_dial_target(Some(display));
+        ui.connect_form = None;
+    } else {
+        form.error = Some("Dial manager is not running; cannot connect".to_string());
+    }
 }
 
 /// Write the current connection info to a timestamped file in the system temp

@@ -340,9 +340,11 @@ impl AppState {
         self.dial_tx.subscribe()
     }
 
-    /// Send a dial command to the dial manager (TUI connect/disconnect).
-    pub fn send_dial(&self, cmd: DialCommand) {
-        let _ = self.dial_tx.send(cmd);
+    /// Send a dial command to the dial manager (TUI connect/disconnect). Returns
+    /// `true` if it was delivered to a live manager; `false` if there is no subscriber
+    /// (the manager hasn't started yet or has exited), so the caller can surface it.
+    pub fn send_dial(&self, cmd: DialCommand) -> bool {
+        self.dial_tx.send(cmd).is_ok()
     }
 
     /// Set (or clear) the current dial target's display string.

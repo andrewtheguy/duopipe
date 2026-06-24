@@ -348,13 +348,20 @@ async fn run_managed_dial_session(
         };
 
         // Self-dial guard: end the session (not the process) — the target won't change.
-        if let Ok(id) = &resolved
-            && *id == own_id
-        {
-            log::error!("Refusing to dial this peer's own node id ({own_id}); ending session.");
-            config.status.set_conn_status(ConnStatus::Closed);
-            config.status.set_dial_target(None);
-            return;
+        // Reject both the dial endpoint's own id *and* this process's published (listen)
+        // node id, which is a separate endpoint in the dual-role process — so dialing our
+        // own published id (a quick-mode paste, or a name that resolves back to us) is
+        // caught here as a last line of defense behind the connect prompt's checks.
+        if let Ok(id) = &resolved {
+            let id_str = id.to_string();
+            let is_own_published =
+                config.status.snapshot().endpoint_id.as_deref() == Some(id_str.as_str());
+            if *id == own_id || is_own_published {
+                log::error!("Refusing to dial this peer's own node id ({id}); ending session.");
+                config.status.set_conn_status(ConnStatus::Closed);
+                config.status.set_dial_target(None);
+                return;
+            }
         }
 
         let connect = match resolved {
