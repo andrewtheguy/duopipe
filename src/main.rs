@@ -215,11 +215,15 @@ async fn run_peer_headless(
     autostart_requests: bool,
 ) -> Result<()> {
     let logs = logging::LogBuffer::new(LOG_CAPACITY);
+    // Headless test mode is single-role and never uses nostr, so the dial-prompt
+    // fields are inert.
     let state = AppState::new(
         resolved.role,
         resolved.token_generated,
         logs,
         cfg.request.clone(),
+        false,
+        None,
     );
     let peer_cfg = iroh_mode::PeerConfig {
         role: resolved.role,
@@ -232,9 +236,8 @@ async fn run_peer_headless(
         nostr_relays: vec![],
         nostr_discovery: false,
         nostr_identifier: None,
-        // Headless test mode is single-role (listen or dial), so the dual-only fields
-        // are inert: no separate dial target, and this endpoint reports its own id.
-        dial_target_identifier: None,
+        // Headless test mode is single-role (listen or dial); this endpoint reports its
+        // own id.
         report_endpoint_id: true,
         relay_urls,
         relay_only,

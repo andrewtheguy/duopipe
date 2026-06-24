@@ -36,16 +36,16 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 
 ## Overview
 
-duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. A listener accepts **many dialers at once** over one iroh endpoint. The **dialer requests** tunnels — SSH `-L`–style local forwarding: it binds a local listener and asks the listener peer to connect out to a remote source. The **listener is a pure server**: it serves those requests (each gated by its allowlist) and initiates none of its own.
+duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. Every instance is **always listening**: it accepts **many inbound peers at once** over one iroh endpoint and serves their tunnel requests, each gated by its `[allowed_sources]` allowlist. Alongside that, each instance can hold **one outbound dial session** that *it* drives — SSH `-L`–style local forwarding: it binds a local listener and asks the connected peer to connect out to a remote source. Each individual connection is one-directional (one requester, one server); your process is just both at once.
 
-On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
+There is **no listen/dial choice at startup**. Setup only collects the serving allowlist (when config supplies none) and the auth token (supplied, or generated with a confirm), then the dashboard opens — already listening. To dial a peer, press **`c`** and type the target (its `name` in nostr mode, or its node id in quick mode); press **`D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time.
 
-- Answer **No** → this peer **listens**. If no auth token is configured, it generates one; the TUI header shows the listener's **node id** and the **auth token** so you can copy them to your other device. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
-- Answer **Yes** → this peer **dials**. The TUI prompts for the existing instance's node id, and for the auth token if one isn't already in config or the environment. Both are validated (node id parse, auth-token CRC16) before connecting.
+- The TUI header shows this instance's **node id** and (when freshly generated) the **auth token**, so you can copy them to your other device. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
+- The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated.
 
-> **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
+> **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In nostr mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
 
-Once a connection is established and authenticated, the **dialer requests tunnels** and the **listener serves them** (gated by its `[allowed_sources]` allowlist). A listener can hold **many dialers at once** — laptop + phone + VPS all dialing one homelab box — each shown in its peer list. To reach a service that lives near the listener box, run that box as the dialer instead. iroh provides NAT traversal with relay fallback and automatic discovery.
+A peer can serve **many inbound peers at once** — laptop + phone + VPS all dialing one homelab box — each shown in its peer list, while also dialing out itself. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
 > **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS); the same auth token lives on each of your machines. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
@@ -202,7 +202,7 @@ local_listen = "127.0.0.1:15678"
 tcp = ["127.0.0.0/8"]
 ```
 
-The connection role (listen vs dial) and the dialer's target node id are chosen **interactively** in the TUI, not in the config file. Requests are started/stopped from the TUI too — nothing forwards automatically.
+The instance always listens; the dial target is chosen **interactively** at runtime (press `c`), not in the config file. `[[request]]` entries are templates for that dial session, started/stopped from the TUI — nothing forwards automatically.
 
 ---
 
@@ -226,31 +226,25 @@ For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe nostr` (config-driven, with node-id discovery) on both machines and answer a prompt in the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); only the role and the dial target are chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
+duopipe is **interactive-first**: you run `duopipe nostr` (config-driven, with node-id discovery) on both machines. Each instance is always listening; you dial the other on demand from the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); the dial target is chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
 
-### 1. Start the listening instance
+### 1. Start both instances
 
-On the first machine, point at a config that declares the requests (see [Configuration Files](#configuration-files)) and run:
-
-```bash
-duopipe nostr -c ./peer.toml
-```
-
-When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. The config must set a `name` and supply the auth token (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); the listener then publishes its current node id to nostr under that `name` so a dialer can find it by name. The TUI header shows the **node id** and the **auth token**.
-
-> **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — the dialer finds it by the listener's `name`.
-
-### 2. Start the dialing instance
-
-On the second machine (also pointed at a config that declares its requests):
+On each machine, point at a config that declares its requests (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
 duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Type the **identifier** of the peer you want — the listener's `name` (e.g. `web1`), which must differ from this peer's own `name` — and duopipe resolves it to that peer's current node id via nostr. The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
+There is no role prompt — setup just confirms the allowlist/token and the dashboard opens, already listening. Each config must set a `name` and supply the auth token (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header shows this instance's **node id** and **auth token**.
 
-Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
+> **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — peers find each other by `name`.
+
+### 2. Dial a peer
+
+In the TUI on either machine, press **`c`** and type the **`name`** of the peer you want (e.g. `web1`, which must differ from this instance's own `name`); duopipe resolves it via nostr and connects. Press **`D`** to disconnect, then `c` again to dial a different peer. The **auth token** comes from config or `DUOPIPE_AUTH_TOKEN` and is shared by both sides.
+
+Once connected, the requests you start in the TUI flow over that session. For example, a config with:
 
 ```toml
 [[request]]
@@ -259,10 +253,10 @@ remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 ```
 
-- This request makes the **dialer** listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **listener** connects out to (subject to its `[allowed_sources]`).
-- To expose a service that lives near the listener box, run that box as the **dialer** instead, with the matching `[[request]]`, and list that source in the serving peer's `[allowed_sources]`.
+- This makes the **dialing** side listen on `127.0.0.1:15678`; connections are forwarded to `tcp://127.0.0.1:5678`, which the **connected peer** connects out to (subject to *its* `[allowed_sources]`).
+- The direction is per-connection: whoever pressed `c` is the requester. To pull a service the *other* way, dial from the other box (or both dial each other — each instance serves and dials at once).
 
-The dialer's requests are started/stopped independently in the TUI. A single listener can serve several dialers at once, each with its own requests.
+Requests are started/stopped independently in the TUI. A single instance serves several inbound peers at once while holding one outbound dial session.
 
 ### 3. SSH over a requested tunnel
 
@@ -288,48 +282,26 @@ local_listen = "0.0.0.0:51820"
 
 ### Bidirectional tunnels — both directions on demand
 
-The tunnel model is one-directional per connection: **the dialer requests, the
-listener only serves.** So if `homelab` listens and `laptop` dials, only `laptop`
-can pull tunnels from `homelab`. To *also* let `homelab` reach a service on
-`laptop` on demand, that direction needs its own listener (on `laptop`) and dialer
-(on `homelab`).
+Each individual connection is one-directional: **whoever dialed is the requester, the
+other side serves.** But every instance both serves and dials, so you get both
+directions naturally — just dial from whichever side needs to pull:
 
-The simplest way is the **"Serve and dial (both directions)"** option in the setup
-screen: one process per machine runs a listen half (serving inbound peers) **and** a
-dial half (one outbound connection requesting tunnels) at once, over a shared TUI.
-Pick it on each box and enter the *other* machine's `name` as the dial target — and
-each side's TUI shows both its connected peers and its own outbound tunnels.
+- `homelab` wants a service on `laptop`: on `homelab` press `c`, dial `laptop`, and
+  start its `[[request]]` for that service.
+- `laptop` wants a service on `homelab`: on `laptop` press `c`, dial `homelab`, and
+  start its request.
 
-If you'd rather keep the two halves as separate processes, you can instead **run two
-instances per machine** — one listening, one dialing — reusing the same config file
-(the role is chosen interactively):
+Both can be connected at the same time — each instance's serve half accepts the
+other's inbound dial while its own dial session pulls the other way. Each box's
+`[[request]]` list is what *it* pulls when dialing; its `[allowed_sources]` gates what
+a connected peer may reach when serving — one config carries both halves.
 
-```bash
-# on the homelab box
-duopipe nostr -c ./homelab.toml   # answer No  → LISTEN (serves laptop)
-duopipe nostr -c ./homelab.toml   # answer Yes → DIAL, target: laptop
-
-# on the laptop box
-duopipe nostr -c ./laptop.toml    # answer No  → LISTEN (serves homelab)
-duopipe nostr -c ./laptop.toml    # answer Yes → DIAL, target: homelab
-```
-
-Each box's `[[request]]` list drives what it pulls **when dialing**, and its
-`[allowed_sources]` gates what peers may reach **when listening** — so a single
-config already carries both halves. Start the tunnels you want in each dialing
-TUI.
-
-**This does not conflict on nostr.** Only the *listener* publishes its node id,
-and each record is keyed by a `d` tag derived from that listener's own `name`
-(salted with the auth token). Two machines listening under distinct names
-(`homelab`, `laptop`) publish two independent records; the dialers only *read*
-(they publish nothing). The only requirement is that **each machine listens under
-a unique `name`** — which is already true for distinct peers. Pick non-colliding
-`local_listen` ports if you run a listener and a dialer on the same host.
-
-> The same no-conflict reasoning applies to the single-process dual-role mode: its
-> listen half publishes under this machine's own `name`, its dial half only reads the
-> target's. Use distinct names per machine either way.
+**This does not conflict on nostr.** Each instance publishes its node id under its own
+`name`'s `d` tag (salted with the auth token); dialing only *reads* the target's
+record. Two machines with distinct names (`homelab`, `laptop`) publish two independent
+records. The only requirement is a **unique `name` per machine** — already true for
+distinct peers. (See [docs/ROADMAP.md](docs/ROADMAP.md) for what happens if two
+machines accidentally share a name.)
 
 ### Test mode (testing only)
 
@@ -350,7 +322,7 @@ Both interactive subcommands launch the same TUI; they differ only in mode. The 
 
 ### quick (configless mode)
 
-`duopipe quick` runs everything ephemeral with **no config file** and **no nostr**: the node id changes every run and a dialer enters it by hand.
+`duopipe quick` runs everything ephemeral with **no config file** and **no nostr**: the node id changes every run, and to dial you enter the peer's node id by hand in the connect prompt (`c`).
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -383,7 +355,7 @@ Config files are used by `duopipe nostr`: run it with no flag to load the defaul
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-`duopipe nostr` requires a provided auth token and a `name`. The config holds the tunnel requests, the path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target identifier** are chosen interactively in the TUI, not in the config.
+`duopipe nostr` requires a provided auth token and a `name`. The config holds the tunnel requests, the path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The instance always listens; the **dial target** is chosen interactively at runtime (press `c`), not in the config.
 
 ### Node-id discovery
 
@@ -500,9 +472,9 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 ## How It Works
 
 ### iroh Mode
-1. On startup the TUI asks "Connect to an existing instance?", selecting the listen or dial role (the identity is freshly generated either way)
-2. The listening peer creates an iroh endpoint with discovery services and publishes its address via Pkarr/DNS; its node id is shown in the TUI header
-3. The dialing peer (given the listener's node id) resolves the listening peer via discovery
+1. On startup the instance begins listening immediately (no role prompt); the identity is freshly generated. A dial session is started later from the TUI (`c`)
+2. The instance creates an iroh endpoint with discovery services and publishes its address via Pkarr/DNS; its node id is shown in the TUI header
+3. When dialing, the dial session (given the target's node id, directly or resolved via nostr) reaches the target via discovery
 4. **QUIC handshake:** the connection uses the fixed ALPN constant (`mf/2`); there is no token in the ALPN
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
 6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response

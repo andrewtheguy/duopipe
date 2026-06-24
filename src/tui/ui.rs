@@ -22,6 +22,8 @@ pub struct UiState {
     pub selected: usize,
     /// When `Some`, the "add request" modal is open and captures all keystrokes.
     pub add_form: Option<AddRequestForm>,
+    /// When `Some`, the "connect to peer" modal is open and captures all keystrokes.
+    pub connect_form: Option<ConnectForm>,
     /// Set once the user presses `h`, once a peer has connected, or once the
     /// auto-hide timeout expires: hides the generated-token banner for the rest
     /// of the session.
@@ -98,6 +100,15 @@ impl AddRequestForm {
     }
 }
 
+/// In-progress entry for the runtime "connect to peer" modal (single text field).
+#[derive(Default)]
+pub struct ConnectForm {
+    /// The target: a peer name (nostr mode) or a full node id (quick mode).
+    pub target: Input,
+    /// Inline validation error from the last failed submit; cleared on next keypress.
+    pub error: Option<String>,
+}
+
 pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
     let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
@@ -142,17 +153,28 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
         Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
     ];
 
-    // The dial half (Dial or Both) shows its outbound connection status + path.
+    // The dial half (Dial or Both) shows its outbound dial session: target, status,
+    // and path. `Both` is the interactive serve+dial mode where the target is chosen
+    // at runtime — show a hint to connect when idle.
     if matches!(snap.role, Role::Dial | Role::Both) {
-        lines.push(Line::from(vec![
-            Span::raw("status: "),
-            Span::styled(
-                status_label,
-                Style::default().fg(conn_color(&snap.conn_status)),
-            ),
-            Span::raw("   path: "),
-            Span::raw(snap.path.describe()),
-        ]));
+        let mut spans = Vec::new();
+        if snap.role == Role::Both {
+            let target = snap
+                .dial_target
+                .as_deref()
+                .map(|t| format!("dial → {t}"))
+                .unwrap_or_else(|| "dial → (none — press c)".to_string());
+            spans.push(Span::raw(target));
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::raw("status: "));
+        spans.push(Span::styled(
+            status_label,
+            Style::default().fg(conn_color(&snap.conn_status)),
+        ));
+        spans.push(Span::raw("   path: "));
+        spans.push(Span::raw(snap.path.describe()));
+        lines.push(Line::from(spans));
     }
     // The listen half (Listen or Both) shows the auth-token banner/hint, since its
     // node id is ephemeral and a dialer needs the shared token to connect.
@@ -280,6 +302,56 @@ pub fn render_add_request_dialog(frame: &mut Frame, form: &AddRequestForm) {
                 .borders(Borders::ALL)
                 .title(" add request "),
         )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Modal for starting the on-demand dial session. One text field whose meaning depends
+/// on the mode: a peer name (nostr) or a full node id (quick).
+pub fn render_connect_dialog(frame: &mut Frame, form: &ConnectForm, nostr_discovery: bool) {
+    let (label, hint) = if nostr_discovery {
+        (
+            "peer name:",
+            "the target peer's name (its config `name`); looked up via nostr",
+        )
+    } else {
+        ("node id:", "the target peer's full node id")
+    };
+
+    let mut field_spans = vec![Span::raw(format!("{label:<10}"))];
+    field_spans.extend(render_spans(&form.target, Style::default().fg(Color::Cyan)));
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Connect to peer",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(field_spans),
+        Line::raw(""),
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+    ];
+
+    if let Some(err) = &form.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Enter connect · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let area = centered(frame.area(), 80, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" connect "))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
@@ -470,6 +542,7 @@ fn conn_color(status: &ConnStatus) -> Color {
             Color::Yellow
         }
         ConnStatus::Closed => Color::Red,
+        ConnStatus::Idle => Color::DarkGray,
     }
 }
 
