@@ -248,7 +248,7 @@ On the second machine (also pointed at a config that declares its requests):
 duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Type the **identifier** of the peer you want — the listener's `name` (e.g. `web1`) — and duopipe resolves it to that peer's current node id via nostr. The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
+When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Type the **identifier** of the peer you want — the listener's `name` (e.g. `web1`), which must differ from this peer's own `name` — and duopipe resolves it to that peer's current node id via nostr. The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
 
 Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
 

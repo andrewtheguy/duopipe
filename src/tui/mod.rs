@@ -69,6 +69,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         launch.config_auth_token.clone(),
         launch.allowed_sources.clone(),
         launch.nostr_discovery,
+        launch.peer_name.clone(),
     )
     .await
     {
@@ -179,8 +180,14 @@ async fn run_setup(
     config_auth_token: Option<String>,
     config_allowed_sources: AllowedSources,
     nostr_discovery: bool,
+    own_name: Option<String>,
 ) -> SetupOutcome {
-    let mut state = SetupState::new(config_auth_token, config_allowed_sources, nostr_discovery);
+    let mut state = SetupState::new(
+        config_auth_token,
+        config_allowed_sources,
+        nostr_discovery,
+        own_name,
+    );
     let mut tick = tokio::time::interval(TICK);
 
     loop {

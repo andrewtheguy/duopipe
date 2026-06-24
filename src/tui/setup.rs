@@ -99,6 +99,9 @@ pub struct SetupState {
     node_id: Option<EndpointId>,
     /// Target peer's nostr identifier (nostr-mode dial); `None` in quick mode.
     peer_identifier: Option<String>,
+    /// This peer's own identifier (config `name`), used to reject a dialer entering
+    /// its own id (which would resolve to itself). `None` in quick mode.
+    own_name: Option<String>,
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
     token_generated: bool,
@@ -113,6 +116,7 @@ impl SetupState {
         config_auth_token: Option<String>,
         config_allowed_sources: AllowedSources,
         nostr_discovery: bool,
+        own_name: Option<String>,
     ) -> Self {
         Self {
             phase: SetupPhase::Start,
@@ -127,6 +131,7 @@ impl SetupState {
             nostr_discovery,
             node_id: None,
             peer_identifier: None,
+            own_name,
             auth_token: None,
             token_generated: false,
             buffer: Input::default(),
@@ -311,6 +316,13 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                     // looked up via nostr at runtime.
                     if raw.is_empty() {
                         state.error = Some("Enter the peer's identifier".to_string());
+                        Step::Continue
+                    } else if state.own_name.as_deref().map(str::trim) == Some(raw) {
+                        // Dialing our own identifier would resolve to ourselves.
+                        state.error = Some(
+                            "That is this peer's own identifier; enter the other peer's identifier"
+                                .to_string(),
+                        );
                         Step::Continue
                     } else {
                         state.peer_identifier = Some(raw.to_string());
@@ -557,7 +569,7 @@ mod tests {
 
     #[test]
     fn listen_generates_token_when_none() {
-        let mut s = SetupState::new(None, from_config(), false);
+        let mut s = SetupState::new(None, from_config(), false, None);
         // Without a config token, choosing listen first asks for confirmation.
         assert!(matches!(choose_listen(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
@@ -576,7 +588,7 @@ mod tests {
 
     #[test]
     fn listen_no_token_confirm_back_returns_to_start() {
-        let mut s = SetupState::new(None, from_config(), false);
+        let mut s = SetupState::new(None, from_config(), false, None);
         assert!(matches!(choose_listen(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
         // Declining the confirmation returns to the start screen.
@@ -590,7 +602,7 @@ mod tests {
     #[test]
     fn listen_on_enter_reuses_config_token() {
         let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), false);
+        let mut s = SetupState::new(Some(token.clone()), from_config(), false, None);
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Listen);
@@ -602,7 +614,7 @@ mod tests {
 
     #[test]
     fn dial_rejects_bad_node_id_and_keeps_editing() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
         assert!(matches!(choose_dial(&mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::NodeId);
         type_str(&mut s, "not-a-node-id");
@@ -617,7 +629,7 @@ mod tests {
     fn dial_full_flow_with_config_token_skips_token_prompt() {
         let token = auth::generate_token();
         let node_id = iroh::SecretKey::generate().public().to_string();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), false);
+        let mut s = SetupState::new(Some(token.clone()), from_config(), false, None);
         choose_dial(&mut s);
         type_str(&mut s, &node_id);
         match handle_key(key(KeyCode::Enter), &mut s) {
@@ -635,7 +647,7 @@ mod tests {
         // In nostr mode the dialer types a short identifier; it resolves to a Dial
         // with a peer_identifier and no node id (looked up at runtime).
         let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), true);
+        let mut s = SetupState::new(Some(token.clone()), from_config(), true, None);
         choose_dial(&mut s);
         assert_eq!(s.phase, SetupPhase::NodeId);
         type_str(&mut s, "web1");
@@ -652,7 +664,7 @@ mod tests {
 
     #[test]
     fn dial_nostr_mode_blank_identifier_rejected() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), true);
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), true, None);
         choose_dial(&mut s);
         assert_eq!(s.phase, SetupPhase::NodeId);
         // Blank identifier keeps the prompt open with an error.
@@ -665,8 +677,36 @@ mod tests {
     }
 
     #[test]
+    fn dial_nostr_mode_rejects_own_identifier() {
+        // Entering this peer's own name (from config) would resolve to itself. The
+        // config name carries surrounding whitespace to exercise the trim.
+        let token = auth::generate_token();
+        let mut s = SetupState::new(Some(token), from_config(), true, Some("  web1  ".to_string()));
+        choose_dial(&mut s);
+        assert_eq!(s.phase, SetupPhase::NodeId);
+        type_str(&mut s, "web1");
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
+        assert!(s.error.is_some(), "own identifier must be rejected");
+        assert_eq!(s.phase, SetupPhase::NodeId);
+        assert!(s.peer_identifier.is_none());
+
+        // A different identifier is accepted.
+        for _ in 0.."web1".len() {
+            handle_key(key(KeyCode::Backspace), &mut s);
+        }
+        type_str(&mut s, "web2");
+        match handle_key(key(KeyCode::Enter), &mut s) {
+            Step::Done(r) => assert_eq!(r.peer_identifier.as_deref(), Some("web2")),
+            _ => panic!("expected Done(Dial) for a different identifier"),
+        }
+    }
+
+    #[test]
     fn dial_quick_mode_blank_node_id_rejected() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
         choose_dial(&mut s);
         assert_eq!(s.phase, SetupPhase::NodeId);
         // Blank entry in quick mode keeps the prompt open with an error.
@@ -682,7 +722,7 @@ mod tests {
     fn dial_prompts_token_when_absent_and_validates_it() {
         let node_id = iroh::SecretKey::generate().public().to_string();
         let token = auth::generate_token();
-        let mut s = SetupState::new(None, from_config(), false);
+        let mut s = SetupState::new(None, from_config(), false, None);
         choose_dial(&mut s);
         type_str(&mut s, &node_id);
         // Valid node id with no config token -> advance to the token prompt.
@@ -713,7 +753,7 @@ mod tests {
 
     #[test]
     fn node_id_field_supports_cursor_editing() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
         choose_dial(&mut s); // -> NodeId
         type_str(&mut s, "abcd");
         // Move left twice and insert in the middle.
@@ -729,7 +769,7 @@ mod tests {
 
     #[test]
     fn start_role_selection_navigates_and_clamps() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
         // Default highlight is the listen option.
         assert_eq!(s.connect_choice, 0);
         // Up at the top clamps.
@@ -750,7 +790,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits() {
-        let mut s = SetupState::new(None, from_config(), false);
+        let mut s = SetupState::new(None, from_config(), false, None);
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(handle_key(k, &mut s), Step::Quit));
     }
@@ -759,7 +799,7 @@ mod tests {
     fn start_screen_collects_tcp_then_udp_allowlist() {
         // Empty config allowlist -> the two CIDR fields appear on the start screen,
         // reached with Tab.
-        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false, None);
         handle_key(key(KeyCode::Tab), &mut s); // Role -> AllowedTcp
         type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
         handle_key(key(KeyCode::Tab), &mut s); // -> AllowedUdp
@@ -783,7 +823,7 @@ mod tests {
         // The allowlist entered on the start screen reaches a dial result too.
         let token = auth::generate_token();
         let node_id = iroh::SecretKey::generate().public().to_string();
-        let mut s = SetupState::new(Some(token), AllowedSources::default(), false);
+        let mut s = SetupState::new(Some(token), AllowedSources::default(), false, None);
         handle_key(key(KeyCode::Down), &mut s); // role -> dial
         handle_key(key(KeyCode::Tab), &mut s); // -> AllowedTcp
         type_str(&mut s, "10.0.0.0/8");
@@ -802,7 +842,7 @@ mod tests {
 
     #[test]
     fn allowlist_rejects_invalid_cidr_inline() {
-        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false, None);
         handle_key(key(KeyCode::Tab), &mut s); // -> AllowedTcp
         type_str(&mut s, "not-a-cidr");
         assert!(matches!(
@@ -816,7 +856,7 @@ mod tests {
 
     #[test]
     fn allowlist_blank_entries_yield_empty_lists() {
-        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false);
+        let mut s = SetupState::new(Some(auth::generate_token()), AllowedSources::default(), false, None);
         // Blank TCP/UDP, default listen role: Enter finishes with empty lists.
         // `run_peer` later defaults empty protocol lists to localhost.
         match handle_key(key(KeyCode::Enter), &mut s) {

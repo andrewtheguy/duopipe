@@ -15,7 +15,8 @@ mode:
   token (it is the nostr rendezvous secret — a generated one couldn't be discovered
   by the peer) and a `name` (this peer's short identifier). Startup fails fast if
   either is missing. Nostr publishes/looks up the node id by name (see below): when
-  connecting, the dialer types the *target peer's* identifier (its `name`). There is
+  connecting, the dialer types the *target peer's* identifier (its `name`) — setup
+  rejects entering this peer's own `name`, which would resolve to itself. There is
   no raw node-id entry in nostr mode — use quick mode for that.
 
 Token precedence is `--auth-token-file` (quick only) > `DUOPIPE_AUTH_TOKEN` > config
