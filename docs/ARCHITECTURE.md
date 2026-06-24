@@ -35,7 +35,7 @@ The role is chosen **at startup**: the TUI asks "Connect to an existing instance
 
 Each peer declares **tunnel requests** in config (the connection role is chosen at startup, not here):
 
-- **`[[request]]`** (`name`, `remote_source`, `local_listen`): this peer binds a local listener at `local_listen`; each accepted connection asks the *other* peer to connect out to `remote_source`, then bridges the two. Requests are activated on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
+- **`[[request]]`** (`name`, `remote_source`, `local_listen`): a **prefilled template** that seeds each connected peer's tunnel list. When started, this peer binds a local listener at `local_listen`; each accepted connection asks the *other* peer to connect out to `remote_source`, then bridges the two. Tunnels are activated on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
 - **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): gates which `remote_source` addresses *this* peer will connect out to when the other peer requests one of ours. Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`).
 
 #### Non-interactive mode (testing)
@@ -44,7 +44,7 @@ The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_
 
 - `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
-- `DUOPIPE_AUTOSTART_REQUESTS=1` — start every configured `[[request]]` on connect.
+- `DUOPIPE_AUTOSTART_REQUESTS=1` — start a peer's template tunnels on connect (test-only; the TUI starts tunnels manually).
 - `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
@@ -275,7 +275,7 @@ graph TB
     style R fill:#FFCCBC
 ```
 
-A per-connection `Semaphore` (default `max_streams = 100`) bounds concurrent forwarded **data** streams in both directions (surfaced in the TUI as the `streams` gauge). The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. The CIDR allowlist check runs **before** a permit is acquired, so rejected sources never consume one; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
+A single global `Semaphore` (default `max_streams = 100`), shared across all connected peers, bounds concurrent forwarded **data** streams in both directions (surfaced in the TUI as the `streams` gauge). The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. The CIDR allowlist check runs **before** a permit is acquired, so rejected sources never consume one; if the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
 
 ### Request Data Flow
 
@@ -583,18 +583,14 @@ graph TB
 **Your own devices, coordinated out-of-band.** duopipe is built for **one person linking devices they own** (laptop ↔ homelab box ↔ VPS) — not a public service or multi-tenant gateway. (Two parties who fully trust each other can use it too, but that is not the primary design point.) Several design choices follow directly from this assumption:
 
 - **Out-of-band credential exchange.** The shared auth token is the same value placed on each of your devices, moved over a side channel you already have (a password manager, an existing SSH session, a synced secrets store). The ephemeral node id changes every run, but it no longer needs hand-copying: it is published to and looked up from nostr, keyed off that same shared token (see [Node-id discovery](#node-id-discovery-nostr)).
-- **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, the bound peer, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* is done by you (one person across your screens), not automatically.
+- **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, every connected peer, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* is done by you (one person across your screens), not automatically.
 - **Trust assumed between your devices.** Because either peer may *request* tunnels of the other once authenticated, the token should only ever live on endpoints you control; the `[allowed_sources]` allowlist then bounds what the other end can actually reach.
 
-**Sticky single-session binding (listen role).** The first peer to authenticate binds the session to its node id (`AppState::admit_peer`) for the **lifetime of the program**. Afterwards:
+**Multiple peers, per-peer tunnels (listen role).** A listener accepts **many concurrent dialers** over its one iroh endpoint — there is no single-peer session binding. Each authenticated connection gets its own `PeerSession` (`AppState::attach_peer`): an independent tunnel table seeded from the `[[request]]` template, its own command channel, and its own observed path. Because a tunnel binds a local port and is directed at exactly one connection, the listen dashboard carries a peer selector — `Tab` toggles focus between the peer list and the selected peer's tunnels, so a tunnel you start targets that peer. A dialer holds at most one peer (the listener it dialed); a listener holds one per connected device. The single `max_streams` cap is **global**, shared across all peers.
 
-- The **same** node id may disconnect and reconnect freely (the dialer's endpoint is reused across its reconnect loop, so its id is stable).
-- A **different** node id is rejected as a wrong peer (`WRONG_PEER_CODE`) — a *fatal* rejection (`ErrorCategory::Rejected`, exit 4) so that dialer stops instead of racing for the session. This is deliberately robust against accidental rebinding: launching several dialers at one listener (each with a fresh ephemeral id) deterministically admits only the first.
-- A *second live connection from the bound peer* (its previous connection still tearing down) is rejected transiently as busy (`PEER_BUSY_CODE`); that dialer retries with backoff and gets back in once the old connection clears.
+The only admission guard left is transient: a **second concurrent connection from a node id that already has a live session** is refused as busy (`PEER_BUSY_CODE`) so a reconnect race cannot bind the same local ports twice; that dialer retries with backoff and gets back in once its old connection clears. Different node ids are always admitted. A peer's runtime-added tunnels do not persist across a disconnect — its session re-seeds from the template on reconnect (consistent with the per-connection reset that has always happened).
 
-The binding persists even while no peer is connected. To admit a different node id, the operator either restarts the listener or presses `u` in the listen dashboard (`AppState::unbind_session`), which clears the binding so the next authenticated peer may bind.
-
-**Auth, then a source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the session binding admits the peer, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
+**Auth, then a source allowlist.** Connection setup is asymmetric, but the request model is symmetric: once the shared auth token passes and the peer is admitted, either peer may *request* tunnels. A request asks the acceptor to connect out to a `source`; before connecting, the acceptor checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Requests are additionally activated on demand from the TUI; nothing forwards until started. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
@@ -860,7 +856,7 @@ The `iroh::Endpoint` provides:
 - `run_listen` — `create_server_endpoint`, then an `endpoint.accept()` loop spawning `handle_connection(.., is_dialer = false)`. When `announce_endpoint` is set (non-interactive mode) it prints `node_id:` and `auth_token:` to stderr.
 - `run_dial` — `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs two concurrent halves over the one connection: an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out) and a `request_supervisor` that starts/stops our own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request. In test mode, `DUOPIPE_AUTOSTART_REQUESTS=1` starts every request on connect. Everything is torn down when `conn.closed()` resolves.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs two concurrent halves over the one connection: an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out) and a `request_supervisor` that starts/stops our own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request. Both halves use the global `max_streams` semaphore, shared across all peers. In test mode, `DUOPIPE_AUTOSTART_REQUESTS=1` starts that peer's template tunnels on connect. Everything is torn down when `conn.closed()` resolves, and the `PeerSession` is detached.
 
 ---
 
@@ -887,7 +883,7 @@ graph LR
 - **UDP Tunneling**: Additional framing overhead (2 bytes per packet)
 - **Relay Mode**: Higher latency, potentially lower throughput
 - **Direct Mode**: Near-native performance with encryption overhead
-- **Concurrency**: A per-connection semaphore caps concurrent forwarded data streams (`max_streams`, default 100) across both directions.
+- **Concurrency**: A single global semaphore caps concurrent forwarded data streams (`max_streams`, default 100) across both directions and all connected peers.
 
 ---
 
@@ -923,7 +919,6 @@ has its own internal reconnect loop; the process only exits on fatal errors.
 | 1 | General error | Unexpected/uncategorized failures |
 | 2 | Configuration | Missing/invalid node id, invalid token format, bad request address or `allowed_sources` CIDR |
 | 3 | Authentication | Token rejected by peer, auth response timeout |
-| 4 | Rejected | A different node id tried to bind a session already bound to another peer (`WRONG_PEER_CODE`). Fatal — the dialer stops rather than retrying, since its node id can't match until the listener unbinds or restarts |
 | 10 | Connection failed | Relay timeout, endpoint offline, peer unreachable |
 | 11 | Connection lost | QUIC connection closed after tunnel was established |
 

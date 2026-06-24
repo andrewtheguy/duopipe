@@ -1,6 +1,6 @@
 //! Common endpoint helpers for iroh tunnel connections.
 
-use crate::app_state::{AppState, PathInfo, PathKind, Role};
+use crate::app_state::{AppState, PathInfo, PathKind};
 use crate::config::{
     CongestionController, DEFAULT_SEND_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, TransportTuning,
 };
@@ -493,10 +493,9 @@ pub fn watch_connection_paths(
         let mut last_key = None;
         while let Some(paths) = stream.next().await {
             let info = classify_paths(&paths);
-            match state.role {
-                Role::Dial => state.set_path(info),
-                Role::Listen => state.set_peer_path(&remote_id, info),
-            }
+            // Both roles track the path on the per-peer session (the dialer has a
+            // single peer; the listener has one per connection).
+            state.set_peer_path(&remote_id, info);
             let key = paths_key(&paths);
             if last_key.as_ref() != Some(&key) {
                 info!("Connection: {}", format_paths(&paths));

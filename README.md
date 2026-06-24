@@ -13,7 +13,7 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 **Features:**
 - **No account or registration required** — Just download and run
 - **No publicly accessible IPs or port forwarding required** — Automatic NAT hole punching
-- **One connection, many tunnels in both directions** — A single P2P link carries any number of requested tunnels at once, in either direction
+- **Many peers, many tunnels in both directions** — A listener serves several dialers at once; each P2P link carries any number of requested tunnels, in either direction, with its own tunnel set
 - **Full TCP and UDP support** — Seamlessly tunnel any TCP or UDP traffic
 - **Cross-platform** — Works on Linux, macOS, and Windows
 - **No root required** — Runs as unprivileged user
@@ -36,7 +36,7 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 
 ## Overview
 
-duopipe runs as a single symmetric peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. Two peers establish **one** iroh P2P connection, and over that single connection they run **many tunnels in both directions at once**. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
+duopipe runs as a symmetric peer launched in one of two modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each of which opens an interactive terminal UI. A listener accepts **many dialers at once** over one iroh endpoint; each connection runs **many tunnels in both directions at once**, with its own per-peer tunnel set. Each tunnel is *requested* — SSH `-L`–style local forwarding: a peer binds a local listener and asks the other side to connect out to a remote source.
 
 On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the connection is asymmetric only because QUIC needs a dialer and an acceptor:
 
@@ -45,12 +45,12 @@ On startup, the TUI asks **"Connect to an existing instance?"**. Setting up the 
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run. This means the listener's node id **changes every run** and must be re-copied to the dialer each time. (This avoids same-machine locking that could otherwise produce duplicate node ids.)
 
-Once the connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. iroh provides NAT traversal with relay fallback and automatic discovery.
+Once a connection is established and authenticated, tunnels flow both ways: **either** peer may request tunnels of the other. A listener can hold several connections at once (laptop + phone + VPS all dialing one homelab box); tunnel state is **per peer**, so in the TUI you select a peer and manage its tunnels independently (`Tab` switches focus between the peer list and the selected peer's tunnels). iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
 > **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS); the same auth token lives on each of your machines. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
 > - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth token is per-run too. Move the auth token between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in nostr mode the node id is then discovered automatically.
-> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, the active peer, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
+> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, every connected peer, and each tunnel's health — and **start/stop tunnels by hand**. Nothing forwards on its own; you decide *what* to expose and *when*. Config `[[request]]` entries are a *prefilled template* (they seed each peer's tunnel list to save typing), not instructions to auto-open anything.
 > - **Trust assumed, exposure narrowly scoped.** Either peer may *request* tunnels of the other, which is fine between your own devices; still keep each side's `[allowed_sources]` allowlist as tight as the task needs.
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
@@ -294,7 +294,7 @@ duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1`
 |---------|---------|
 | `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start every configured `[[request]]` once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start a peer's template tunnels once connected. Test-only: the interactive TUI always starts tunnels by hand, so this is the only way to exercise tunnels headlessly. |
 | `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
 
 In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
@@ -326,7 +326,7 @@ Both interactive subcommands launch the same TUI; they differ only in mode. The 
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
-| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all requests on connect. |
+| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start a peer's template tunnels on connect. |
 
 ## Configuration Files
 
@@ -383,9 +383,9 @@ auth_token_file = "~/.config/duopipe/auth_token.txt"
 # relay_urls = ["https://relay.example.com"]
 # relay_only = false           # requires at least one relay_urls entry
 dns_server = "https://dns.example.com/pkarr"
-max_streams = 100   # max concurrent forwarded connections across all tunnels
+max_streams = 100   # max concurrent forwarded connections across all tunnels and peers
 
-# Tunnel requests: bind locally, ask the peer to connect out to source.
+# Tunnel requests (prefilled template): bind locally, ask the peer to connect out to source.
 [[request]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
@@ -449,7 +449,6 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 | 1 | General/unexpected error | Use judgment |
 | 2 | Configuration error (invalid arguments, bad token format, missing fields) | No — fix configuration |
 | 3 | Authentication failure (token rejected, auth timeout) | No — fix credentials |
-| 4 | Rejected: the listener's session is bound to a different node id | No — unbind/restart the listener, or dial from the bound node |
 | 10 | Connection establishment failed (timeout, relay failure, peer unreachable) | Only if it worked before |
 | 11 | Connection lost after tunnels were established | Yes — always retry |
 

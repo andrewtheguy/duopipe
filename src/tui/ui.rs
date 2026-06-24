@@ -10,15 +10,28 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use tui_input::Input;
 
 use super::textinput::render_spans;
-use crate::app_state::{AppSnapshot, ConnStatus, PeerRow, Role, TunnelRow, TunnelStatus};
+use crate::app_state::{AppSnapshot, ConnStatus, PeerSnapshot, Role, TunnelRow, TunnelStatus};
 use crate::logging::LogLine;
+
+/// Which pane the dashboard cursor is acting on. `Tab` toggles between selecting a
+/// peer and selecting a tunnel within the selected peer.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pane {
+    #[default]
+    Tunnels,
+    Peers,
+}
 
 /// View state owned by the TUI loop (not shared with the runtime).
 #[derive(Default)]
 pub struct UiState {
     /// Lines scrolled up from the bottom of the log pane. 0 = follow tail.
     pub log_scroll: usize,
-    /// Index of the highlighted tunnel row (toggled with Enter).
+    /// Which pane the cursor acts on (peer list vs the selected peer's tunnels).
+    pub focus: Pane,
+    /// Index of the highlighted peer row (the peer tunnels act on).
+    pub selected_peer: usize,
+    /// Index of the highlighted tunnel row within the selected peer (toggled with Enter).
     pub selected: usize,
     /// When `Some`, the "add request" modal is open and captures all keystrokes.
     pub add_form: Option<AddRequestForm>,
@@ -98,8 +111,18 @@ impl AddRequestForm {
     }
 }
 
+/// The tunnels of the peer the cursor is currently on (empty when no peer is
+/// selected / connected).
+fn selected_tunnels<'a>(snap: &'a AppSnapshot, ui: &UiState) -> &'a [TunnelRow] {
+    snap.peers
+        .get(ui.selected_peer)
+        .map(|p| p.tunnels.as_slice())
+        .unwrap_or(&[])
+}
+
 pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
-    let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
+    let tunnels = selected_tunnels(snap, ui);
+    let tunnel_rows = tunnels.len().max(1) as u16 + 2; // header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
     let [header_area, tunnels_area, peers_area, logs_area] = Layout::vertical([
         Constraint::Length(5),
@@ -115,7 +138,7 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
         snap.role == Role::Listen && snap.token_generated && !ui.token_banner_hidden;
     render_header(frame, header_area, snap, show_token_banner);
     render_tunnels(frame, tunnels_area, snap, ui);
-    render_peers(frame, peers_area, snap);
+    render_peers(frame, peers_area, snap, ui);
     render_logs(frame, logs_area, logs, ui);
 }
 
@@ -142,6 +165,11 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
     ];
 
     if snap.role == Role::Dial {
+        let path = snap
+            .peers
+            .first()
+            .map(|p| p.path.describe())
+            .unwrap_or_else(|| "—".to_string());
         lines.push(Line::from(vec![
             Span::raw("status: "),
             Span::styled(
@@ -149,7 +177,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
                 Style::default().fg(conn_color(&snap.conn_status)),
             ),
             Span::raw("   path: "),
-            Span::raw(snap.path.describe()),
+            Span::raw(path),
         ]));
     } else if show_token_banner {
         // Listen + freshly generated token, not yet dismissed: surface the token so
@@ -291,15 +319,19 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
+    let focused = ui.focus == Pane::Tunnels;
+    let tunnels = selected_tunnels(snap, ui);
     let header = Row::new(["", "NAME", "SPEC", "STATUS", "DETAIL"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = if snap.tunnels.is_empty() {
+    let rows: Vec<Row> = if snap.peers.is_empty() {
+        vec![Row::new(["", "", "(no peer connected)", "", ""])]
+    } else if tunnels.is_empty() {
         vec![Row::new(["", "", "(no tunnels configured)", "", ""])]
     } else {
-        snap.tunnels
+        tunnels
             .iter()
             .enumerate()
-            .map(|(i, t)| tunnel_row(t, i == ui.selected))
+            .map(|(i, t)| tunnel_row(t, focused && i == ui.selected))
             .collect()
     };
     let widths = [
@@ -309,11 +341,21 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
         Constraint::Length(10),
         Constraint::Percentage(25),
     ];
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] "),
-    );
+    // Name the peer these tunnels belong to so it is clear which connection a
+    // start/stop targets.
+    let who = snap
+        .peers
+        .get(ui.selected_peer)
+        .map(|p| short_id(&p.remote_id))
+        .unwrap_or_else(|| "—".to_string());
+    let title = if focused {
+        format!(" Tunnels · {who}  [↑/↓ select · Enter start/stop · a add · x/Del delete · Tab peers] ")
+    } else {
+        format!(" Tunnels · {who}  [Tab to focus] ")
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(table, area);
 }
 
@@ -337,46 +379,37 @@ fn tunnel_row(t: &TunnelRow, selected: bool) -> Row<'static> {
     }
 }
 
-fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
+fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
+    let focused = ui.focus == Pane::Peers;
     let title = match snap.role {
-        // The session binds to the first peer; `u` clears that binding.
-        Role::Listen => " Connected peers  [u unbind] ",
+        Role::Listen if focused => " Connected peers  [↑/↓ select · Tab tunnels] ",
+        Role::Listen => " Connected peers  [Tab to focus] ",
         Role::Dial => " Connection ",
     };
-    let header = Row::new(["REMOTE ID", "SINCE", "PATH"])
+    let header = Row::new(["", "REMOTE ID", "SINCE", "PATH"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = match snap.role {
-        Role::Listen => {
-            if !snap.peers.is_empty() {
-                snap.peers.iter().map(peer_row).collect()
-            } else if let Some(bound) = &snap.bound_peer {
-                // Bound but disconnected: the session is reserved for this node id
-                // until it reconnects or the operator presses `u`.
-                vec![Row::new(vec![
-                    Cell::from(short_id(bound)),
-                    Cell::from("(bound — waiting)"),
-                    Cell::from("press u to unbind"),
-                ])]
-            } else {
-                vec![Row::new(["", "(waiting for peers)", ""])]
-            }
-        }
-        Role::Dial => {
-            let remote = snap
-                .peers
-                .first()
-                .map(|p| short_id(&p.remote_id))
-                .unwrap_or_else(|| "-".to_string());
-            vec![Row::new(vec![
-                Cell::from(remote),
-                Cell::from(snap.conn_status.label()),
-                Cell::from(snap.path.describe()),
-            ])]
-        }
+    let rows: Vec<Row> = if snap.peers.is_empty() {
+        let waiting = match snap.role {
+            Role::Listen => "(waiting for peers)",
+            Role::Dial => "(connecting…)",
+        };
+        vec![Row::new(vec![
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(waiting),
+            Cell::from(snap.conn_status.label()),
+        ])]
+    } else {
+        snap.peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| peer_row(p, focused && i == ui.selected_peer))
+            .collect()
     };
 
     let widths = [
+        Constraint::Length(2),
         Constraint::Length(16),
         Constraint::Length(16),
         Constraint::Min(20),
@@ -387,12 +420,19 @@ fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
     frame.render_widget(table, area);
 }
 
-fn peer_row(p: &PeerRow) -> Row<'static> {
-    Row::new(vec![
+fn peer_row(p: &PeerSnapshot, selected: bool) -> Row<'static> {
+    let cursor = if selected { "›" } else { " " };
+    let row = Row::new(vec![
+        Cell::from(cursor),
         Cell::from(short_id(&p.remote_id)),
         Cell::from(fmt_elapsed(p.connected_since.elapsed())),
         Cell::from(p.path.describe()),
-    ])
+    ]);
+    if selected {
+        row.style(Style::default().add_modifier(Modifier::REVERSED))
+    } else {
+        row
+    }
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
