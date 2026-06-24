@@ -555,11 +555,25 @@ impl Drop for PublisherGuard {
     }
 }
 
-/// Interval between node-id republishes. Replaceable nostr events can be dropped by
-/// relays at varying times, so we refresh periodically while listening. The same loop
-/// re-checks for a name conflict each cycle (conflict detection happens only at these
-/// nostr touch-points — there is no separate monitor).
+/// Steady-state interval between node-id republishes. Replaceable nostr events can be
+/// dropped by relays at varying times, so we refresh periodically while listening. The
+/// same loop re-checks for a name conflict each cycle (conflict detection happens only
+/// at these nostr touch-points — there is no separate monitor).
 const NODE_ID_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Interval for the initial conflict-detection burst. Startup deliberately does no
+/// nostr lookup (so a sole device's restart, whose own stale relay record carries a
+/// different ephemeral node id, is never a false conflict). That means a second device
+/// launched against a live name would otherwise go unnoticed until the first 300s
+/// republish. To detect it promptly we re-check a few times soon after the initial
+/// claim: each re-check publishes first, so it still sees our *own* fresh record when
+/// there is no competitor (no false positive) and a foreign newer record when there is.
+const STARTUP_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Number of publish cycles that use [`STARTUP_RECHECK_INTERVAL`] before settling into
+/// [`NODE_ID_REPUBLISH_INTERVAL`]. Bounds the fast phase to ~1 minute after launch so
+/// steady state remains the slow, "no continuous monitoring" cadence.
+const STARTUP_RECHECK_CYCLES: u32 = 6;
 
 /// Short prefix of a node id for human-readable conflict messages.
 fn short_node_id(id: &str) -> String {
@@ -615,6 +629,10 @@ async fn run_node_id_publisher(params: PublisherParams) {
 
     let mut commands = state.subscribe_name();
     let mut first = true;
+    // Count of completed publishes; the first few cycles re-check quickly (see
+    // STARTUP_RECHECK_CYCLES) so a same-name conflict surfaces without waiting a full
+    // republish interval.
+    let mut publishes: u32 = 0;
 
     loop {
         // Decide whether this cycle can publish. Startup keys off the local flag (never
@@ -722,10 +740,17 @@ async fn run_node_id_publisher(params: PublisherParams) {
         }
         state.set_name_conflict(NameConflict::Inactive);
         first = false;
+        publishes = publishes.saturating_add(1);
 
+        // Re-check quickly for the first few cycles, then settle to the slow cadence.
+        let interval = if publishes <= STARTUP_RECHECK_CYCLES {
+            STARTUP_RECHECK_INTERVAL
+        } else {
+            NODE_ID_REPUBLISH_INTERVAL
+        };
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(NODE_ID_REPUBLISH_INTERVAL) => {}
+            _ = tokio::time::sleep(interval) => {}
         }
     }
 }
