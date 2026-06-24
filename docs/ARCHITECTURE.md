@@ -434,7 +434,7 @@ graph TB
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
-        K[nostr_relay_urls]
+        K[name — peer identifier for nostr<br/>nostr_relay_urls]
     end
 
     A --> S[Validation]
@@ -702,10 +702,11 @@ sequenceDiagram
 
 Because the node id is ephemeral, **nostr mode** (active whenever a config file is loaded) uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Configless mode (no config file) does not use nostr — the dialer enters the node id by hand. Implemented in `nostr_discovery.rs`:
 
-- **Shared key from the auth token.** Both peers derive the same nostr keypair via `sha256("duopipe:nostr-rendezvous:v1" || auth_token)`. No extra identifier is exchanged — the token both sides already share *is* the rendezvous. Discovery therefore only works when the token is shared (which the dialer needs anyway, for auth).
-- **Publish (listener).** `run_listen` spawns a background task that publishes a replaceable event (NIP-78 kind 30078, `d` tag `duopipe:nodeid`, content = the current node id string) at startup and refreshes it every ~5 minutes. Relay failures are logged but non-fatal.
-- **Lookup on demand (dialer).** When no node id was supplied directly, `run_dial` looks it up (filter by author = derived pubkey + kind + `d` tag, newest wins) at the top of *every* connect attempt, so a listener that restarted with a fresh node id self-heals on the next attempt. No persistent subscription.
-- **Not encrypted.** The node id is public; the auth token still gates the actual connection. Relays default to `DEFAULT_NOSTR_RELAYS`, overridable via `nostr_relay_urls`. To skip nostr entirely, run configless (no config file).
+- **Shared author key from the auth token.** Both peers derive the same nostr *author* keypair via `sha256("duopipe:nostr-rendezvous:v1" || auth_token)`. The token both sides share *is* the rendezvous, so discovery only works when it's shared (which the dialer needs anyway, for auth).
+- **Per-peer `d` tag from the `name`.** Each peer is distinguished by its `name`: the `d` tag is `duopipe:nodeid:<sha256("duopipe:peer-id:v1" || auth_token || name)>` (`identifier_dtag`). Salting the hash with the auth token stops a short, low-entropy name from being guessed or enumerated on relays. Several peers can share one auth token and stay individually addressable; duplicate names just clobber (replaceable, newest wins).
+- **Publish (listener).** `run_listen` spawns a background task that publishes a replaceable event (NIP-78 kind 30078, `d` tag = this peer's name tag, content = the current node id string) at startup and refreshes it every ~5 minutes. Relay failures are logged but non-fatal. Because the `d` tag is keyed on the stable name, a restart replaces the peer's own record — no stale accumulation.
+- **Lookup on demand (dialer).** A nostr-mode dialer types the *target's* `name`; `run_dial` resolves it (filter by author = derived pubkey + kind + name's `d` tag, newest wins) at the top of *every* connect attempt, so a listener that restarted with a fresh node id self-heals on the next attempt. No persistent subscription.
+- **Not encrypted.** The node id is public; the auth token still gates the actual connection. Relays default to `DEFAULT_NOSTR_RELAYS`, overridable via `nostr_relay_urls`. To dial a raw node id without nostr, use quick mode.
 
 Hermetic tests bypass nostr entirely: when `DUOPIPE_PEER_NODE_ID` is set the dialer dials that id directly, so the test suite needs no live relays.
 

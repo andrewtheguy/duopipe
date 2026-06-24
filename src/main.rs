@@ -170,6 +170,7 @@ impl TestEnv {
                 Ok(ResolvedPeer {
                     role: Role::Dial,
                     peer_node_id: Some(id),
+                    peer_identifier: None,
                     auth_token,
                     token_generated: false,
                     allowed_sources,
@@ -188,6 +189,7 @@ impl TestEnv {
                 Ok(ResolvedPeer {
                     role: Role::Listen,
                     peer_node_id: None,
+                    peer_identifier: None,
                     auth_token,
                     token_generated,
                     allowed_sources,
@@ -230,6 +232,7 @@ async fn run_peer_headless(
         // DUOPIPE_PEER_NODE_ID, so tests stay hermetic (no live relays).
         nostr_relays: vec![],
         nostr_discovery: false,
+        nostr_identifier: None,
         relay_urls,
         relay_only,
         dns_server: cfg.dns_server.clone(),
@@ -398,6 +401,17 @@ async fn run_start_peer(
         .into());
     }
 
+    // Nostr mode requires a `name`: each peer publishes its node id under this short
+    // identifier, and a dialer types it to look the peer up.
+    let peer_name = cfg.name.as_ref().map(|n| n.trim()).filter(|n| !n.is_empty());
+    if nostr_discovery_enabled && peer_name.is_none() {
+        return Err(TunnelError::config(anyhow::anyhow!(
+            "Nostr mode requires a `name` (short identifier) in the config; a dialer uses it to find this peer."
+        ))
+        .into());
+    }
+    let peer_name = peer_name.map(|n| n.to_string());
+
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
         logs: log_buffer,
@@ -411,6 +425,7 @@ async fn run_start_peer(
         config_auth_token,
         nostr_relays,
         nostr_discovery: nostr_discovery_enabled,
+        peer_name,
     };
 
     tui::run_tui(launch).await

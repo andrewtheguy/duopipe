@@ -40,7 +40,8 @@ enum SetupPhase {
     /// Listen only, when no config token: confirm a fresh token will be
     /// generated for this run before generating it.
     ConfirmGenerateToken,
-    /// Dial only: the existing instance's node id.
+    /// Dial only: the dial target. In nostr mode this is the peer's short
+    /// identifier (looked up via nostr); in quick mode it is a full node id.
     NodeId,
     /// Dial only: the auth token (skipped when one came from config/env).
     AuthToken,
@@ -91,10 +92,13 @@ pub struct SetupState {
     /// Whether the dial role was chosen. The role can't be inferred from
     /// `node_id` because a dialer may leave it blank and discover it via nostr.
     dial: bool,
-    /// Whether nostr node-id discovery is available, so the dial node-id prompt may
-    /// be left blank (the node id is then looked up at runtime via the auth token).
+    /// Whether nostr discovery is active (nostr mode). When true the dialer enters a
+    /// short peer *identifier* (looked up at runtime); when false (quick mode) it
+    /// enters a full node id.
     nostr_discovery: bool,
     node_id: Option<EndpointId>,
+    /// Target peer's nostr identifier (nostr-mode dial); `None` in quick mode.
+    peer_identifier: Option<String>,
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
     token_generated: bool,
@@ -122,6 +126,7 @@ impl SetupState {
             dial: false,
             nostr_discovery,
             node_id: None,
+            peer_identifier: None,
             auth_token: None,
             token_generated: false,
             buffer: Input::default(),
@@ -142,9 +147,9 @@ fn finalize_listen(state: &mut SetupState) -> Step {
     Step::Done(build_resolved(state))
 }
 
-/// After the node id is resolved (`Some` = entered manually, `None` = discover via
-/// nostr at runtime), either finish (a config/env token is present) or advance to
-/// the token prompt.
+/// After the dial target is resolved (a node id in quick mode, or a peer identifier
+/// in nostr mode), either finish (a config/env token is present) or advance to the
+/// token prompt.
 fn proceed_after_node_id(state: &mut SetupState) -> Step {
     match state.config_auth_token.clone() {
         Some(token) => {
@@ -170,6 +175,7 @@ fn build_resolved(state: &SetupState) -> ResolvedPeer {
     ResolvedPeer {
         role,
         peer_node_id: state.node_id,
+        peer_identifier: state.peer_identifier.clone(),
         auth_token: state.auth_token.clone().unwrap_or_default(),
         token_generated: state.token_generated,
         allowed_sources: state.allowed_sources.clone(),
@@ -300,19 +306,26 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
             }
             KeyCode::Enter => {
                 let raw = state.buffer.value().trim();
-                if raw.is_empty() {
-                    if state.nostr_discovery {
-                        // Blank = discover the node id via nostr at runtime.
+                if state.nostr_discovery {
+                    // Nostr mode: the entry is the target peer's short identifier,
+                    // looked up via nostr at runtime.
+                    if raw.is_empty() {
+                        state.error = Some("Enter the peer's identifier".to_string());
+                        Step::Continue
+                    } else {
+                        state.peer_identifier = Some(raw.to_string());
                         state.node_id = None;
                         proceed_after_node_id(state)
-                    } else {
-                        state.error = Some("Enter the peer's node id".to_string());
-                        Step::Continue
                     }
+                } else if raw.is_empty() {
+                    // Quick mode: a full node id is required.
+                    state.error = Some("Enter the peer's node id".to_string());
+                    Step::Continue
                 } else {
                     match raw.parse::<EndpointId>() {
                         Ok(id) => {
                             state.node_id = Some(id);
+                            state.peer_identifier = None;
                             proceed_after_node_id(state)
                         }
                         Err(_) => {
@@ -437,13 +450,16 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
             lines.push(Line::from("Proceed? (Y/n)"));
         }
         SetupPhase::NodeId => {
-            lines.push(Line::from("Existing instance node id:"));
-            lines.push(field_input_line(&state.buffer, true));
             if state.nostr_discovery {
+                lines.push(Line::from("Peer identifier:"));
+                lines.push(field_input_line(&state.buffer, true));
                 lines.push(Line::from(Span::styled(
-                    "  leave blank to discover it via nostr (uses the shared auth token)",
+                    "  the target peer's name (its config `name`); looked up via nostr",
                     Style::default().fg(Color::DarkGray),
                 )));
+            } else {
+                lines.push(Line::from("Existing instance node id:"));
+                lines.push(field_input_line(&state.buffer, true));
             }
         }
         SetupPhase::AuthToken => {
@@ -615,30 +631,45 @@ mod tests {
     }
 
     #[test]
-    fn dial_blank_node_id_discovers_via_nostr_when_enabled() {
-        // With discovery on, a dialer may leave the node id blank: it resolves to a
-        // Dial with no node id (looked up at runtime via the auth token).
+    fn dial_nostr_mode_takes_identifier_not_node_id() {
+        // In nostr mode the dialer types a short identifier; it resolves to a Dial
+        // with a peer_identifier and no node id (looked up at runtime).
         let token = auth::generate_token();
         let mut s = SetupState::new(Some(token.clone()), from_config(), true);
         choose_dial(&mut s);
         assert_eq!(s.phase, SetupPhase::NodeId);
-        // Enter with an empty buffer -> discover.
+        type_str(&mut s, "web1");
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Dial);
-                assert!(r.peer_node_id.is_none(), "node id is discovered at runtime");
+                assert_eq!(r.peer_identifier.as_deref(), Some("web1"));
+                assert!(r.peer_node_id.is_none(), "nostr mode dials by identifier");
                 assert_eq!(r.auth_token, token);
             }
-            _ => panic!("expected Done(Dial) with a blank node id"),
+            _ => panic!("expected Done(Dial) with a peer identifier"),
         }
     }
 
     #[test]
-    fn dial_blank_node_id_rejected_when_discovery_disabled() {
+    fn dial_nostr_mode_blank_identifier_rejected() {
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), true);
+        choose_dial(&mut s);
+        assert_eq!(s.phase, SetupPhase::NodeId);
+        // Blank identifier keeps the prompt open with an error.
+        assert!(matches!(
+            handle_key(key(KeyCode::Enter), &mut s),
+            Step::Continue
+        ));
+        assert!(s.error.is_some());
+        assert_eq!(s.phase, SetupPhase::NodeId);
+    }
+
+    #[test]
+    fn dial_quick_mode_blank_node_id_rejected() {
         let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false);
         choose_dial(&mut s);
         assert_eq!(s.phase, SetupPhase::NodeId);
-        // Blank entry with discovery off keeps the prompt open with an error.
+        // Blank entry in quick mode keeps the prompt open with an error.
         assert!(matches!(
             handle_key(key(KeyCode::Enter), &mut s),
             Step::Continue

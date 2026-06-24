@@ -46,6 +46,11 @@ pub struct PeerConfig {
     /// `DUOPIPE_AUTH_TOKEN` env var) is the only way to supply a token; a fresh
     /// listening instance generates one if neither is set.
     pub auth_token_file: Option<PathBuf>,
+    /// This peer's short, memorable identifier for nostr discovery. Required in
+    /// nostr mode: a listener publishes its node id under this name, and a dialer
+    /// types it to look the peer up — so several peers can share one auth token and
+    /// still be reached individually.
+    pub name: Option<String>,
     /// Nostr relay URLs used for node-id discovery (nostr mode only). Absent ⇒ a
     /// built-in set of public relays (see `nostr_discovery::DEFAULT_NOSTR_RELAYS`).
     pub nostr_relay_urls: Option<Vec<String>>,

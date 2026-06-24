@@ -119,6 +119,10 @@ pub struct PeerConfig {
     /// identity itself is always ephemeral. Disabled in headless test mode, where
     /// the dialer's node id is wired directly.
     pub nostr_discovery: bool,
+    /// Short identifier for nostr discovery (role-dependent): when listening, the
+    /// name this peer publishes its node id under; when dialing, the target peer's
+    /// name to look up. `None` outside nostr mode.
+    pub nostr_identifier: Option<String>,
     /// Iroh relay URLs.
     pub relay_urls: Vec<String>,
     /// Whether to force relay-only mode (disables direct P2P).
@@ -147,6 +151,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("auth_token", &"[REDACTED]")
             .field("nostr_relays", &self.nostr_relays)
             .field("nostr_discovery", &self.nostr_discovery)
+            .field("nostr_identifier", &self.nostr_identifier)
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
             .field("dns_server", &self.dns_server)
@@ -201,19 +206,19 @@ async fn run_listen(config: PeerConfig) -> Result<()> {
     log::info!("Dial this instance with the node id and auth token.");
     log::info!("Waiting for peers to connect...");
 
-    // Publish the (ephemeral) node id to nostr so a peer sharing the auth token can
-    // discover it without a manual node-id exchange. Runs in the background and
-    // republishes periodically; relay failures are logged but non-fatal (peers who
-    // already have the node id still connect directly).
-    let _publisher = if config.nostr_discovery {
-        Some(spawn_node_id_publisher(
+    // Publish the (ephemeral) node id to nostr under this peer's identifier so a peer
+    // sharing the auth token can discover it by name without a manual node-id
+    // exchange. Runs in the background and republishes periodically; relay failures
+    // are logged but non-fatal (peers who already have the node id still connect).
+    let _publisher = match (config.nostr_discovery, config.nostr_identifier.clone()) {
+        (true, Some(identifier)) => Some(spawn_node_id_publisher(
             config.auth_token.clone(),
+            identifier,
             endpoint_id,
             config.nostr_relays.clone(),
             config.status.shutdown.clone(),
-        ))
-    } else {
-        None
+        )),
+        _ => None,
     };
 
     let shutdown = config.status.shutdown.clone();
@@ -276,13 +281,16 @@ const NODE_ID_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 /// it every [`NODE_ID_REPUBLISH_INTERVAL`] until shutdown.
 fn spawn_node_id_publisher(
     auth_token: String,
+    identifier: String,
     node_id: EndpointId,
     relays: Vec<String>,
     shutdown: CancellationToken,
 ) -> PublisherGuard {
     PublisherGuard(tokio::spawn(async move {
         loop {
-            match crate::nostr_discovery::publish_node_id(&auth_token, &node_id, &relays).await {
+            match crate::nostr_discovery::publish_node_id(&auth_token, &identifier, &node_id, &relays)
+                .await
+            {
                 Ok(()) => log::info!("Published node id to nostr for peer discovery"),
                 Err(e) => log::warn!("Failed to publish node id to nostr: {e:#}"),
             }
@@ -299,9 +307,9 @@ fn spawn_node_id_publisher(
 // ============================================================================
 
 async fn run_dial(config: PeerConfig) -> Result<()> {
-    if config.peer_node_id.is_none() && !config.nostr_discovery {
+    if config.peer_node_id.is_none() && config.nostr_identifier.is_none() {
         anyhow::bail!(
-            "dial role requires a peer node id (provide one, or enable nostr discovery)"
+            "dial role requires a peer node id (quick mode) or a peer identifier (nostr mode)"
         );
     }
 
@@ -335,24 +343,34 @@ async fn run_dial(config: PeerConfig) -> Result<()> {
     loop {
         config.status.set_conn_status(ConnStatus::Connecting);
 
-        // Resolve the target node id. If one was supplied directly, use it as-is.
-        // Otherwise look it up on nostr now — re-resolving every attempt means a
-        // listener that restarted with a fresh ephemeral id is picked up here.
+        // Resolve the target node id. If one was supplied directly (quick mode), use
+        // it as-is. Otherwise look it up on nostr by the target's identifier —
+        // re-resolving every attempt means a listener that restarted with a fresh
+        // ephemeral id (same identifier) is picked up here.
         let target: Result<EndpointId> = match peer_id {
             Some(id) => Ok(id),
-            None => tokio::select! {
-                _ = shutdown.cancelled() => break,
-                r = crate::nostr_discovery::lookup_node_id(
-                    &config.auth_token,
-                    &config.nostr_relays,
-                ) => match r {
-                    Ok(id) => {
-                        log::info!("Discovered peer node id via nostr: {id}");
-                        Ok(id)
-                    }
-                    Err(e) => Err(e.context("nostr node-id lookup failed")),
-                },
-            },
+            None => {
+                // Guaranteed Some: run_dial bails earlier unless a node id or
+                // identifier is set, and peer_id is None here.
+                let identifier = config
+                    .nostr_identifier
+                    .as_deref()
+                    .expect("dial without a node id requires a nostr identifier");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    r = crate::nostr_discovery::lookup_node_id(
+                        &config.auth_token,
+                        identifier,
+                        &config.nostr_relays,
+                    ) => match r {
+                        Ok(id) => {
+                            log::info!("Discovered peer '{identifier}' node id via nostr: {id}");
+                            Ok(id)
+                        }
+                        Err(e) => Err(e.context("nostr node-id lookup failed")),
+                    },
+                }
+            }
         };
 
         let connect = match target {
@@ -1085,6 +1103,7 @@ mod tests {
             auth_token: token.to_string(),
             nostr_relays: vec![],
             nostr_discovery: false,
+            nostr_identifier: None,
             relay_urls: vec![],
             relay_only: false,
             dns_server: Some("none".to_string()),

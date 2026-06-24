@@ -147,7 +147,7 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **nostr mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, the listener publishes its current node id, and the dialer looks it up automatically (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe quick`) nostr is off and the dialer enters the node id manually. The node id is always shown in the TUI header.
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **nostr mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, each listener publishes its current node id under its `name`, and a dialer looks it up by typing the target peer's `name` (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe quick`) nostr is off and the dialer enters the node id manually. The node id is always shown in the TUI header.
 
 ## Authentication
 
@@ -236,9 +236,9 @@ On the first machine, point at a config that declares the requests (see [Configu
 duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. The auth token must be supplied (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); the listener then publishes its current node id to nostr so the dialer can find it. The TUI header shows the **node id** and the **auth token**.
+When the TUI asks **"Connect to an existing instance?"**, answer **No**. This instance becomes the listener. The config must set a `name` and supply the auth token (config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`); the listener then publishes its current node id to nostr under that `name` so a dialer can find it by name. The TUI header shows the **node id** and the **auth token**.
 
-> **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — the dialer discovers it via the shared auth token.
+> **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — the dialer finds it by the listener's `name`.
 
 ### 2. Start the dialing instance
 
@@ -248,7 +248,7 @@ On the second machine (also pointed at a config that declares its requests):
 duopipe nostr -c ./peer.toml
 ```
 
-When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Leave the **node id** blank to discover it via nostr (or enter it manually). The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
+When the TUI asks **"Connect to an existing instance?"**, answer **Yes**. Type the **identifier** of the peer you want — the listener's `name` (e.g. `web1`) — and duopipe resolves it to that peer's current node id via nostr. The **auth token** comes from config or the `DUOPIPE_AUTH_TOKEN` env var and is validated before connecting.
 
 Once connected, the requests you start in the TUI flow over the single connection. For example, a config with:
 
@@ -313,7 +313,7 @@ Both interactive subcommands launch the same TUI; they differ only in mode. The 
 
 ### nostr (config-driven mode)
 
-`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It **requires a provided auth token** (the nostr rendezvous secret) and fails fast if none is supplied via config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config.
+`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It **requires a provided auth token** (the nostr rendezvous secret) and a **`name`** (this peer's short identifier); it fails fast if either is missing. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -338,11 +338,11 @@ Config files are used by `duopipe nostr`: run it with no flag to load the defaul
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-`duopipe nostr` requires a provided auth token. The config holds the tunnel requests, the path to the auth token, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target node id** are chosen interactively in the TUI, not in the config.
+`duopipe nostr` requires a provided auth token and a `name`. The config holds the tunnel requests, the path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The connection **role** and the dialer's **target identifier** are chosen interactively in the TUI, not in the config.
 
 ### Node-id discovery
 
-Nostr discovery is active in `duopipe nostr`. The iroh node id is ephemeral, so the listener publishes its current node id to **nostr** and the dialer looks it up — no manual copy needed. Both peers derive the same nostr key from the shared auth token, so nothing extra is exchanged (the node id is public; the auth token still gates the connection, and the value is not encrypted). To skip nostr entirely, run `duopipe quick` and enter the node id by hand.
+Nostr discovery is active in `duopipe nostr`. The iroh node id is ephemeral, so each listener publishes its current node id to **nostr** under its `name`, and a dialer looks it up by typing the target peer's `name` — no manual copy needed. Both peers derive the same nostr *author* key from the shared auth token; each peer's record is then placed under a `d` tag of `duopipe:nodeid:<sha256(auth_token || name)>`, so several peers can share one auth token yet stay individually addressable (duplicate names just mean newest-wins). The name hash is **salted with the auth token**, so a short name can't be guessed or enumerated on relays. The node id is public — the auth token still gates the connection — so it is not encrypted. Because the `d` tag is keyed on the stable `name`, a listener restart replaces its own record (no stale entries) and the dialer re-resolves by name on each reconnect. To dial a raw node id without nostr, use `duopipe quick`.
 
 ```toml
 # Relays default to a built-in public set; override if desired:
@@ -371,7 +371,11 @@ The same config shape is used by both peers; the role is chosen interactively at
 
 ```toml
 # Example peer configuration.
-# The connection role and dial target node id are chosen interactively in the TUI.
+# The connection role and the dialer's target identifier are chosen interactively.
+
+# This peer's short identifier (required in nostr mode). A dialer types it to find
+# this peer; the listener publishes its node id under this name.
+name = "web1"
 
 # Shared auth token — supply via a file (here) or the DUOPIPE_AUTH_TOKEN env var.
 auth_token_file = "~/.config/duopipe/auth_token.txt"
