@@ -639,7 +639,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
         // the relay record, so a fresh node id each run is not a false conflict);
         // subsequent cycles compare the relay's node id against our own.
         let outcome = if first {
-            match crate::name_conflict::read_flag(&identifier) {
+            match crate::peer_state::read_flag(&identifier) {
                 Some(flag) => CheckOutcome::Conflict {
                     other_node_id: flag.other_node_id,
                 },
@@ -661,7 +661,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
         if let CheckOutcome::Conflict { other_node_id } = outcome {
             let at_startup = first;
             // Stop publishing and remember the conflict so it survives a restart.
-            if let Err(e) = crate::name_conflict::write_flag(&identifier, &other_node_id) {
+            if let Err(e) = crate::peer_state::write_flag(&identifier, &other_node_id) {
                 log::warn!("Could not write name-conflict flag: {e}");
             }
 
@@ -696,7 +696,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
 
             match cmd {
                 NameCommand::TakeOver => {
-                    if let Err(e) = crate::name_conflict::clear_flag(&identifier) {
+                    if let Err(e) = crate::peer_state::clear_flag(&identifier) {
                         log::warn!("Could not clear name-conflict flag: {e}");
                     }
                     state.clear_name_conflict();

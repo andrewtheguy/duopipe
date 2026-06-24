@@ -9,10 +9,10 @@ mod config;
 mod error;
 mod iroh_mode;
 mod logging;
-mod name_conflict;
 mod net;
 mod nostr_discovery;
 mod peer_params;
+mod peer_state;
 mod signaling;
 mod tui;
 
@@ -426,6 +426,32 @@ async fn run_start_peer(
         .into());
     }
     let peer_name = peer_name.map(|n| n.to_string());
+
+    // Hold a process-lifetime exclusive lock on this name's local state file so two
+    // duopipe instances on the same machine can't claim the same nostr name. This is
+    // the same-machine counterpart to the cross-device nostr conflict resolution: it
+    // fails fast at startup (the lock is held for the whole process, so there is no
+    // mid-session local conflict). `_name_lock` must outlive `run_tui`; dropping it on
+    // exit releases the lock. Quick mode (no name) takes no lock.
+    let _name_lock = match peer_name.as_deref() {
+        Some(name) => match peer_state::acquire_name_lock(name) {
+            Ok(lock) => Some(lock),
+            Err(peer_state::NameLockError::Held) => {
+                return Err(TunnelError::config(anyhow::anyhow!(
+                    "Another duopipe process on this machine is already using the name '{name}'. \
+                     Stop it first, or use a different `name` in the config."
+                ))
+                .into());
+            }
+            Err(peer_state::NameLockError::Io(e)) => {
+                return Err(TunnelError::config(anyhow::anyhow!(
+                    "Could not acquire the local name lock for '{name}': {e}"
+                ))
+                .into());
+            }
+        },
+        None => None,
+    };
 
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
