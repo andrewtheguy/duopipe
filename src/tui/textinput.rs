@@ -7,10 +7,14 @@
 //! cursor position so editing mid-string is visible.
 
 use ratatui::crossterm::event::{Event, KeyEvent};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use tui_input::backend::crossterm::to_input_request;
 use tui_input::{Input, InputRequest};
+
+/// Minimum visible width of an input slot. Short values are padded with a dim
+/// underline so an empty or unfocused field still reads as a place to type.
+const FIELD_SLOT_WIDTH: usize = 24;
 
 /// Apply a key press to `input`, dropping inserted characters that `accept`
 /// rejects. Cursor movement and deletion always pass through.
@@ -52,6 +56,32 @@ pub fn render_spans(input: &Input, style: Style) -> Vec<Span<'static>> {
     } else {
         // Cursor at end: a reversed space reads as a trailing block cursor.
         spans.push(Span::styled(" ".to_string(), cursor_style));
+    }
+    spans
+}
+
+/// Render `input` as a fixed-width field: the value (with a block cursor when
+/// `active`) followed by a dim `_` underline filling the slot. The underline keeps
+/// the field visible even when it is empty or unfocused, so the user can see where
+/// to type — otherwise an empty inactive field collapses to nothing.
+pub fn render_field(input: &Input, style: Style, active: bool) -> Vec<Span<'static>> {
+    let value_len = input.value().chars().count();
+    let mut spans = if active {
+        render_spans(input, style)
+    } else if value_len == 0 {
+        Vec::new()
+    } else {
+        vec![Span::styled(input.value().to_string(), style)]
+    };
+    // `render_spans` adds one extra cell for the block cursor only when it sits past
+    // the end of the value; account for that so the underline lines up.
+    let cursor_past_end = active && input.cursor() >= value_len;
+    let used = value_len + usize::from(cursor_past_end);
+    if used < FIELD_SLOT_WIDTH {
+        spans.push(Span::styled(
+            "_".repeat(FIELD_SLOT_WIDTH - used),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     spans
 }

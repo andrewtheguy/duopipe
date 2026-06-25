@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use tui_input::Input;
 
-use super::textinput::render_spans;
+use super::textinput::render_field;
 use crate::app_state::{
     AppSnapshot, ConnStatus, NameConflict, PeerRow, Role, TunnelId, TunnelRow, TunnelStatus,
 };
@@ -434,12 +434,7 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
     let editing = form.editing.is_some();
     let field_line = |label: &str, input: &Input, active: bool| -> Line<'static> {
         let mut spans = vec![Span::raw(format!("{label:<14}"))];
-        let style = Style::default().fg(Color::Cyan);
-        if active {
-            spans.extend(render_spans(input, style));
-        } else {
-            spans.push(Span::styled(input.value().to_string(), style));
-        }
+        spans.extend(render_field(input, Style::default().fg(Color::Cyan), active));
         Line::from(spans)
     };
 
@@ -539,7 +534,11 @@ pub fn render_connect_dialog(frame: &mut Frame, form: &ConnectForm, nostr_discov
     };
 
     let mut field_spans = vec![Span::raw(format!("{label:<10}"))];
-    field_spans.extend(render_spans(&form.target, Style::default().fg(Color::Cyan)));
+    field_spans.extend(render_field(
+        &form.target,
+        Style::default().fg(Color::Cyan),
+        true,
+    ));
 
     let mut lines = vec![
         Line::from(Span::styled(

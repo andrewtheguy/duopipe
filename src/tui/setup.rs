@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tui_input::Input;
 
-use super::textinput::{handle_edit, render_spans};
+use super::textinput::{handle_edit, render_field};
 use crate::app_state::Role;
 use crate::auth;
 use crate::config::{AllowedSources, validate_cidr};
@@ -540,12 +540,7 @@ fn button_span(label: &str, focused: bool) -> Span<'static> {
 /// the value is shown plainly.
 fn field_input_line(buffer: &Input, active: bool) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
-    let style = Style::default().fg(Color::Cyan);
-    if active {
-        spans.extend(render_spans(buffer, style));
-    } else {
-        spans.push(Span::styled(buffer.value().to_string(), style));
-    }
+    spans.extend(render_field(buffer, Style::default().fg(Color::Cyan), active));
     Line::from(spans)
 }
 
