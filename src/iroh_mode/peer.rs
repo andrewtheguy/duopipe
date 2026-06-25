@@ -217,8 +217,15 @@ async fn run_serve_and_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Re
     let shutdown = config.status.shutdown.clone();
 
     let listen_sem = semaphore.clone();
-    let mut listen_task = tokio::spawn(run_listen(listen_cfg, listen_sem));
-    let mut dial_task = tokio::spawn(run_dial_manager(dial_cfg, semaphore));
+    // Tag every record from each half so the single combined log pane is attributable.
+    let mut listen_task = tokio::spawn(crate::logging::scoped(
+        "serve",
+        run_listen(listen_cfg, listen_sem),
+    ));
+    let mut dial_task = tokio::spawn(crate::logging::scoped(
+        "dial",
+        run_dial_manager(dial_cfg, semaphore),
+    ));
 
     let first = tokio::select! {
         r = &mut listen_task => ("listen", r),
@@ -281,9 +288,9 @@ async fn run_dial_manager(config: PeerConfig, semaphore: Arc<Semaphore>) -> Resu
                     let cfg = config.clone();
                     let sem = semaphore.clone();
                     let ep = endpoint.clone();
-                    let h = tokio::spawn(async move {
+                    let h = tokio::spawn(crate::logging::inherit_source(async move {
                         run_managed_dial_session(cfg, sem, &ep, own_id, target, session_tok).await;
-                    });
+                    }));
                     current = Some((tok, h));
                 }
                 Ok(DialCommand::Disconnect) => {
@@ -533,11 +540,11 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
 
         let config = config.clone();
         let semaphore = semaphore.clone();
-        connection_tasks.spawn(async move {
+        connection_tasks.spawn(crate::logging::inherit_source(async move {
             if let Err(e) = handle_connection(conn, config, semaphore, false).await {
                 log::warn!("Connection error for {}: {}", remote_id, e);
             }
-        });
+        }));
     }
 
     connection_tasks.shutdown().await;
@@ -612,7 +619,9 @@ enum CheckOutcome {
 /// writes the flag, and (interactively) prompts the user to take over, rename, or
 /// decline — quitting at startup or degrading to serve-only mid-session.
 fn spawn_node_id_publisher(params: PublisherParams) -> PublisherGuard {
-    PublisherGuard(tokio::spawn(run_node_id_publisher(params)))
+    PublisherGuard(tokio::spawn(crate::logging::inherit_source(
+        run_node_id_publisher(params),
+    )))
 }
 
 async fn run_node_id_publisher(params: PublisherParams) {
@@ -1002,11 +1011,11 @@ async fn handle_connection(
         let conn = conn.clone();
         let semaphore = semaphore.clone();
         let allowed_sources = Arc::new(config.allowed_sources.clone());
-        tasks.spawn(async move {
+        tasks.spawn(crate::logging::inherit_source(async move {
             if let Err(e) = accept_loop(conn, semaphore, allowed_sources).await {
                 log::debug!("Accept loop ended: {}", e);
             }
-        });
+        }));
     }
 
     // Requester side (dial role only): a dialer drives a single connection, so it
@@ -1021,9 +1030,9 @@ async fn handle_connection(
             let conn = conn.clone();
             let semaphore = semaphore.clone();
             let status = config.status.clone();
-            tasks.spawn(async move {
+            tasks.spawn(crate::logging::inherit_source(async move {
                 request_supervisor(conn, semaphore, status, command_rx).await;
-            });
+            }));
         }
         // Optionally autostart every configured request (non-interactive/test mode).
         if config.autostart_requests {
@@ -1086,7 +1095,7 @@ async fn request_supervisor(
                     let semaphore = semaphore.clone();
                     let status = status.clone();
                     let done_tx = done_tx.clone();
-                    tokio::spawn(async move {
+                    tokio::spawn(crate::logging::inherit_source(async move {
                         let outcome = tokio::select! {
                             r = run_request(conn.clone(), req, semaphore, status.clone(), id) => Some(r),
                             _ = token.cancelled() => None,
@@ -1105,7 +1114,7 @@ async fn request_supervisor(
                             }
                         }
                         let _ = done_tx.send(id);
-                    });
+                    }));
                 }
                 Ok(TunnelCommand::Stop(id)) => {
                     if let Some(token) = running.remove(&id) {
@@ -1219,11 +1228,11 @@ async fn accept_loop(
 
         let semaphore = semaphore.clone();
         let allowed_sources = allowed_sources.clone();
-        stream_tasks.spawn(async move {
+        stream_tasks.spawn(crate::logging::inherit_source(async move {
             if let Err(e) = handle_incoming_stream(send, recv, semaphore, allowed_sources).await {
                 log::warn!("Stream error: {}", e);
             }
-        });
+        }));
 
         while stream_tasks.try_join_next().is_some() {}
     }
@@ -1407,7 +1416,7 @@ async fn tcp_accept_and_tunnel(
     let mut accept_tasks: JoinSet<()> = JoinSet::new();
     for listener in listeners {
         let tx = tx.clone();
-        accept_tasks.spawn(async move {
+        accept_tasks.spawn(crate::logging::inherit_source(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
@@ -1419,7 +1428,7 @@ async fn tcp_accept_and_tunnel(
                     Err(e) => log::warn!("Failed to accept TCP connection: {}", e),
                 }
             }
-        });
+        }));
     }
     drop(tx);
 
@@ -1434,12 +1443,12 @@ async fn tcp_accept_and_tunnel(
         };
         let conn = conn.clone();
         let hello = hello.clone();
-        conn_tasks.spawn(async move {
+        conn_tasks.spawn(crate::logging::inherit_source(async move {
             let _permit = permit;
             if let Err(e) = open_tcp_data_stream(&conn, hello, tcp_stream).await {
                 log::warn!("Tunnel for {} failed: {}", peer, e);
             }
-        });
+        }));
         while conn_tasks.try_join_next().is_some() {}
     }
 
