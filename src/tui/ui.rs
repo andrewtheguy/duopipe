@@ -3,13 +3,13 @@
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use tui_input::Input;
 
-use super::textinput::render_field;
+use super::textinput::{INPUT_FIELD_HEIGHT, render_input_field};
 use crate::app_state::{
     AppSnapshot, ConnStatus, NameConflict, PeerRow, Role, TunnelId, TunnelRow, TunnelStatus,
 };
@@ -428,18 +428,12 @@ fn dial_header_line(snap: &AppSnapshot, show_hint: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Modal for adding a tunnel request at runtime. Three labeled fields; the active
-/// one carries a blinking block cursor. Mirrors the setup-screen input style.
+/// Modal for adding a tunnel request at runtime. Three text fields are rendered
+/// as standard bordered input boxes; the active one owns the terminal cursor.
 pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
     let editing = form.editing.is_some();
-    let field_line = |label: &str, input: &Input, active: bool| -> Line<'static> {
-        let mut spans = vec![Span::raw(format!("{label:<14}"))];
-        spans.extend(render_field(input, Style::default().fg(Color::Cyan), active));
-        Line::from(spans)
-    };
-
     let protocol_active = form.field == AddField::Protocol;
-    let protocol_line = {
+    let protocol_line = || {
         let mut spans = vec![Span::raw(format!("{:<14}", "protocol:"))];
         for p in [Protocol::Tcp, Protocol::Udp] {
             let selected = form.protocol == p;
@@ -464,61 +458,118 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         Line::from(spans)
     };
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            if editing { "Edit tunnel" } else { "Add tunnel" },
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        field_line("name:", &form.name, form.field == AddField::Name),
-        protocol_line,
-        field_line(
-            "remote_source:",
-            &form.remote_source,
-            form.field == AddField::RemoteSource,
-        ),
-        field_line(
-            "local_listen:",
-            &form.local_listen,
-            form.field == AddField::LocalListen,
-        ),
-        Line::raw(""),
+    let error_rows = if form.error.is_some() { 2 } else { 0 };
+    let area = centered(
+        frame.area(),
+        92,
+        2 + 2 + INPUT_FIELD_HEIGHT * 3 + 1 + 1 + 2 + error_rows + 1,
+    );
+    frame.render_widget(Clear, area);
+    let panel = Block::default()
+        .borders(Borders::ALL)
+        .title(if editing { " edit tunnel " } else { " add tunnel " });
+    frame.render_widget(panel, area);
+
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let mut constraints = vec![
+        Constraint::Length(2),
+        Constraint::Length(INPUT_FIELD_HEIGHT),
+        Constraint::Length(1),
+        Constraint::Length(INPUT_FIELD_HEIGHT),
+        Constraint::Length(INPUT_FIELD_HEIGHT),
+        Constraint::Length(1),
+        Constraint::Length(2),
+    ];
+    if form.error.is_some() {
+        constraints.extend([Constraint::Length(1), Constraint::Length(1)]);
+    }
+    constraints.extend([Constraint::Min(0), Constraint::Length(1)]);
+    let chunks = Layout::vertical(constraints).split(inner);
+    let mut i = 0;
+
+    render_modal_lines(
+        frame,
+        chunks[i],
+        vec![
+            Line::from(Span::styled(
+                if editing { "Edit tunnel" } else { "Add tunnel" },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+        ],
+    );
+    i += 1;
+    render_input_field(
+        frame,
+        chunks[i],
+        "Name",
+        &form.name,
+        form.field == AddField::Name,
+    );
+    i += 1;
+    render_modal_line(frame, chunks[i], protocol_line());
+    i += 1;
+    render_input_field(
+        frame,
+        chunks[i],
+        "Remote source",
+        &form.remote_source,
+        form.field == AddField::RemoteSource,
+    );
+    i += 1;
+    render_input_field(
+        frame,
+        chunks[i],
+        "Local listen",
+        &form.local_listen,
+        form.field == AddField::LocalListen,
+    );
+    i += 1;
+    render_modal_line(
+        frame,
+        chunks[i],
         Line::from(Span::styled(
             "remote_source: host:port (protocol prepended)   local_listen: host:port   (name optional)",
             Style::default().fg(Color::DarkGray),
         )),
-    ];
+    );
+    i += 1;
+    render_modal_line(
+        frame,
+        chunks[i],
+        Line::from(Span::styled(
+            if editing {
+                "↑/↓ move field · ←/→ switch protocol · Enter on local_listen saves · Esc cancel"
+            } else {
+                "↑/↓ move field · ←/→ switch protocol · Enter on local_listen adds & starts · Esc cancel"
+            },
+            Style::default().fg(Color::DarkGray),
+        )),
+    );
+    i += 1;
 
     if let Some(err) = &form.error {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
-        )));
+        i += 1; // spacer before the error
+        render_modal_line(
+            frame,
+            chunks[i],
+            Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red))),
+        );
     }
 
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        if editing {
-            "↑/↓ move field · ←/→ switch protocol · Enter on local_listen saves · Esc cancel"
-        } else {
-            "↑/↓ move field · ←/→ switch protocol · Enter on local_listen adds & starts · Esc cancel"
-        },
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let area = centered(frame.area(), 88, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(if editing { " edit tunnel " } else { " add tunnel " }),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_modal_line(
+        frame,
+        chunks[chunks.len() - 1],
+        Line::from(Span::styled(
+            "Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    );
 }
 
 /// Modal for starting the on-demand dial session. One text field whose meaning depends
@@ -526,52 +577,89 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
 pub fn render_connect_dialog(frame: &mut Frame, form: &ConnectForm, nostr_discovery: bool) {
     let (label, hint) = if nostr_discovery {
         (
-            "peer name:",
+            "Peer name",
             "the target peer's name (its config `name`); looked up via nostr",
         )
     } else {
-        ("node id:", "the target peer's full node id")
+        ("Node id", "the target peer's full node id")
     };
 
-    let mut field_spans = vec![Span::raw(format!("{label:<10}"))];
-    field_spans.extend(render_field(
-        &form.target,
-        Style::default().fg(Color::Cyan),
-        true,
-    ));
+    let error_rows = if form.error.is_some() { 2 } else { 0 };
+    let area = centered(
+        frame.area(),
+        84,
+        2 + 2 + INPUT_FIELD_HEIGHT + 1 + 2 + error_rows + 1,
+    );
+    frame.render_widget(Clear, area);
+    let panel = Block::default().borders(Borders::ALL).title(" connect ");
+    frame.render_widget(panel, area);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Connect to peer",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(field_spans),
-        Line::raw(""),
-        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let mut constraints = vec![
+        Constraint::Length(2),
+        Constraint::Length(INPUT_FIELD_HEIGHT),
+        Constraint::Length(1),
+        Constraint::Length(2),
     ];
+    if form.error.is_some() {
+        constraints.extend([Constraint::Length(1), Constraint::Length(1)]);
+    }
+    constraints.extend([Constraint::Min(0), Constraint::Length(1)]);
+    let chunks = Layout::vertical(constraints).split(inner);
+    let mut i = 0;
+
+    render_modal_lines(
+        frame,
+        chunks[i],
+        vec![
+            Line::from(Span::styled(
+                "Connect to peer",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+        ],
+    );
+    i += 1;
+    render_input_field(frame, chunks[i], label, &form.target, true);
+    i += 1;
+    i += 1; // spacer before hint
+    render_modal_line(
+        frame,
+        chunks[i],
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+    );
+    i += 1;
 
     if let Some(err) = &form.error {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
-        )));
+        i += 1; // spacer before the error
+        render_modal_line(
+            frame,
+            chunks[i],
+            Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red))),
+        );
     }
 
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Enter connect · Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    )));
+    render_modal_line(
+        frame,
+        chunks[chunks.len() - 1],
+        Line::from(Span::styled(
+            "Enter connect · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    );
+}
 
-    let area = centered(frame.area(), 80, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" connect "))
-        .wrap(Wrap { trim: false });
+fn render_modal_line(frame: &mut Frame, area: Rect, line: Line<'static>) {
+    render_modal_lines(frame, area, vec![line]);
+}
+
+fn render_modal_lines(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 

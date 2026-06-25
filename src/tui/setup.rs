@@ -12,13 +12,13 @@
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tui_input::Input;
 
-use super::textinput::{handle_edit, render_field};
+use super::textinput::{INPUT_FIELD_HEIGHT, handle_edit, render_input_field};
 use crate::app_state::Role;
 use crate::auth;
 use crate::config::{AllowedSources, validate_cidr};
@@ -387,161 +387,296 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 /// Render the setup screen.
 pub fn render(frame: &mut Frame, state: &SetupState) {
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            format!(
-                "duopipe v{} — {} setup",
-                env!("CARGO_PKG_VERSION"),
-                if state.nostr_discovery { "nostr" } else { "quick" }
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
+    let area = centered(frame.area(), 84, setup_panel_height(state));
+    let panel = Block::default().borders(Borders::ALL).title(" setup ");
+    frame.render_widget(panel, area);
 
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let [title_area, body_area, footer_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    render_setup_title(frame, title_area, state);
     match state.phase {
+        SetupPhase::Start => render_start_phase(frame, body_area, state),
+        SetupPhase::TokenSetup => render_token_phase(frame, body_area, state),
+    }
+    render_setup_footer(frame, footer_area, state);
+}
+
+fn setup_panel_height(state: &SetupState) -> u16 {
+    let body = match state.phase {
         SetupPhase::Start => {
-            lines.push(Line::from("This instance will always listen for peers."));
-            if state.nostr_discovery
-                && let Some(name) = &state.own_name
-            {
-                lines.push(Line::from(Span::styled(
-                    format!("  Reachable via nostr as \"{name}\"."),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            lines.push(Line::from(Span::styled(
-                "  Dial a peer on demand from the dashboard (press Shift-C).",
-                Style::default().fg(Color::DarkGray),
-            )));
-            if let Some(token) = &state.config_auth_token {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  Auth token loaded (fingerprint: {}).",
-                        auth::token_fingerprint(token)
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            // Primary actions, kept above the optional allowlist fields so Start isn't
-            // buried below advanced settings the user can safely skip.
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                button_span("Start", state.focus == StartFocus::Start),
-                Span::raw("  "),
-                button_span("Exit", state.focus == StartFocus::Exit),
-            ]));
-            if allowlist_fields_shown(state) {
-                lines.push(Line::raw(""));
-                lines.push(Line::from(Span::styled(
-                    "Optional — leave blank to allow localhost only:",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                lines.push(choice_line(
-                    "Allowed TCP sources the peer may request (CIDR):",
-                    state.focus == StartFocus::AllowedTcp,
-                ));
-                lines.push(field_input_line(
-                    &state.allowed_tcp,
-                    state.focus == StartFocus::AllowedTcp,
-                ));
-                lines.push(Line::from(Span::styled(
-                    "      space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
-                    Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(choice_line(
-                    "Allowed UDP sources the peer may request (CIDR):",
-                    state.focus == StartFocus::AllowedUdp,
-                ));
-                lines.push(field_input_line(
-                    &state.allowed_udp,
-                    state.focus == StartFocus::AllowedUdp,
-                ));
-                lines.push(Line::from(Span::styled(
-                    "      space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+            let fields = if allowlist_fields_shown(state) {
+                // Spacer, section label, two 3-row fields, and one help row per field.
+                1 + 1 + INPUT_FIELD_HEIGHT + 1 + INPUT_FIELD_HEIGHT + 1
+            } else {
+                0
+            };
+            start_summary_lines(state).len() as u16 + fields + error_height(state)
         }
         SetupPhase::TokenSetup => {
-            let input_active = state.token_focus == TokenFocus::Input;
-            if state.nostr_discovery {
-                // Nostr: the token is a pre-shared secret — entry only, no generate. One
-                // field, always active, so it needs no choice marker.
-                lines.push(Line::from("Enter the shared auth token:"));
-                // The config declares the token's fingerprint; show it so the user knows
-                // what their pasted token must match before they even submit.
-                if let Some(expected) = &state.expected_token_fingerprint {
-                    lines.push(Line::from(Span::styled(
-                        format!("  expected fingerprint: {expected} — your token must match this"),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                }
-                lines.push(field_input_line(&state.auth_token_input, input_active));
-            } else {
-                // Quick: two stacked choices, each marked with `▶` when it has focus —
-                // generate a fresh token, or type/paste an existing one.
-                lines.push(Line::from("No auth token supplied. Choose one:"));
-                lines.push(Line::raw(""));
-                lines.push(choice_line(
-                    "Generate new token",
-                    state.token_focus == TokenFocus::Generate,
-                ));
-                lines.push(Line::from(Span::styled(
-                    "      A fresh token for this run, shown so you can copy it to your other device.",
-                    Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(Line::raw(""));
-                lines.push(choice_line("Enter an existing token:", input_active));
-                lines.push(field_input_line(&state.auth_token_input, input_active));
-            }
-
-            let typed = state.auth_token_input.value().trim();
-            if !typed.is_empty() && auth::validate_token(typed).is_ok() {
-                let fp = auth::token_fingerprint(typed);
-                // When the config pins a fingerprint, show match/mismatch directly against
-                // it; otherwise just surface the fingerprint to cross-check by hand.
-                let line = match &state.expected_token_fingerprint {
-                    Some(expected) if auth::fingerprint_matches(typed, expected) => Span::styled(
-                        format!("      fingerprint: {fp} ✓ matches the config"),
-                        Style::default().fg(Color::Green),
-                    ),
-                    Some(expected) => Span::styled(
-                        format!("      fingerprint: {fp} ✗ does not match the config ({expected})"),
-                        Style::default().fg(Color::Red),
-                    ),
-                    None => Span::styled(
-                        format!("      fingerprint: {fp} — confirm this matches your other device"),
-                        Style::default().fg(Color::Green),
-                    ),
-                };
-                lines.push(Line::from(line));
-            }
-            lines.push(Line::raw(""));
-            let hint = if state.nostr_discovery {
-                // Nostr has no Generate button: the token is pre-shared, made out of band.
-                "Both peers need the same token. First time? Run `duopipe generate-auth-token`, then paste that token here on every device."
-            } else {
-                // Quick mode: the Generate choice above covers a fresh token; this field
-                // is for reusing one shown on the other device.
-                "Both peers need the same token: paste the one shown on your other device, or pick \"Generate new token\" above."
-            };
-            lines.push(Line::from(Span::styled(
-                hint,
-                Style::default().fg(Color::DarkGray),
-            )));
+            token_intro_lines(state).len() as u16
+                + 1
+                + INPUT_FIELD_HEIGHT
+                + u16::from(token_fingerprint_line(state).is_some())
+                + 1
+                + 2
+                + error_height(state)
         }
+    };
+    // Outer border + title area + body + footer.
+    2 + 2 + body + 1
+}
+
+fn error_height(state: &SetupState) -> u16 {
+    if state.error.is_some() { 2 } else { 0 }
+}
+
+fn render_setup_title(frame: &mut Frame, area: Rect, state: &SetupState) {
+    render_lines(
+        frame,
+        area,
+        vec![
+            Line::from(Span::styled(
+                format!(
+                    "duopipe v{} — {} setup",
+                    env!("CARGO_PKG_VERSION"),
+                    if state.nostr_discovery { "nostr" } else { "quick" }
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+        ],
+    );
+}
+
+fn render_start_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
+    let summary = start_summary_lines(state);
+    let mut constraints = vec![Constraint::Length(summary.len() as u16)];
+    if allowlist_fields_shown(state) {
+        constraints.extend([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(INPUT_FIELD_HEIGHT),
+            Constraint::Length(1),
+            Constraint::Length(INPUT_FIELD_HEIGHT),
+            Constraint::Length(1),
+        ]);
+    }
+    if state.error.is_some() {
+        constraints.extend([Constraint::Length(1), Constraint::Length(1)]);
+    }
+    constraints.push(Constraint::Min(0));
+
+    let chunks = Layout::vertical(constraints).split(area);
+    let mut i = 0;
+    render_lines(frame, chunks[i], summary);
+    i += 1;
+
+    if allowlist_fields_shown(state) {
+        i += 1; // spacer after the primary buttons
+        render_line(
+            frame,
+            chunks[i],
+            Line::from(Span::styled(
+                "Optional — leave blank to allow localhost only:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        );
+        i += 1;
+        render_input_field(
+            frame,
+            chunks[i],
+            "Allowed TCP sources (CIDR)",
+            &state.allowed_tcp,
+            state.focus == StartFocus::AllowedTcp,
+        );
+        i += 1;
+        render_line(
+            frame,
+            chunks[i],
+            Line::from(Span::styled(
+                "space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
+        i += 1;
+        render_input_field(
+            frame,
+            chunks[i],
+            "Allowed UDP sources (CIDR)",
+            &state.allowed_udp,
+            state.focus == StartFocus::AllowedUdp,
+        );
+        i += 1;
+        render_line(
+            frame,
+            chunks[i],
+            Line::from(Span::styled(
+                "space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
+        i += 1;
     }
 
-    if let Some(err) = &state.error {
-        lines.push(Line::raw(""));
+    render_error_if_any(frame, &chunks, i, state.error.as_deref());
+}
+
+fn render_token_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
+    let intro = token_intro_lines(state);
+    let fingerprint = token_fingerprint_line(state);
+    let mut constraints = vec![
+        Constraint::Length(intro.len() as u16),
+        Constraint::Length(1),
+        Constraint::Length(INPUT_FIELD_HEIGHT),
+    ];
+    if fingerprint.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.extend([Constraint::Length(1), Constraint::Length(2)]);
+    if state.error.is_some() {
+        constraints.extend([Constraint::Length(1), Constraint::Length(1)]);
+    }
+    constraints.push(Constraint::Min(0));
+
+    let chunks = Layout::vertical(constraints).split(area);
+    let mut i = 0;
+    render_lines(frame, chunks[i], intro);
+    i += 1;
+    i += 1; // spacer between the choice text and the field
+    render_input_field(
+        frame,
+        chunks[i],
+        "Auth token",
+        &state.auth_token_input,
+        state.token_focus == TokenFocus::Input,
+    );
+    i += 1;
+    if let Some(line) = fingerprint {
+        render_line(frame, chunks[i], line);
+        i += 1;
+    }
+    i += 1; // spacer before the mode-specific hint
+    render_line(
+        frame,
+        chunks[i],
+        Line::from(Span::styled(
+            token_hint(state),
+            Style::default().fg(Color::DarkGray),
+        )),
+    );
+    i += 1;
+
+    render_error_if_any(frame, &chunks, i, state.error.as_deref());
+}
+
+fn start_summary_lines(state: &SetupState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("This instance will always listen for peers.")];
+    if state.nostr_discovery
+        && let Some(name) = &state.own_name
+    {
         lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
+            format!("  Reachable via nostr as \"{name}\"."),
+            Style::default().fg(Color::DarkGray),
         )));
     }
-
+    lines.push(Line::from(Span::styled(
+        "  Dial a peer on demand from the dashboard (press Shift-C).",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if let Some(token) = &state.config_auth_token {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Auth token loaded (fingerprint: {}).",
+                auth::token_fingerprint(token)
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    // Primary actions stay above optional allowlist fields so Start is never buried.
     lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        button_span("Start", state.focus == StartFocus::Start),
+        Span::raw("  "),
+        button_span("Exit", state.focus == StartFocus::Exit),
+    ]));
+    lines
+}
+
+fn token_intro_lines(state: &SetupState) -> Vec<Line<'static>> {
+    if state.nostr_discovery {
+        let mut lines = vec![Line::from("Enter the shared auth token:")];
+        // The config declares the token's fingerprint; show it before submit.
+        if let Some(expected) = &state.expected_token_fingerprint {
+            lines.push(Line::from(Span::styled(
+                format!("  expected fingerprint: {expected} — your token must match this"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        return lines;
+    }
+
+    vec![
+        Line::from("No auth token supplied. Choose one:"),
+        Line::raw(""),
+        choice_line(
+            "Generate new token",
+            state.token_focus == TokenFocus::Generate,
+        ),
+        Line::from(Span::styled(
+            "      A fresh token for this run, shown so you can copy it to your other device.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        choice_line(
+            "Enter an existing token:",
+            state.token_focus == TokenFocus::Input,
+        ),
+    ]
+}
+
+fn token_fingerprint_line(state: &SetupState) -> Option<Line<'static>> {
+    let typed = state.auth_token_input.value().trim();
+    if typed.is_empty() || auth::validate_token(typed).is_err() {
+        return None;
+    }
+
+    let fp = auth::token_fingerprint(typed);
+    let span = match &state.expected_token_fingerprint {
+        Some(expected) if auth::fingerprint_matches(typed, expected) => Span::styled(
+            format!("fingerprint: {fp} ✓ matches the config"),
+            Style::default().fg(Color::Green),
+        ),
+        Some(expected) => Span::styled(
+            format!("fingerprint: {fp} ✗ does not match the config ({expected})"),
+            Style::default().fg(Color::Red),
+        ),
+        None => Span::styled(
+            format!("fingerprint: {fp} — confirm this matches your other device"),
+            Style::default().fg(Color::Green),
+        ),
+    };
+    Some(Line::from(span))
+}
+
+fn token_hint(state: &SetupState) -> &'static str {
+    if state.nostr_discovery {
+        // Nostr has no Generate button: the token is pre-shared, made out of band.
+        "Both peers need the same token. First time? Run `duopipe generate-auth-token`, then paste that token here on every device."
+    } else {
+        // Quick mode: the Generate choice covers a fresh token; this field reuses one.
+        "Both peers need the same token: paste the one shown on your other device, or pick \"Generate new token\" above."
+    }
+}
+
+fn render_setup_footer(frame: &mut Frame, area: Rect, state: &SetupState) {
     let footer = match state.phase {
         SetupPhase::Start => "↑/↓ ←/→ move · Enter select · Esc / Ctrl-C quit",
         SetupPhase::TokenSetup if !state.nostr_discovery => {
@@ -549,16 +684,35 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
         }
         SetupPhase::TokenSetup => "Enter confirm · Esc back · Ctrl-C quit",
     };
-    lines.push(Line::from(Span::styled(
-        footer,
-        Style::default().fg(Color::DarkGray),
-    )));
+    render_line(
+        frame,
+        area,
+        Line::from(Span::styled(footer, Style::default().fg(Color::DarkGray))),
+    );
+}
 
-    let height = lines.len() as u16 + 2;
-    let area = centered(frame.area(), 76, height.min(frame.area().height));
-    let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" setup "))
-        .wrap(Wrap { trim: false });
+fn render_error_if_any(
+    frame: &mut Frame,
+    chunks: &[Rect],
+    index: usize,
+    error: Option<&str>,
+) {
+    let Some(err) = error else {
+        return;
+    };
+    render_line(
+        frame,
+        chunks[index + 1],
+        Line::from(Span::styled(err.to_string(), Style::default().fg(Color::Red))),
+    );
+}
+
+fn render_line(frame: &mut Frame, area: Rect, line: Line<'static>) {
+    render_lines(frame, area, vec![line]);
+}
+
+fn render_lines(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
@@ -599,14 +753,6 @@ fn choice_line(label: &str, active: bool) -> Line<'static> {
         choice_marker(active),
         Span::styled(label.to_string(), label_style),
     ])
-}
-
-/// The text-input line nested under a [`choice_line`]: indented to clear the marker,
-/// with a block cursor at the edit position when `active`.
-fn field_input_line(buffer: &Input, active: bool) -> Line<'static> {
-    let mut spans = vec![Span::raw("    ")];
-    spans.extend(render_field(buffer, Style::default().fg(Color::Cyan), active));
-    Line::from(spans)
 }
 
 #[cfg(test)]
