@@ -4,7 +4,7 @@
 //!
 //! ## Token Format
 //! - Exactly 47 characters
-//! - Starts with lowercase `i` (for iroh)
+//! - Starts with lowercase `d` (for duopipe)
 //! - Remaining 46 characters are Base64URL (no padding)
 //! - Decoded payload is exactly 34 bytes:
 //!   - First 32 bytes: random entropy
@@ -22,7 +22,7 @@ use std::path::Path;
 pub const TOKEN_LENGTH: usize = 47;
 
 /// Required prefix character for tokens.
-pub const TOKEN_PREFIX: char = 'i';
+pub const TOKEN_PREFIX: char = 'd';
 
 /// Number of random bytes in token payload.
 const RANDOM_BYTES_LEN: usize = 32;
@@ -60,7 +60,7 @@ fn crc16_ccitt_false(data: &[u8]) -> u16 {
 
 /// Generate a new authentication token.
 ///
-/// Format: `i` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 47 characters total.
+/// Format: `d` + base64url_no_pad(32 random bytes + 2-byte CRC16) = 47 characters total.
 pub fn generate_token() -> String {
     let mut random = [0u8; RANDOM_BYTES_LEN];
     let mut rng = rand::rng();
@@ -145,7 +145,7 @@ fn parse_token_lines(content: &str) -> impl Iterator<Item = (usize, &str)> {
 /// Load a single auth token from a file.
 ///
 /// # File Format
-/// - First non-empty, non-comment line is the token (`i` + 46 Base64URL chars, no padding)
+/// - First non-empty, non-comment line is the token (`d` + 46 Base64URL chars, no padding)
 /// - Lines starting with `#` are treated as comments
 /// - Empty lines are ignored
 /// - Inline comments (after token) are supported with `#`
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_validate_token_too_short() {
-        let result = validate_token("ishort");
+        let result = validate_token("dshort");
         assert!(result.is_err());
         assert!(
             result
@@ -261,7 +261,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("must start with 'i'")
+                .contains("must start with 'd'")
         );
     }
 
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_validate_token_non_ascii() {
-        let result = validate_token("i🔐notascii");
+        let result = validate_token("d🔐notascii");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ASCII"));
     }

@@ -157,7 +157,7 @@ A peer connection is gated by a single pre-shared **auth token**, shared by **bo
 
 **Auth Token Format:**
 - Exactly 47 characters
-- Starts with `i` (for iroh)
+- Starts with `d` (for duopipe)
 - Remaining 46 characters are Base64URL-encoded (no padding)
 - Decoded payload: 32 random bytes + 2-byte CRC16-CCITT-FALSE checksum
 
@@ -441,7 +441,7 @@ duopipe generate-auth-token
 duopipe generate-auth-token -c 5
 ```
 
-Auth token format: `i` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total.
+Auth token format: `d` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total.
 
 > **Note:** A listening instance that starts without a configured token generates one automatically and shows it in the TUI header, so generating one ahead of time is optional.
 
