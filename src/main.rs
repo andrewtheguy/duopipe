@@ -65,11 +65,12 @@ enum Command {
     /// Start a peer in nostr mode (interactive TUI): always serving, with one
     /// on-demand outbound dial session.
     ///
-    /// Requires a config file. The auth token (the nostr rendezvous secret) may be
-    /// supplied via config `auth_token_file` or DUOPIPE_AUTH_TOKEN; if neither is set,
-    /// setup lets you generate a fresh token or paste an existing one. The listener
-    /// publishes its current ephemeral node id to nostr and a dialer looks it up, so
-    /// the node id need not be exchanged by hand.
+    /// Requires a config file. The auth token (the nostr rendezvous secret) is shared
+    /// and pre-generated: supply it via config `auth_token_file` or DUOPIPE_AUTH_TOKEN,
+    /// or paste it at the setup screen (generate one first with
+    /// `duopipe generate-auth-token`). The listener publishes its current ephemeral
+    /// node id to nostr and a dialer looks it up, so the node id need not be exchanged
+    /// by hand.
     ///
     /// On startup the TUI confirms setup, then opens the dashboard already
     /// listening. Press `c` in the dashboard to dial a peer by name.
@@ -407,11 +408,11 @@ async fn run_start_peer(
         .await;
     }
 
-    // When no token is supplied via file/env, the interactive setup screen resolves it
-    // (generate a fresh one or paste an existing one) for both quick and nostr mode —
-    // so `auth_token_file` is fully optional. The token is the rendezvous secret both
-    // nostr peers derive their key from: generate it on the first device (it is shown
-    // for copying) and enter it on the second.
+    // When no token is supplied via file/env, the interactive setup screen resolves it,
+    // so `auth_token_file` is fully optional. Quick mode offers generate-or-enter (the
+    // token is ephemeral). Nostr mode only lets you paste a token: it is the pre-shared
+    // rendezvous secret both peers derive their key from, so it must be generated ahead
+    // of time (`duopipe generate-auth-token`) and entered on each device.
 
     // Nostr mode requires a `name`: each peer publishes its node id under this short
     // identifier, and a dialer types it to look the peer up.

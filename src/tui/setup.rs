@@ -30,21 +30,22 @@ enum SetupPhase {
     /// Start screen: a summary plus — when config supplies no `[allowed_sources]` — the
     /// TCP/UDP CIDR allowlists gating what inbound peers may request. Enter proceeds.
     Start,
-    /// When no token came from config/env: choose whether to generate a fresh token or
-    /// enter an existing one. Symmetric across quick and nostr modes.
-    ChooseTokenSource,
-    /// "Enter existing" path: type or paste a token, validated before it is accepted.
-    EnterToken,
+    /// No token from config/env: set one up. Quick mode shows a "Generate new" button
+    /// alongside an inline entry field (the token is ephemeral); nostr mode shows only
+    /// the entry field (its token is a pre-shared secret, generated out of band with
+    /// `duopipe generate-auth-token`). Validated before it is accepted.
+    TokenSetup,
 }
 
-/// Which option is focused on the [`SetupPhase::ChooseTokenSource`] screen.
+/// Which element of the [`SetupPhase::TokenSetup`] screen has focus. `Generate` is only
+/// present in quick mode; nostr mode stays on `Input`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChooseFocus {
-    /// Generate a fresh token for this run (shown in the dashboard so it can be copied
-    /// to the other device).
+enum TokenFocus {
+    /// The "Generate new" button (quick mode only): make a fresh ephemeral token,
+    /// surfaced in the dashboard so it can be copied to the other device.
     Generate,
-    /// Enter/paste a token shared from another device.
-    Enter,
+    /// The inline token entry field: type or paste a token shared from another device.
+    Input,
 }
 
 /// Which element of the [`SetupPhase::Start`] screen has focus. The two CIDR fields
@@ -120,9 +121,9 @@ pub struct SetupState {
     nostr_discovery: bool,
     /// This machine's own nostr name (config `name`) — display only, for the summary.
     own_name: Option<String>,
-    /// Focused option on the [`SetupPhase::ChooseTokenSource`] screen.
-    choose_focus: ChooseFocus,
-    /// Token typed/pasted on the [`SetupPhase::EnterToken`] screen.
+    /// Focused element on the [`SetupPhase::TokenSetup`] screen.
+    token_focus: TokenFocus,
+    /// Token typed/pasted on the [`SetupPhase::TokenSetup`] screen.
     auth_token_input: Input,
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
@@ -150,7 +151,7 @@ impl SetupState {
             allowed_sources: AllowedSources::default(),
             nostr_discovery,
             own_name,
-            choose_focus: ChooseFocus::Generate,
+            token_focus: TokenFocus::Generate,
             auth_token_input: Input::default(),
             auth_token: None,
             token_generated: false,
@@ -169,9 +170,17 @@ fn finalize(state: &mut SetupState, auth_token: String, generated: bool) -> Step
 }
 
 /// Validate the typed/pasted token and finish on success; on failure keep the
-/// `EnterToken` screen open with an inline error.
+/// `TokenSetup` screen open with an inline error.
 fn submit_token(state: &mut SetupState) -> Step {
     let token = state.auth_token_input.value().trim().to_string();
+    if token.is_empty() {
+        state.error = Some(if state.nostr_discovery {
+            "Enter the shared auth token.".to_string()
+        } else {
+            "Enter a token, or select \"Generate new\".".to_string()
+        });
+        return Step::Continue;
+    }
     match auth::validate_token(&token) {
         Ok(()) => finalize(state, token, false),
         Err(e) => {
@@ -200,8 +209,9 @@ fn allowlist_fields_shown(state: &SetupState) -> bool {
 }
 
 /// Submit the start screen: resolve the allowlist (from config or the entered CIDRs),
-/// then finish (a token is present) or confirm token generation. A bad CIDR keeps the
-/// screen open with an error.
+/// then finish (a config/env token is present), offer generate-or-enter (quick mode),
+/// or go straight to token entry (nostr mode). A bad CIDR keeps the screen open with
+/// an error.
 fn submit_start(state: &mut SetupState) -> Step {
     let allowed = if !allowlist_fields_shown(state) {
         state.config_allowed_sources.clone()
@@ -230,8 +240,15 @@ fn submit_start(state: &mut SetupState) -> Step {
         // A config/env token is used as-is, no further prompt.
         finalize(state, token, false)
     } else {
-        // No token: offer generate-or-enter (symmetric across quick and nostr modes).
-        state.phase = SetupPhase::ChooseTokenSource;
+        // No token: open the token-setup screen. Quick mode focuses its "Generate new"
+        // button (the common path; the token is ephemeral); nostr mode has no generate
+        // option (the token is a pre-shared secret), so it focuses the entry field.
+        state.phase = SetupPhase::TokenSetup;
+        state.token_focus = if state.nostr_discovery {
+            TokenFocus::Input
+        } else {
+            TokenFocus::Generate
+        };
         Step::Continue
     }
 }
@@ -299,36 +316,33 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                 Step::Continue
             }
         },
-        SetupPhase::ChooseTokenSource => match key.code {
+        SetupPhase::TokenSetup => match key.code {
             KeyCode::Esc => {
                 state.phase = SetupPhase::Start;
                 Step::Continue
             }
-            // Left/Right (or Tab) toggle between the two options.
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                state.choose_focus = match state.choose_focus {
-                    ChooseFocus::Generate => ChooseFocus::Enter,
-                    ChooseFocus::Enter => ChooseFocus::Generate,
+            // Tab / Up / Down move between the "Generate new" button and the inline
+            // entry field. Quick mode only — nostr has no Generate button, so these
+            // fall through to the field (where they are no-ops).
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+                if !state.nostr_discovery =>
+            {
+                state.token_focus = match state.token_focus {
+                    TokenFocus::Generate => TokenFocus::Input,
+                    TokenFocus::Input => TokenFocus::Generate,
                 };
                 Step::Continue
             }
-            KeyCode::Enter => match state.choose_focus {
-                ChooseFocus::Generate => finalize(state, auth::generate_token(), true),
-                ChooseFocus::Enter => {
-                    state.phase = SetupPhase::EnterToken;
-                    Step::Continue
-                }
+            KeyCode::Enter => match state.token_focus {
+                TokenFocus::Generate => finalize(state, auth::generate_token(), true),
+                TokenFocus::Input => submit_token(state),
             },
-            _ => Step::Continue,
-        },
-        SetupPhase::EnterToken => match key.code {
-            KeyCode::Esc => {
-                state.phase = SetupPhase::ChooseTokenSource;
-                Step::Continue
-            }
-            KeyCode::Enter => submit_token(state),
+            // On the entry field every other key (Left/Right cursor moves, backspace,
+            // paste, characters) edits the input; the Generate button ignores them.
             _ => {
-                handle_edit(&mut state.auth_token_input, key, is_token_char);
+                if state.token_focus == TokenFocus::Input {
+                    handle_edit(&mut state.auth_token_input, key, is_token_char);
+                }
                 Step::Continue
             }
         },
@@ -360,7 +374,11 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 pub fn render(frame: &mut Frame, state: &SetupState) {
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            concat!("duopipe v", env!("CARGO_PKG_VERSION"), " — setup"),
+            format!(
+                "duopipe v{} — {} setup",
+                env!("CARGO_PKG_VERSION"),
+                if state.nostr_discovery { "nostr" } else { "quick" }
+            ),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
@@ -428,27 +446,29 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 )));
             }
         }
-        SetupPhase::ChooseTokenSource => {
-            lines.push(Line::from("No auth token supplied. Choose how to set one up:"));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                button_span("Generate new", state.choose_focus == ChooseFocus::Generate),
-                Span::raw("  "),
-                button_span("Enter existing", state.choose_focus == ChooseFocus::Enter),
-            ]));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "  Generate new — the first device makes a token, shown so you can copy it.",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  Enter existing — the second device pastes the token shown on the first.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        SetupPhase::EnterToken => {
-            lines.push(Line::from("Enter the shared auth token from your other device:"));
-            lines.push(field_input_line(&state.auth_token_input, true));
+        SetupPhase::TokenSetup => {
+            if state.nostr_discovery {
+                // Nostr: the token is a pre-shared secret — entry only, no generate.
+                lines.push(Line::from("Enter the shared auth token:"));
+            } else {
+                // Quick: the "Generate new" button sits above an inline entry field.
+                lines.push(Line::from("No auth token supplied. Set one up:"));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(button_span(
+                    "Generate new",
+                    state.token_focus == TokenFocus::Generate,
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  A fresh token for this run, shown so you can copy it to your other device.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::raw(""));
+                lines.push(Line::from("Or enter an existing token:"));
+            }
+            lines.push(field_input_line(
+                &state.auth_token_input,
+                state.token_focus == TokenFocus::Input,
+            ));
             let typed = state.auth_token_input.value().trim();
             if !typed.is_empty() && auth::validate_token(typed).is_ok() {
                 lines.push(Line::from(Span::styled(
@@ -459,8 +479,16 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                     Style::default().fg(Color::Green),
                 )));
             }
+            let hint = if state.nostr_discovery {
+                // Nostr has no Generate button: the token is pre-shared, made out of band.
+                "  Both peers need the same token. First time? Run `duopipe generate-auth-token`, then paste that token here on every device."
+            } else {
+                // Quick mode: the Generate button above covers a fresh token; this field
+                // is for reusing one shown on the other device.
+                "  Both peers need the same token: paste the one shown on your other device, or pick \"Generate new\" above."
+            };
             lines.push(Line::from(Span::styled(
-                "  Both devices must use the same token. Generate one with: duopipe generate-auth-token",
+                hint,
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -477,8 +505,10 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     lines.push(Line::raw(""));
     let footer = match state.phase {
         SetupPhase::Start => "↑/↓ ←/→ move · Enter select · Esc / Ctrl-C quit",
-        SetupPhase::ChooseTokenSource => "←/→ move · Enter select · Esc back · Ctrl-C quit",
-        SetupPhase::EnterToken => "Enter confirm · Esc back · Ctrl-C quit",
+        SetupPhase::TokenSetup if !state.nostr_discovery => {
+            "Tab move · Enter generate/confirm · Esc back · Ctrl-C quit"
+        }
+        SetupPhase::TokenSetup => "Enter confirm · Esc back · Ctrl-C quit",
     };
     lines.push(Line::from(Span::styled(
         footer,
@@ -559,12 +589,12 @@ mod tests {
     }
 
     #[test]
-    fn start_without_token_offers_choice_then_generates() {
-        // Quick mode: no config token -> the choice screen, focused on Generate.
+    fn quick_without_token_focuses_generate_and_generates() {
+        // Quick mode: no config token -> the token-setup screen, focused on Generate.
         let mut s = SetupState::new(None, from_config(), false, None);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
-        assert_eq!(s.choose_focus, ChooseFocus::Generate);
+        assert_eq!(s.phase, SetupPhase::TokenSetup);
+        assert_eq!(s.token_focus, TokenFocus::Generate);
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
@@ -576,22 +606,17 @@ mod tests {
     }
 
     #[test]
-    fn nostr_without_token_can_enter_existing() {
-        // Nostr mode also reaches the same choice screen (no hard token requirement).
+    fn quick_can_tab_to_inline_field_and_enter_token() {
+        // Tab moves from the Generate button to the inline entry field; typing there
+        // and pressing Enter accepts the pasted token (not "generated").
         let token = auth::generate_token();
-        let mut s = SetupState::new(None, from_config(), true, Some("hl".into()));
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
-        // Move to "Enter existing" and open the entry screen.
-        handle_key(key(KeyCode::Right), &mut s);
-        assert_eq!(s.choose_focus, ChooseFocus::Enter);
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::EnterToken);
-        // Paste a valid token (whitespace around it is trimmed).
+        let mut s = SetupState::new(None, from_config(), false, None);
+        handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (focus Generate)
+        handle_key(key(KeyCode::Tab), &mut s);
+        assert_eq!(s.token_focus, TokenFocus::Input);
         type_str(&mut s, &token);
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
-                assert_eq!(r.role, Role::Both);
                 assert!(!r.token_generated, "an entered token is not 'generated'");
                 assert_eq!(r.auth_token, token);
             }
@@ -600,34 +625,43 @@ mod tests {
     }
 
     #[test]
-    fn enter_token_rejects_invalid_and_stays_open() {
-        let mut s = SetupState::new(None, from_config(), false, None);
-        handle_key(key(KeyCode::Enter), &mut s); // -> ChooseTokenSource
-        handle_key(key(KeyCode::Right), &mut s); // focus Enter
-        handle_key(key(KeyCode::Enter), &mut s); // -> EnterToken
-        type_str(&mut s, "not-a-real-token");
+    fn nostr_without_token_focuses_inline_field() {
+        // Nostr mode has no Generate button (its token is a pre-shared secret), so the
+        // entry field is focused immediately on the same screen.
+        let token = auth::generate_token();
+        let mut s = SetupState::new(None, from_config(), true, Some("hl".into()));
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::EnterToken);
-        assert!(s.error.is_some());
+        assert_eq!(s.phase, SetupPhase::TokenSetup);
+        assert_eq!(s.token_focus, TokenFocus::Input);
+        type_str(&mut s, &token);
+        match handle_key(key(KeyCode::Enter), &mut s) {
+            Step::Done(r) => {
+                assert_eq!(r.role, Role::Both);
+                assert!(!r.token_generated);
+                assert_eq!(r.auth_token, token);
+            }
+            _ => panic!("expected Done(Both) with the entered token"),
+        }
     }
 
     #[test]
-    fn choose_token_source_esc_returns_to_start() {
+    fn token_setup_esc_returns_to_start() {
         let mut s = SetupState::new(None, from_config(), false, None);
         handle_key(key(KeyCode::Enter), &mut s);
-        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
+        assert_eq!(s.phase, SetupPhase::TokenSetup);
         handle_key(key(KeyCode::Esc), &mut s);
         assert_eq!(s.phase, SetupPhase::Start);
     }
 
     #[test]
-    fn enter_token_esc_returns_to_choice() {
+    fn enter_token_rejects_invalid_and_stays_open() {
         let mut s = SetupState::new(None, from_config(), false, None);
-        handle_key(key(KeyCode::Enter), &mut s); // -> ChooseTokenSource
-        handle_key(key(KeyCode::Right), &mut s);
-        handle_key(key(KeyCode::Enter), &mut s); // -> EnterToken
-        handle_key(key(KeyCode::Esc), &mut s);
-        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
+        handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (focus Generate)
+        handle_key(key(KeyCode::Tab), &mut s); // focus the inline field
+        type_str(&mut s, "not-a-real-token");
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::TokenSetup);
+        assert!(s.error.is_some());
     }
 
     #[test]
