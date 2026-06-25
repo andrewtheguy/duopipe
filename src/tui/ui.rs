@@ -234,8 +234,9 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
 }
 
 fn header_height(show_token_banner: bool, show_conflict_warning: bool) -> u16 {
-    // The token banner is two lines: the token itself plus the hide hint below it.
-    let base = if show_token_banner { 7 } else { 5 };
+    // Five content rows (app identity, mode/name, streams/fp, node id, dial line) plus
+    // the border. The token banner adds two rows: the token itself and the hide hint.
+    let base = if show_token_banner { 9 } else { 7 };
     base + if show_conflict_warning { 1 } else { 0 }
 }
 
@@ -247,7 +248,9 @@ fn render_header(
     show_dial_hint: bool,
 ) {
     let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
-    let mut app_line = vec![
+    // Spread the header fields over a few short rows (at most two fields each) instead
+    // of one long line, so the header still reads on a narrow terminal.
+    let app_line = vec![
         Span::styled("duopipe", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             concat!(" v", env!("CARGO_PKG_VERSION")),
@@ -258,27 +261,29 @@ fn render_header(
             snap.hostname.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  mode: "),
+    ];
+    // This peer's identity: mode and (in nostr mode) its name.
+    let mut id_line = vec![
+        Span::raw("mode: "),
         Span::styled(mode_label(snap), Style::default().add_modifier(Modifier::BOLD)),
     ];
     if let Some(name) = own_name_display(snap) {
-        app_line.push(Span::raw("  name: "));
-        app_line.push(Span::styled(
+        id_line.push(Span::raw("  name: "));
+        id_line.push(Span::styled(
             name.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
     }
-    app_line.push(Span::raw("  streams: "));
-    app_line.push(Span::raw(format!(
-        "{}/{}",
-        snap.streams_used, snap.streams_max
-    )));
-    // A short, stable fingerprint of the active token, shown in every mode and role so
-    // the user can confirm two devices share the same token even after the full token
-    // is hidden (it is the only place the token can be cross-checked).
+    // Live status: open streams and a short, stable fingerprint of the active token,
+    // shown in every mode and role so the user can confirm two devices share the same
+    // token even after the full token is hidden (the only place it can be cross-checked).
+    let mut status_line = vec![
+        Span::raw("streams: "),
+        Span::raw(format!("{}/{}", snap.streams_used, snap.streams_max)),
+    ];
     if let Some(token) = snap.auth_token.as_deref() {
-        app_line.push(Span::raw("  token fp: "));
-        app_line.push(Span::styled(
+        status_line.push(Span::raw("  token fp: "));
+        status_line.push(Span::styled(
             crate::auth::token_fingerprint(token),
             Style::default().add_modifier(Modifier::BOLD),
         ));
@@ -286,6 +291,8 @@ fn render_header(
 
     let mut lines = vec![
         Line::from(app_line),
+        Line::from(id_line),
+        Line::from(status_line),
         Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
         dial_header_line(snap, show_dial_hint),
     ];
