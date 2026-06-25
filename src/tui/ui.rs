@@ -234,7 +234,8 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
 }
 
 fn header_height(show_token_banner: bool, show_conflict_warning: bool) -> u16 {
-    let base = if show_token_banner { 6 } else { 5 };
+    // The token banner is two lines: the token itself plus the hide hint below it.
+    let base = if show_token_banner { 7 } else { 5 };
     base + if show_conflict_warning { 1 } else { 0 }
 }
 
@@ -291,11 +292,11 @@ fn render_header(
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "  (hides after 10m, h to hide now)",
-                Style::default().fg(Color::DarkGray),
-            ),
         ]));
+        lines.push(Line::from(Span::styled(
+            "auth token hides after 10 minutes, press h to hide now",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     if let NameConflict::Degraded { message } = &snap.name_conflict {
@@ -362,8 +363,8 @@ pub(super) fn own_name_display(snap: &AppSnapshot) -> Option<&str> {
 pub(super) fn dial_text(snap: &AppSnapshot) -> String {
     snap.dial_target
         .as_deref()
-        .map(|target| format!("dial → {target}"))
-        .unwrap_or_else(|| "dial: not connected".to_string())
+        .map(|target| format!("Outbound → {target}"))
+        .unwrap_or_else(|| "Outbound: not connected".to_string())
 }
 
 /// The dial-session control hint, styled to stand out as an action. It lives on the
@@ -396,7 +397,7 @@ fn dial_header_line(snap: &AppSnapshot, show_hint: bool) -> Line<'static> {
     };
 
     let mut spans = vec![
-        Span::raw(format!("dial → {target}   status: ")),
+        Span::raw(format!("Outbound → {target}   status: ")),
         Span::styled(
             snap.conn_status.label(),
             Style::default().fg(conn_color(&snap.conn_status)),
@@ -605,11 +606,11 @@ fn tunnel_title(snap: &AppSnapshot) -> &'static str {
     match snap.role {
         Role::Listen => " Tunnels ",
         Role::Dial | Role::Both if has_connected_dial(snap) => {
-            " Tunnels  [↑/↓ select · Enter start/stop · a add · e edit · d/Del delete] "
+            " Outbound Tunnels  [↑/↓ select · Enter start/stop · a add · e edit · d/Del delete] "
         }
         // Without a dial session tunnels can be edited but not started; the connect
         // hint lives on the dial header line above, not here.
-        Role::Dial | Role::Both => " Tunnels  [a add · e edit · d/Del delete] ",
+        Role::Dial | Role::Both => " Outbound Tunnels  [a add · e edit · d/Del delete] ",
     }
 }
 
@@ -881,7 +882,7 @@ mod tests {
 
         assert!(text.contains("mode: nostr"));
         assert!(text.contains("name: web1"));
-        assert!(text.contains("dial: not connected"));
+        assert!(text.contains("Outbound: not connected"));
         // The connect control hint lives on the dial header line, not the Tunnels box.
         assert!(text.contains("Shift-C connect"));
     }
@@ -935,7 +936,7 @@ mod tests {
             ..Default::default()
         };
         let logs = render_text(&snap, &logs_ui);
-        assert!(logs.contains("dial: not connected"));
+        assert!(logs.contains("Outbound: not connected"));
         assert!(!logs.contains("Shift-C connect"));
     }
 
@@ -968,7 +969,7 @@ mod tests {
 
         let text = render_text(&snap, &UiState::default());
 
-        assert!(text.contains("dial → homelab"));
+        assert!(text.contains("Outbound → homelab"));
         assert!(text.contains("status: Connecting"));
         assert!(text.contains("path: establishing…"));
         // An active session offers disconnect (not connect) on the dial header line.

@@ -652,11 +652,11 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         snap.endpoint_id.as_deref().unwrap_or("(pending)")
     );
     if let Some(target) = snap.dial_target.as_deref() {
-        let _ = writeln!(out, "dial:      {target}");
+        let _ = writeln!(out, "outbound:  {target}");
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
     } else {
-        let _ = writeln!(out, "dial:      not connected");
+        let _ = writeln!(out, "outbound:  not connected");
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
 
@@ -1102,7 +1102,7 @@ mod tests {
 
         assert!(text.contains("mode:      nostr"));
         assert!(text.contains("name:      web1"));
-        assert!(text.contains("dial:      not connected"));
+        assert!(text.contains("outbound:  not connected"));
         assert!(!text.contains("role:"));
         assert!(!text.contains("status:"));
         assert!(!text.contains("path:"));
