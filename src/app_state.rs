@@ -15,7 +15,7 @@ use parking_lot::RwLock;
 use tokio::sync::{Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::RequestEntry;
+use crate::config::TunnelEntry;
 use crate::logging::LogBuffer;
 
 /// Capacity of the tunnel-command broadcast channel (commands are tiny; this
@@ -24,9 +24,9 @@ const TUNNEL_COMMAND_CAPACITY: usize = 64;
 const DIAL_COMMAND_CAPACITY: usize = 16;
 const NAME_COMMAND_CAPACITY: usize = 8;
 
-/// Stable identity for a tunnel request, allocated once when the request is added
+/// Stable identity for a tunnel, allocated once when the tunnel is added
 /// (config-seeded or runtime) and unchanged for the life of the session, including
-/// across reconnect reseeds. Identity is decoupled from the vec position so requests
+/// across reconnect reseeds. Identity is decoupled from the vec position so tunnels
 /// can be removed without disturbing the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TunnelId(u64);
@@ -194,14 +194,14 @@ impl PathInfo {
     }
 }
 
-/// Lifecycle status of a configured tunnel request.
+/// Lifecycle status of a configured tunnel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TunnelStatus {
     /// Configured but not started (or stopped).
     Idle,
-    /// Local listener is bound and the request is active.
+    /// Local listener is bound and the tunnel is active.
     Listening,
-    /// The request failed (bind error, peer rejection, etc.).
+    /// The tunnel failed (bind error, peer rejection, etc.).
     Error,
 }
 
@@ -220,14 +220,14 @@ impl TunnelStatus {
     }
 }
 
-/// A configured tunnel request and its current status. Carries the request's stable
+/// A configured tunnel and its current status. Carries the tunnel's stable
 /// [`TunnelId`]; rows are kept in display order, but the id (not the position) is the
 /// identity used to start/stop/delete it.
 #[derive(Clone)]
 pub struct TunnelRow {
-    /// Stable identity of the underlying request.
+    /// Stable identity of the underlying tunnel.
     pub id: TunnelId,
-    /// Display label from the request's `name`.
+    /// Display label from the tunnel's `name`.
     pub name: String,
     /// Human-readable "LISTEN <- SOURCE" description.
     pub spec: String,
@@ -236,16 +236,16 @@ pub struct TunnelRow {
     pub detail: String,
 }
 
-/// A configured tunnel request paired with its stable id. The authoritative spec
-/// list (`AppState::requests`) is seeded from config and appended to at runtime.
-struct Request {
+/// A configured tunnel paired with its stable id. The authoritative spec
+/// list (`AppState::specs`) is seeded from config and appended to at runtime.
+struct TunnelSpec {
     id: TunnelId,
-    entry: RequestEntry,
+    entry: TunnelEntry,
 }
 
-/// Build the `Idle` tunnel row for a request (centralizes the spec format used by
+/// Build the `Idle` tunnel row for a tunnel (centralizes the spec format used by
 /// both seeding and runtime additions).
-fn tunnel_row_for(id: TunnelId, entry: &RequestEntry) -> TunnelRow {
+fn tunnel_row_for(id: TunnelId, entry: &TunnelEntry) -> TunnelRow {
     TunnelRow {
         id,
         name: entry.name.clone(),
@@ -283,10 +283,10 @@ pub struct AppState {
     peers: RwLock<Vec<PeerRow>>,
     /// Monotonic allocator for [`TunnelId`]s. Never reused within a session.
     next_id: AtomicU64,
-    /// Authoritative tunnel-request list (dial role): seeded from config and appended
-    /// to at runtime via [`AppState::add_request`]. `tunnels` is kept 1:1 with this
-    /// (same order), but identity is the [`TunnelId`], not the vec position.
-    requests: RwLock<Vec<Request>>,
+    /// Authoritative tunnel list: seeded from config and appended to at runtime via
+    /// [`AppState::add_tunnel`]. `tunnels` is kept 1:1 with this (same order), but
+    /// identity is the [`TunnelId`], not the vec position.
+    specs: RwLock<Vec<TunnelSpec>>,
     tunnels: RwLock<Vec<TunnelRow>>,
     /// Live stream limiter; `used = max - available_permits()`. One global cap on
     /// concurrent forwarded streams across all tunnels and all connected peers.
@@ -318,24 +318,24 @@ impl AppState {
         role: Role,
         token_generated: bool,
         logs: Arc<LogBuffer>,
-        requests: Vec<RequestEntry>,
+        tunnels: Vec<TunnelEntry>,
         nostr_discovery: bool,
         own_name: Option<String>,
     ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
         let (name_tx, _) = broadcast::channel(NAME_COMMAND_CAPACITY);
-        // Assign a stable id to each config-seeded request; runtime adds continue
+        // Assign a stable id to each config-seeded tunnel; runtime adds continue
         // from the same counter via `alloc_id`.
-        let requests: Vec<Request> = requests
+        let specs: Vec<TunnelSpec> = tunnels
             .into_iter()
             .enumerate()
-            .map(|(i, entry)| Request {
+            .map(|(i, entry)| TunnelSpec {
                 id: TunnelId(i as u64),
                 entry,
             })
             .collect();
-        let next_id = AtomicU64::new(requests.len() as u64);
+        let next_id = AtomicU64::new(specs.len() as u64);
         Arc::new(Self {
             role,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -346,7 +346,7 @@ impl AppState {
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
             next_id,
-            requests: RwLock::new(requests),
+            specs: RwLock::new(specs),
             tunnels: RwLock::new(Vec::new()),
             semaphore: RwLock::new(None),
             streams_max: RwLock::new(0),
@@ -485,60 +485,94 @@ impl AppState {
         self.peers.write().retain(|p| p.remote_id != remote_id);
     }
 
-    /// Rebuild the tunnel table from the current request list (all `Idle`), carrying
-    /// each request's stable id. Called once per (re)connection; runtime additions
-    /// and deletions persist because they live in `requests`.
-    pub fn seed_tunnels_from_requests(&self) {
+    /// Rebuild the tunnel table from the current spec list (all `Idle`), carrying
+    /// each tunnel's stable id. Called once per (re)connection; runtime additions
+    /// and deletions persist because they live in `specs`.
+    pub fn seed_tunnels(&self) {
         let rows = self
-            .requests
+            .specs
             .read()
             .iter()
-            .map(|r| tunnel_row_for(r.id, &r.entry))
+            .map(|s| tunnel_row_for(s.id, &s.entry))
             .collect();
         *self.tunnels.write() = rows;
     }
 
-    /// The request with `id`, cloned (used by the connection supervisor on `Start`).
-    pub fn get_request(&self, id: TunnelId) -> Option<RequestEntry> {
-        self.requests
+    /// The tunnel with `id`, cloned (used by the connection supervisor on `Start`).
+    pub fn get_tunnel(&self, id: TunnelId) -> Option<TunnelEntry> {
+        self.specs
             .read()
             .iter()
-            .find(|r| r.id == id)
-            .map(|r| r.entry.clone())
+            .find(|s| s.id == id)
+            .map(|s| s.entry.clone())
     }
 
-    /// Ids of all configured tunnel requests, in display order (used by the autostart
+    /// Ids of all configured tunnels, in display order (used by the autostart
     /// path to start each one).
-    pub fn request_ids(&self) -> Vec<TunnelId> {
-        self.requests.read().iter().map(|r| r.id).collect()
+    pub fn tunnel_ids(&self) -> Vec<TunnelId> {
+        self.specs.read().iter().map(|s| s.id).collect()
     }
 
-    /// Append a new tunnel request at runtime and its matching `Idle` row. Returns
+    /// Whether the tunnel `id` is currently running (used to gate the edit action).
+    pub fn tunnel_running(&self, id: TunnelId) -> bool {
+        self.tunnels
+            .read()
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| t.status.is_running())
+    }
+
+    /// Whether `name` is already used by a tunnel, optionally ignoring `except` (the
+    /// row being edited). Used to keep tunnel names unique.
+    pub fn tunnel_name_taken(&self, name: &str, except: Option<TunnelId>) -> bool {
+        self.specs
+            .read()
+            .iter()
+            .any(|s| Some(s.id) != except && s.entry.name == name)
+    }
+
+    /// Append a new tunnel at runtime and its matching `Idle` row. Returns
     /// its freshly allocated id.
-    pub fn add_request(&self, entry: RequestEntry) -> TunnelId {
+    pub fn add_tunnel(&self, entry: TunnelEntry) -> TunnelId {
         let id = self.alloc_id();
         let row = tunnel_row_for(id, &entry);
-        // Hold both locks for the duration so `requests` and `tunnels` are never
-        // observed out of sync. Lock order is requests-then-tunnels, matching
-        // `seed_tunnels_from_requests`; no site takes them the other way, so this
-        // can't deadlock.
-        let mut requests = self.requests.write();
+        // Hold both locks for the duration so `specs` and `tunnels` are never
+        // observed out of sync. Lock order is specs-then-tunnels, matching
+        // `seed_tunnels`; no site takes them the other way, so this can't deadlock.
+        let mut specs = self.specs.write();
         let mut tunnels = self.tunnels.write();
-        requests.push(Request { id, entry });
+        specs.push(TunnelSpec { id, entry });
         tunnels.push(row);
         id
+    }
+
+    /// Replace the spec of tunnel `id` in place, rebuilding its row to `Idle` (caller
+    /// guarantees it is not running). No `Start` is sent; the tunnel keeps its id and
+    /// position. A no-op if `id` is unknown.
+    pub fn edit_tunnel(&self, id: TunnelId, entry: TunnelEntry) {
+        // Same specs-then-tunnels lock order as `add_tunnel`.
+        let mut specs = self.specs.write();
+        let mut tunnels = self.tunnels.write();
+        if let Some(spec) = specs.iter_mut().find(|s| s.id == id) {
+            spec.entry = entry.clone();
+        } else {
+            return;
+        }
+        if let Some(row) = tunnels.iter_mut().find(|t| t.id == id) {
+            *row = tunnel_row_for(id, &entry);
+        }
     }
 
     /// Remove the tunnel `id` from the session (config is never touched). If it is
     /// running, a `Stop` is broadcast first so the supervisor cancels its task and
     /// frees the bound local port; the row is then dropped from both lists.
-    pub fn delete_request(&self, id: TunnelId) {
+    pub fn delete_tunnel(&self, id: TunnelId) {
         // Free the port if running. `Stop` for a non-running id is a harmless no-op in
         // the supervisor, so we send unconditionally.
         self.send_command(TunnelCommand::Stop(id));
-        let mut requests = self.requests.write();
+        let mut specs = self.specs.write();
         let mut tunnels = self.tunnels.write();
-        requests.retain(|r| r.id != id);
+        specs.retain(|s| s.id != id);
         tunnels.retain(|t| t.id != id);
     }
 
@@ -618,8 +652,8 @@ mod tests {
     use super::*;
     use crate::logging::LogBuffer;
 
-    fn req(name: &str, src: &str, listen: &str) -> RequestEntry {
-        RequestEntry {
+    fn req(name: &str, src: &str, listen: &str) -> TunnelEntry {
+        TunnelEntry {
             name: name.into(),
             remote_source: src.into(),
             local_listen: listen.into(),
@@ -627,22 +661,22 @@ mod tests {
     }
 
     #[test]
-    fn add_request_appends_request_and_idle_row() {
+    fn add_tunnel_appends_tunnel_and_idle_row() {
         let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed, false, None);
-        // Rows mirror the requests only after seeding.
-        state.seed_tunnels_from_requests();
-        assert_eq!(state.request_ids().len(), 1);
+        // Rows mirror the specs only after seeding.
+        state.seed_tunnels();
+        assert_eq!(state.tunnel_ids().len(), 1);
         assert_eq!(state.tunnel_count(), 1);
         let db_id = state.tunnel_id_at(0).expect("seeded id");
 
-        let id = state.add_request(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
+        let id = state.add_tunnel(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
         assert_ne!(id, db_id, "append allocates a fresh id");
-        assert_eq!(state.request_ids().len(), 2);
+        assert_eq!(state.tunnel_ids().len(), 2);
         assert_eq!(state.tunnel_count(), 2);
 
-        // The request round-trips and the row is Idle with the right spec.
-        let got = state.get_request(id).expect("request present");
+        // The tunnel round-trips and the row is Idle with the right spec.
+        let got = state.get_tunnel(id).expect("tunnel present");
         assert_eq!(got.remote_source, "tcp://127.0.0.1:22");
         let row = state.snapshot().tunnels[1].clone();
         assert_eq!(row.id, id);
@@ -651,33 +685,68 @@ mod tests {
         assert_eq!(row.status, TunnelStatus::Idle);
 
         // A second append keeps allocating distinct ids.
-        let id2 = state.add_request(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
+        let id2 = state.add_tunnel(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
         assert_ne!(id2, id);
-        assert_eq!(state.get_request(db_id).unwrap().name, "db");
+        assert_eq!(state.get_tunnel(db_id).unwrap().name, "db");
     }
 
     #[test]
-    fn delete_request_drops_row_and_preserves_other_ids() {
+    fn delete_tunnel_drops_row_and_preserves_other_ids() {
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
-        let a = state.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        let b = state.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
-        let c = state.add_request(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
+        let a = state.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        let b = state.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        let c = state.add_tunnel(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
         assert_eq!(state.tunnel_count(), 3);
 
         // Delete the middle tunnel.
-        state.delete_request(b);
+        state.delete_tunnel(b);
         assert_eq!(state.tunnel_count(), 2);
-        assert!(state.get_request(b).is_none(), "deleted request is gone");
+        assert!(state.get_tunnel(b).is_none(), "deleted tunnel is gone");
 
         // The survivors keep their ids and shift up by one position.
-        assert_eq!(state.get_request(a).unwrap().name, "a");
-        assert_eq!(state.get_request(c).unwrap().name, "c");
+        assert_eq!(state.get_tunnel(a).unwrap().name, "a");
+        assert_eq!(state.get_tunnel(c).unwrap().name, "c");
         assert_eq!(state.tunnel_id_at(0), Some(a));
         assert_eq!(state.tunnel_id_at(1), Some(c));
 
         // Deleting an unknown id is a no-op.
-        state.delete_request(b);
+        state.delete_tunnel(b);
         assert_eq!(state.tunnel_count(), 2);
+    }
+
+    #[test]
+    fn update_tunnel_replaces_spec_and_row_in_place() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
+        let a = state.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        let b = state.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+
+        state.edit_tunnel(a, req("a2", "udp://127.0.0.1:9", "127.0.0.1:99"));
+        // Same id and position; spec and row reflect the edit.
+        assert_eq!(state.tunnel_id_at(0), Some(a));
+        let got = state.get_tunnel(a).expect("tunnel present");
+        assert_eq!(got.name, "a2");
+        assert_eq!(got.remote_source, "udp://127.0.0.1:9");
+        let row = state.snapshot().tunnels[0].clone();
+        assert_eq!(row.id, a);
+        assert_eq!(row.name, "a2");
+        assert_eq!(row.spec, "127.0.0.1:99 <- udp://127.0.0.1:9");
+        assert_eq!(row.status, TunnelStatus::Idle);
+        // The other tunnel is untouched.
+        assert_eq!(state.get_tunnel(b).unwrap().name, "b");
+    }
+
+    #[test]
+    fn tunnel_name_taken_honors_except() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
+        let a = state.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        state.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+
+        assert!(state.tunnel_name_taken("b", None));
+        assert!(!state.tunnel_name_taken("c", None));
+        // "a" excluding its own row is free (lets an edit keep its name).
+        assert!(!state.tunnel_name_taken("a", Some(a)));
+        // But "b" still collides even when editing "a".
+        assert!(state.tunnel_name_taken("b", Some(a)));
     }
 
     #[test]

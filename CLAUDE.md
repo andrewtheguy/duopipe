@@ -46,8 +46,8 @@ to stderr, needs no terminal) and is required for the other test-only vars to ta
 effect.
 - `DUOPIPE_TEST_MODE=1` enables headless test mode and gates the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` present ⇒ dial that node id; absent ⇒ listen.
-- `DUOPIPE_AUTOSTART_REQUESTS=1` starts every configured `[[request]]` (dial role)
-  once the connection is up. Required to exercise tunnels in tests, since requests are
+- `DUOPIPE_AUTOSTART_TUNNELS=1` starts every configured `[[tunnel]]` (dial role)
+  once the connection is up. Required to exercise tunnels in tests, since tunnels are
   otherwise activated interactively in the TUI and nothing forwards automatically.
 - `DUOPIPE_AUTH_TOKEN=<token>` is the shared auth token (required to dial; for
   listen it is used if set, otherwise one is generated). Also honored outside test
@@ -96,10 +96,11 @@ Tunnel model: within any one connection the **dialer requests** tunnels and the
 always-on serve half gates each incoming request against its `[allowed_sources]` CIDR
 lists (`tcp`/`udp`; an empty/absent list defaults to dual-stack localhost
 `127.0.0.0/8`, `::1/128`), while its dial session requests tunnels from whatever peer
-it is connected to. Each `[[request]]` is a tunnel template (dial side): it binds a
-local `local_listen` address and asks the connected peer to connect out to a
-`remote_source`, bridging the two — SSH `-L`-style local forwarding. Tunnels are
-started interactively (`Enter`) or added at runtime (`a`).
+it is connected to. The `[[tunnel]]` entries are a seed list of tunnels (dial side):
+each binds a local `local_listen` address and asks the connected peer to connect out
+to a `remote_source`, bridging the two — SSH `-L`-style local forwarding. Names must
+be unique. Tunnels are started interactively (`Enter`), added at runtime (`a`), or
+edited in place while not running (`e`).
 
 Multiple peers: the serve half accepts **many concurrent inbound peers** over its iroh
 endpoint — there is no single-peer session binding (authentication is the only gate).
