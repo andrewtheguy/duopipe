@@ -253,7 +253,9 @@ pub(super) async fn forward_stream_to_udp_server(
     // Order addresses for connection attempts
     let ordered_addrs = order_udp_addresses(&target_addrs);
     let (response_tx, response_rx) = mpsc::channel::<Bytes>(32);
-    let writer_task = tokio::spawn(write_udp_responses_to_stream(send_stream, response_rx));
+    let writer_task = tokio::spawn(crate::logging::inherit_source(
+        write_udp_responses_to_stream(send_stream, response_rx),
+    ));
 
     let mut active_session: Option<UdpTargetSession> = None;
     let mut active_addr_idx = 0;
@@ -405,7 +407,7 @@ fn spawn_udp_response_task(
     target_addr: SocketAddr,
     response_tx: mpsc::Sender<Bytes>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::spawn(crate::logging::inherit_source(async move {
         let mut storage = uninitialized_vec(65535);
         loop {
             let mut read_buf = ReadBuf::uninit(&mut storage);
@@ -423,7 +425,7 @@ fn spawn_udp_response_task(
             }
             log::debug!("-> Sent {} bytes back to client from {}", data.len(), target_addr);
         }
-    })
+    }))
 }
 
 async fn write_udp_responses_to_stream(
