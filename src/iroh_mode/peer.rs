@@ -639,6 +639,10 @@ async fn run_node_id_publisher(params: PublisherParams) {
         config_path,
     } = params;
 
+    // State/lock files are namespaced by the token fingerprint (matches the lock taken
+    // at startup, since the resolved token is validated against the config fingerprint).
+    let fingerprint = crate::auth::token_fingerprint(&auth_token);
+
     let mut commands = state.subscribe_name();
     let mut first = true;
     // Count of completed publishes; the first few cycles re-check quickly (see
@@ -651,7 +655,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
         // the relay record, so a fresh node id each run is not a false conflict);
         // subsequent cycles compare the relay's node id against our own.
         let outcome = if first {
-            match crate::peer_state::read_flag(&identifier) {
+            match crate::peer_state::read_flag(&identifier, &fingerprint) {
                 Some(flag) => CheckOutcome::Conflict {
                     other_node_id: flag.other_node_id,
                 },
@@ -673,7 +677,8 @@ async fn run_node_id_publisher(params: PublisherParams) {
         if let CheckOutcome::Conflict { other_node_id } = outcome {
             let at_startup = first;
             // Stop publishing and remember the conflict so it survives a restart.
-            if let Err(e) = crate::peer_state::write_flag(&identifier, &other_node_id) {
+            if let Err(e) = crate::peer_state::write_flag(&identifier, &fingerprint, &other_node_id)
+            {
                 log::warn!("Could not write name-conflict flag: {e}");
             }
 
@@ -708,7 +713,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
 
             match cmd {
                 NameCommand::TakeOver => {
-                    if let Err(e) = crate::peer_state::clear_flag(&identifier) {
+                    if let Err(e) = crate::peer_state::clear_flag(&identifier, &fingerprint) {
                         log::warn!("Could not clear name-conflict flag: {e}");
                     }
                     state.clear_name_conflict();

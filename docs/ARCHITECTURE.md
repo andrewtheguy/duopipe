@@ -425,7 +425,7 @@ graph TB
     end
 
     subgraph "Options"
-        E[auth_token_file — path to the single shared token<br/>both peers]
+        E[auth_token_file — path to the single shared token<br/>auth_token_fingerprint — required in nostr mode]
         G[tunnel[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
@@ -454,13 +454,16 @@ The outbound dial target is not a config field. In interactive mode it is entere
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. When none of these supply a token, the interactive setup screen resolves it (validated against its CRC before acceptance): **quick mode** offers generate-or-enter — a generated token is ephemeral and surfaced in the dashboard header for copying — while **nostr mode** only accepts a pasted token, since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`). `auth_token_file` is therefore optional in nostr mode too — only a `name` is mandatory.
+Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. When none of these supply a token, the interactive setup screen resolves it (validated against its CRC before acceptance): **quick mode** offers generate-or-enter — a generated token is ephemeral and surfaced in the dashboard header for copying — while **nostr mode** only accepts a pasted token, since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`). `auth_token_file` is therefore optional in nostr mode too — only a `name` and `auth_token_fingerprint` are mandatory.
 
-The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, a CRC16-CCITT-FALSE over the token string rendered as 4 hex digits — persistently in the header (all modes/roles) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret.
+The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, the first 4 bytes of the token string's SHA-256 rendered as 8 lowercase hex digits — persistently in the header (all modes/roles) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret. The same canonical form also namespaces the per-name local state/lock file (`peer_state`): its path is `state-<fingerprint>-<name>.json`, with the `name` used verbatim (safe because `config::validate_name` restricts it to ASCII letters, digits, and `_`), so different pairings (tokens) that share a `name` get distinct, human-readable state files.
+
+**Fingerprint pinning (nostr mode):** a nostr config must declare `auth_token_fingerprint` (the same 8-hex-digit value) regardless of whether the token itself is in the config. The resolved token — from file, env, or pasted at setup — is checked against it (`auth::fingerprint_matches`): a file/env token is verified in `main::resolve_expected_fingerprint` before the TUI launches (a mismatch is a plain config error), and a pasted token is verified in the setup screen (`submit_token`). This disambiguates configs meant for different pairings, so pointing a config at the wrong token file is caught up front instead of failing as an auth error on connect. Quick mode declares no fingerprint.
 
 ```toml
 # peer.toml
 auth_token_file = "/etc/duopipe/auth_token.txt"
+auth_token_fingerprint = "a1b2c3d4"   # required in nostr mode; must match the token above
 
 [[tunnel]]
 name = "ssh"

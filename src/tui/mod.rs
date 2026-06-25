@@ -49,6 +49,10 @@ pub struct TuiLaunch {
     /// A valid auth token from config/env (pre-seeds the dial flow; used directly
     /// for listen). Pre-validated in main.
     pub config_auth_token: Option<String>,
+    /// Expected token fingerprint declared by a nostr config (`auth_token_fingerprint`),
+    /// already validated in main. When set, a token pasted at the setup screen must match
+    /// it. `None` in quick mode.
+    pub expected_token_fingerprint: Option<String>,
     /// Nostr relay URLs for node-id discovery.
     pub nostr_relays: Vec<String>,
     /// Whether nostr node-id discovery is enabled (listener publishes, dialer
@@ -73,6 +77,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         &mut terminal,
         &mut events,
         launch.config_auth_token.clone(),
+        launch.expected_token_fingerprint.clone(),
         launch.allowed_sources.clone(),
         launch.nostr_discovery,
         launch.peer_name.clone(),
@@ -206,12 +211,14 @@ async fn run_setup(
     terminal: &mut DefaultTerminal,
     events: &mut EventStream,
     config_auth_token: Option<String>,
+    expected_token_fingerprint: Option<String>,
     config_allowed_sources: AllowedSources,
     nostr_discovery: bool,
     own_name: Option<String>,
 ) -> SetupOutcome {
     let mut state = SetupState::new(
         config_auth_token,
+        expected_token_fingerprint,
         config_allowed_sources,
         nostr_discovery,
         own_name,
@@ -605,6 +612,12 @@ fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
         if state.own_name.as_deref().map(str::trim) == Some(raw.as_str()) {
             form.error =
                 Some("That is this peer's own name; enter the other peer's name".to_string());
+            return;
+        }
+        // Every valid listener name is alphanumeric + `_`, so reject anything else up
+        // front rather than dialing a name that can never resolve.
+        if let Err(e) = crate::config::validate_name(&raw) {
+            form.error = Some(e.to_string());
             return;
         }
         DialTarget::Name(raw)

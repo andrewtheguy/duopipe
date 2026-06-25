@@ -88,6 +88,10 @@ enum Command {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
         count: usize,
+        /// Emit JSON (a `[{"token","fingerprint"}]` array) for scripting/automation
+        /// instead of the human-readable `<token>  # fp: <fp>` lines.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -127,6 +131,48 @@ fn resolve_config_auth_token(
         )?;
     }
     Ok(token)
+}
+
+/// Resolve the expected auth-token fingerprint for nostr mode. Nostr configs must
+/// declare `auth_token_fingerprint` (the 8-hex-digit fingerprint of the shared token):
+/// it disambiguates configs meant for different pairings, so a config can't be run with
+/// the wrong pairing's token. Returns the validated fingerprint so a token pasted at the
+/// setup screen can also be checked against it; a token already resolved from file/env is
+/// checked here. Quick mode declares no fingerprint and returns `None`.
+fn resolve_expected_fingerprint(
+    cfg: &PeerConfig,
+    nostr_mode: bool,
+    config_auth_token: Option<&str>,
+) -> Result<Option<String>> {
+    if !nostr_mode {
+        return Ok(None);
+    }
+    let expected = cfg
+        .auth_token_fingerprint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Nostr mode requires `auth_token_fingerprint` in the config: the 8-hex-digit \
+                 fingerprint of your shared token (shown by `duopipe generate-auth-token` and in \
+                 the dashboard header). It guards against running this config with a token meant \
+                 for a different pairing."
+            )
+        })?;
+    auth::validate_fingerprint(expected)?;
+    if let Some(token) = config_auth_token
+        && !auth::fingerprint_matches(token, expected)
+    {
+        anyhow::bail!(
+            "Auth token fingerprint mismatch: the config declares \
+             `auth_token_fingerprint = \"{}\"`, but the resolved token's fingerprint is {}. \
+             This token belongs to a different pairing — fix the token source or the fingerprint.",
+            expected,
+            auth::token_fingerprint(token)
+        );
+    }
+    Ok(Some(expected.to_string()))
 }
 
 /// All test-only environment variables, read once behind the single
@@ -345,9 +391,29 @@ async fn run_inner() -> Result<()> {
             )
             .await
         }
-        Command::GenerateAuthToken { count } => {
-            for _ in 0..count {
-                println!("{}", auth::generate_token());
+        Command::GenerateAuthToken { count, json } => {
+            let tokens: Vec<String> = (0..count).map(|_| auth::generate_token()).collect();
+            if json {
+                // Structured output for scripting/automation: an array of
+                // {token, fingerprint} objects so callers don't have to parse the
+                // human-readable line format.
+                let entries: Vec<_> = tokens
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "token": t,
+                            "fingerprint": auth::token_fingerprint(t),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                // The fingerprint is appended as an inline `#` comment so the output is
+                // still a valid token file (the parser strips inline comments), while
+                // surfacing the value to put in a nostr config's `auth_token_fingerprint`.
+                for token in &tokens {
+                    println!("{}  # fp: {}", token, auth::token_fingerprint(token));
+                }
             }
             Ok(())
         }
@@ -408,6 +474,13 @@ async fn run_start_peer(
         .await;
     }
 
+    // Nostr mode must declare the shared token's fingerprint. A token already resolved
+    // from file/env is checked against it now (plain error, exit); a token pasted at the
+    // setup screen is checked there, so carry the expected fingerprint into the TUI.
+    let expected_token_fingerprint =
+        resolve_expected_fingerprint(&cfg, nostr_discovery_enabled, config_auth_token.as_deref())
+            .map_err(TunnelError::config)?;
+
     // When no token is supplied via file/env, the interactive setup screen resolves it,
     // so `auth_token_file` is fully optional. Quick mode offers generate-or-enter (the
     // token is ephemeral). Nostr mode only lets you paste a token: it is the pre-shared
@@ -431,8 +504,16 @@ async fn run_start_peer(
     // fails fast at startup (the lock is held for the whole process, so there is no
     // mid-session local conflict). `_name_lock` must outlive `run_tui`; dropping it on
     // exit releases the lock. Quick mode (no name) takes no lock.
+    // State/lock files are namespaced by the token fingerprint as well as the name.
+    // The lock path runs only in nostr mode, where `expected_token_fingerprint` is
+    // required and present; the eventual token is validated to match it, so this is the
+    // same value the publisher derives from the resolved token below.
+    let lock_fingerprint = expected_token_fingerprint
+        .as_deref()
+        .map(|fp| fp.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     let _name_lock = match peer_name.as_deref() {
-        Some(name) => match peer_state::acquire_name_lock(name) {
+        Some(name) => match peer_state::acquire_name_lock(name, &lock_fingerprint) {
             Ok(lock) => Some(lock),
             Err(peer_state::NameLockError::Held) => {
                 return Err(TunnelError::config(anyhow::anyhow!(
@@ -462,6 +543,7 @@ async fn run_start_peer(
         max_streams: cfg.max_streams,
         transport: cfg.transport.clone(),
         config_auth_token,
+        expected_token_fingerprint,
         nostr_relays,
         nostr_discovery: nostr_discovery_enabled,
         peer_name,
@@ -469,4 +551,66 @@ async fn run_start_peer(
     };
 
     tui::run_tui(launch).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_fp(fp: Option<&str>) -> PeerConfig {
+        PeerConfig {
+            auth_token_fingerprint: fp.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn quick_mode_ignores_fingerprint() {
+        // Quick mode declares no fingerprint and never checks one.
+        let cfg = cfg_with_fp(None);
+        assert!(
+            resolve_expected_fingerprint(&cfg, false, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nostr_mode_requires_fingerprint() {
+        let cfg = cfg_with_fp(None);
+        let err = resolve_expected_fingerprint(&cfg, true, None).unwrap_err();
+        assert!(err.to_string().contains("auth_token_fingerprint"));
+    }
+
+    #[test]
+    fn nostr_mode_rejects_malformed_fingerprint() {
+        let cfg = cfg_with_fp(Some("nothex"));
+        assert!(resolve_expected_fingerprint(&cfg, true, None).is_err());
+    }
+
+    #[test]
+    fn nostr_mode_returns_fingerprint_when_no_token_yet() {
+        // No file/env token: the fingerprint is returned so setup can check a pasted one.
+        let cfg = cfg_with_fp(Some("a1b2c3d4"));
+        assert_eq!(
+            resolve_expected_fingerprint(&cfg, true, None).unwrap(),
+            Some("a1b2c3d4".to_string())
+        );
+    }
+
+    #[test]
+    fn nostr_mode_accepts_matching_token() {
+        let token = auth::generate_token();
+        let cfg = cfg_with_fp(Some(&auth::token_fingerprint(&token)));
+        assert!(resolve_expected_fingerprint(&cfg, true, Some(&token)).is_ok());
+    }
+
+    #[test]
+    fn nostr_mode_rejects_token_for_different_pairing() {
+        let token = auth::generate_token();
+        let other = auth::generate_token();
+        let cfg = cfg_with_fp(Some(&auth::token_fingerprint(&other)));
+        let err = resolve_expected_fingerprint(&cfg, true, Some(&token)).unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
+    }
 }
