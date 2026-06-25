@@ -16,6 +16,14 @@ outbound dial session. Two interactive subcommands — `duopipe quick` (configle
 dial by node id) and `duopipe nostr` (config-driven, dial by `name`). Headless test
 mode is gated by `DUOPIPE_TEST_MODE=1`.
 
+# Automation / AI agents
+The interactive `quick`/`nostr` subcommands need a TTY and are not scriptable, but
+`duopipe generate-auth-token` is. For programmatic use pass `--json` to get a
+`[{"token","fingerprint"}]` array (use `--count N` for several) instead of the
+human-readable `<token>  # fp: <fp>` lines — parse that rather than scraping stdout.
+The `fingerprint` is what goes in a nostr config's `auth_token_fingerprint`; the
+`token` goes in the `auth_token_file` (or `DUOPIPE_AUTH_TOKEN`) on every paired device.
+
 # Where the details live
 Don't duplicate these here — read and update the source docs:
 - **README.md** — usage model, CLI options, config file format, test-mode env vars

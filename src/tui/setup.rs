@@ -106,6 +106,10 @@ pub struct SetupState {
     phase: SetupPhase,
     /// A valid auth token already supplied by config/env (pre-validated in main).
     config_auth_token: Option<String>,
+    /// Expected token fingerprint declared by a nostr config (validated in main). When
+    /// set, a token pasted here must match it — guarding against a token meant for a
+    /// different pairing. `None` in quick mode.
+    expected_token_fingerprint: Option<String>,
     /// Allowlist supplied by config. When non-empty the interactive allowlist fields
     /// are hidden (config wins); when empty they are shown on the start screen.
     config_allowed_sources: AllowedSources,
@@ -135,6 +139,7 @@ pub struct SetupState {
 impl SetupState {
     pub fn new(
         config_auth_token: Option<String>,
+        expected_token_fingerprint: Option<String>,
         config_allowed_sources: AllowedSources,
         nostr_discovery: bool,
         own_name: Option<String>,
@@ -142,6 +147,7 @@ impl SetupState {
         Self {
             phase: SetupPhase::Start,
             config_auth_token,
+            expected_token_fingerprint,
             config_allowed_sources,
             // The Start button is the primary action and focused first; the optional
             // CIDR fields are reached by arrowing down.
@@ -181,13 +187,22 @@ fn submit_token(state: &mut SetupState) -> Step {
         });
         return Step::Continue;
     }
-    match auth::validate_token(&token) {
-        Ok(()) => finalize(state, token, false),
-        Err(e) => {
-            state.error = Some(format!("Invalid token: {e}"));
-            Step::Continue
-        }
+    if let Err(e) = auth::validate_token(&token) {
+        state.error = Some(format!("Invalid token: {e}"));
+        return Step::Continue;
     }
+    // In nostr mode the config declares the expected fingerprint; a token for a
+    // different pairing is rejected here rather than failing the connection later.
+    if let Some(expected) = &state.expected_token_fingerprint
+        && !auth::fingerprint_matches(&token, expected)
+    {
+        state.error = Some(format!(
+            "Token fingerprint {} does not match the config's auth_token_fingerprint ({expected}). This token is for a different pairing.",
+            auth::token_fingerprint(&token)
+        ));
+        return Step::Continue;
+    }
+    finalize(state, token, false)
 }
 
 /// Build the final `ResolvedPeer`. Interactive runs are always `Role::Both` (serve
@@ -600,7 +615,7 @@ mod tests {
     #[test]
     fn start_with_config_token_finishes_as_both() {
         let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token.clone()), from_config(), true, Some("hl".into()));
+        let mut s = SetupState::new(Some(token.clone()), None, from_config(), true, Some("hl".into()));
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
@@ -617,7 +632,7 @@ mod tests {
     #[test]
     fn quick_without_token_focuses_generate_and_generates() {
         // Quick mode: no config token -> the token-setup screen, focused on Generate.
-        let mut s = SetupState::new(None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, from_config(), false, None);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::TokenSetup);
         assert_eq!(s.token_focus, TokenFocus::Generate);
@@ -636,7 +651,7 @@ mod tests {
         // Tab moves from the Generate button to the inline entry field; typing there
         // and pressing Enter accepts the pasted token (not "generated").
         let token = auth::generate_token();
-        let mut s = SetupState::new(None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, from_config(), false, None);
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (focus Generate)
         handle_key(key(KeyCode::Tab), &mut s);
         assert_eq!(s.token_focus, TokenFocus::Input);
@@ -655,7 +670,7 @@ mod tests {
         // Nostr mode has no Generate button (its token is a pre-shared secret), so the
         // entry field is focused immediately on the same screen.
         let token = auth::generate_token();
-        let mut s = SetupState::new(None, from_config(), true, Some("hl".into()));
+        let mut s = SetupState::new(None, None, from_config(), true, Some("hl".into()));
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::TokenSetup);
         assert_eq!(s.token_focus, TokenFocus::Input);
@@ -671,8 +686,36 @@ mod tests {
     }
 
     #[test]
+    fn nostr_rejects_token_with_wrong_fingerprint() {
+        // A nostr config declares the expected fingerprint; pasting a token from a
+        // different pairing is rejected with an inline error rather than accepted.
+        let intended = auth::generate_token();
+        let other = auth::generate_token();
+        let expected = auth::token_fingerprint(&intended);
+        let mut s = SetupState::new(None, Some(expected.clone()), from_config(), true, Some("hl".into()));
+        handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
+        type_str(&mut s, &other);
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::TokenSetup);
+        assert!(s.error.as_deref().unwrap_or("").contains("fingerprint"));
+    }
+
+    #[test]
+    fn nostr_accepts_token_matching_fingerprint() {
+        let token = auth::generate_token();
+        let expected = auth::token_fingerprint(&token);
+        let mut s = SetupState::new(None, Some(expected), from_config(), true, Some("hl".into()));
+        handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
+        type_str(&mut s, &token);
+        match handle_key(key(KeyCode::Enter), &mut s) {
+            Step::Done(r) => assert_eq!(r.auth_token, token),
+            _ => panic!("expected Done with the matching token"),
+        }
+    }
+
+    #[test]
     fn token_setup_esc_returns_to_start() {
-        let mut s = SetupState::new(None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, from_config(), false, None);
         handle_key(key(KeyCode::Enter), &mut s);
         assert_eq!(s.phase, SetupPhase::TokenSetup);
         handle_key(key(KeyCode::Esc), &mut s);
@@ -681,7 +724,7 @@ mod tests {
 
     #[test]
     fn enter_token_rejects_invalid_and_stays_open() {
-        let mut s = SetupState::new(None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, from_config(), false, None);
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (focus Generate)
         handle_key(key(KeyCode::Tab), &mut s); // focus the inline field
         type_str(&mut s, "not-a-real-token");
@@ -696,6 +739,7 @@ mod tests {
         // buttons. Focus starts on Start, so arrow down into the TCP field first.
         let mut s = SetupState::new(
             Some(auth::generate_token()),
+            None,
             AllowedSources::default(),
             false,
             None,
@@ -722,6 +766,7 @@ mod tests {
     fn bad_cidr_keeps_screen_open_with_error() {
         let mut s = SetupState::new(
             Some(auth::generate_token()),
+            None,
             AllowedSources::default(),
             false,
             None,
@@ -737,6 +782,7 @@ mod tests {
     fn allowlist_field_supports_cursor_editing() {
         let mut s = SetupState::new(
             Some(auth::generate_token()),
+            None,
             AllowedSources::default(),
             false,
             None,
@@ -753,14 +799,14 @@ mod tests {
 
     #[test]
     fn start_button_focused_first_and_enter_starts() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
+        let mut s = SetupState::new(Some(auth::generate_token()), None, from_config(), false, None);
         assert_eq!(s.focus, StartFocus::Start);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Done(_)));
     }
 
     #[test]
     fn exit_button_is_focusable_and_enter_quits() {
-        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
+        let mut s = SetupState::new(Some(auth::generate_token()), None, from_config(), false, None);
         // No fields shown -> focus order is just [Start, Exit]; Right reaches Exit.
         handle_key(key(KeyCode::Right), &mut s);
         assert_eq!(s.focus, StartFocus::Exit);
@@ -775,6 +821,7 @@ mod tests {
     fn up_down_move_between_button_row_and_fields() {
         let mut s = SetupState::new(
             Some(auth::generate_token()),
+            None,
             AllowedSources::default(),
             false,
             None,
@@ -801,7 +848,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits() {
-        let mut s = SetupState::new(None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, from_config(), false, None);
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(handle_key(k, &mut s), Step::Quit));
     }

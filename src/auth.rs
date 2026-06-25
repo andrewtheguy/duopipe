@@ -84,6 +84,32 @@ pub fn token_fingerprint(token: &str) -> String {
     format!("{:04X}", crc16_ccitt_false(token.as_bytes()))
 }
 
+/// Number of hex digits in a token fingerprint (see [`token_fingerprint`]).
+pub const FINGERPRINT_LENGTH: usize = 4;
+
+/// Validate that `fp` is a well-formed token fingerprint: exactly four hex digits, as
+/// produced by [`token_fingerprint`]. Case-insensitive. Used to check the
+/// `auth_token_fingerprint` declared in a nostr-mode config before it is compared
+/// against a resolved token.
+pub fn validate_fingerprint(fp: &str) -> Result<()> {
+    let fp = fp.trim();
+    if fp.len() != FINGERPRINT_LENGTH || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "Token fingerprint must be exactly {} hex digits (e.g. {}), got {:?}",
+            FINGERPRINT_LENGTH,
+            token_fingerprint("example"),
+            fp
+        );
+    }
+    Ok(())
+}
+
+/// Whether `token`'s fingerprint matches the `expected` one (case-insensitive). Used
+/// to confirm a resolved token belongs to the pairing a config was written for.
+pub fn fingerprint_matches(token: &str, expected: &str) -> bool {
+    token_fingerprint(token).eq_ignore_ascii_case(expected.trim())
+}
+
 /// Validate token format.
 ///
 /// Returns Ok(()) if valid, Err with description if invalid.
@@ -230,6 +256,32 @@ mod tests {
         let a = make_test_token([0x01; RANDOM_BYTES_LEN]);
         let b = make_test_token([0x02; RANDOM_BYTES_LEN]);
         assert_ne!(token_fingerprint(&a), token_fingerprint(&b));
+    }
+
+    #[test]
+    fn test_validate_fingerprint_accepts_four_hex_digits() {
+        for fp in ["A1B2", "0000", "ffff", " abCD "] {
+            assert!(validate_fingerprint(fp).is_ok(), "should accept {fp:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_fingerprint_rejects_malformed() {
+        for fp in ["", "ABC", "ABCDE", "GHIJ", "12 4"] {
+            assert!(validate_fingerprint(fp).is_err(), "should reject {fp:?}");
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_matches_is_case_insensitive() {
+        let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
+        let fp = token_fingerprint(&token);
+        assert!(fingerprint_matches(&token, &fp));
+        assert!(fingerprint_matches(&token, &fp.to_lowercase()));
+        assert!(fingerprint_matches(&token, &format!("  {fp}  ")));
+
+        let other = make_test_token([0x01; RANDOM_BYTES_LEN]);
+        assert!(!fingerprint_matches(&token, &token_fingerprint(&other)));
     }
 
     #[test]

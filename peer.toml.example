@@ -53,6 +53,17 @@ name = "web1"
 # can confirm they share the same token even after it is hidden.
 auth_token_file = "~/.config/duopipe/token.txt"
 
+# The shared token's CRC-16 fingerprint (4 hex digits). REQUIRED in nostr mode,
+# whether or not the token itself is set above. Whatever token is finally resolved —
+# from 'auth_token_file', the DUOPIPE_AUTH_TOKEN env var, or pasted at the setup
+# screen — must match this fingerprint, or duopipe refuses to start. This pins each
+# config to one pairing, so pointing it at the wrong token file (or pasting a token
+# meant for a different pair of devices) is caught up front instead of failing as an
+# auth error later. Find the value with `duopipe generate-auth-token` (printed
+# alongside the token) or read it from the dashboard header ("token fp"). Case-
+# insensitive.
+auth_token_fingerprint = "A1B2"
+
 # Nostr node-id discovery is active whenever a config file is loaded. Both peers
 # derive a shared nostr key from the auth_token above; the listener publishes its
 # current ephemeral node id under its 'name' and the dialer looks it up by that
