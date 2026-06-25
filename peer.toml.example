@@ -35,9 +35,9 @@
 # channel to publish & look up the current node id, keyed off the shared auth_token
 # (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
-# This peer's short, memorable identifier. REQUIRED in nostr mode. When listening,
-# this peer publishes its node id under this name; a dialer types it to find this
-# peer. Several peers can share one auth token and be reached individually by name
+# This peer's short, memorable identifier. REQUIRED in nostr mode. This peer's
+# always-on serve half publishes its node id under this name; another peer dials it
+# by typing this name. Several peers can share one auth token and be reached by name
 # (duplicate names just mean newest-wins). For the raw node-id flow, use quick mode
 # (`duopipe quick`).
 name = "web1"

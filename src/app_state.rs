@@ -107,15 +107,18 @@ impl DialTarget {
     }
 }
 
-/// Connection role for this peer.
+/// Internal role of this peer. Every interactive run is `Both` (the single combined
+/// mode); the single-direction `Dial`/`Listen` variants exist only for the headless
+/// test path. This is not a startup choice the user makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Dial,
     Listen,
-    /// Both at once in one process: serve inbound peers (listen) *and* maintain one
-    /// outbound connection that requests tunnels (dial). Each underlying connection
-    /// still has exactly one requester and one server — the two roles run side by
-    /// side over separate endpoints and never interact at the connection layer.
+    /// The combined mode used by every interactive run: a serve half that handles
+    /// inbound peers *and* a dial session that maintains one outbound connection
+    /// requesting tunnels. Each underlying connection still has exactly one requester
+    /// and one server — the two halves run side by side over separate endpoints and
+    /// never interact at the connection layer.
     Both,
 }
 
@@ -129,8 +132,8 @@ impl Role {
     }
 }
 
-/// High-level connection status (primarily meaningful for the dial role, which
-/// has a single connection at a time).
+/// High-level connection status (primarily meaningful for the dial session, which
+/// has a single outbound connection at a time).
 #[derive(Clone, PartialEq)]
 pub enum ConnStatus {
     /// No dial session: serving only, waiting for the user to dial a peer.
@@ -255,8 +258,8 @@ fn tunnel_row_for(id: TunnelId, entry: &TunnelEntry) -> TunnelRow {
     }
 }
 
-/// A currently-connected, authenticated peer (listen role). The listener serves
-/// many of these at once — one row per live connection.
+/// A currently-connected, authenticated inbound peer. The serve half handles
+/// many of these at once — one row per live inbound connection.
 #[derive(Clone)]
 pub struct PeerRow {
     pub remote_id: String,
@@ -272,14 +275,14 @@ pub struct AppState {
     /// `true` when the auth token was freshly generated (not supplied by
     /// config/env), so the dashboard flags it for the user to copy.
     pub token_generated: bool,
-    /// The shared auth token, shown in the listen-role dashboard so the dialer
-    /// can copy it (it may be freshly generated each run).
+    /// The shared auth token, shown in the dashboard so a peer can copy it (it may be
+    /// freshly generated each run).
     auth_token: RwLock<Option<String>>,
     endpoint_id: RwLock<Option<String>>,
     conn_status: RwLock<ConnStatus>,
     path: RwLock<PathInfo>,
-    /// Currently-connected peers (listen role serves many at once; dial role tracks
-    /// its own path separately via `path`).
+    /// Currently-connected inbound peers (the serve half handles many at once; the
+    /// dial session tracks its own outbound path separately via `path`).
     peers: RwLock<Vec<PeerRow>>,
     /// Monotonic allocator for [`TunnelId`]s. Never reused within a session.
     next_id: AtomicU64,
@@ -459,7 +462,7 @@ impl AppState {
         *self.streams_max.write() = max;
     }
 
-    /// Update the path of a connected peer (listen role), matched by `remote_id`.
+    /// Update the path of a connected inbound peer, matched by `remote_id`.
     pub fn set_peer_path(&self, remote_id: &str, path: PathInfo) {
         let mut peers = self.peers.write();
         if let Some(peer) = peers.iter_mut().find(|p| p.remote_id == remote_id) {
@@ -467,7 +470,7 @@ impl AppState {
         }
     }
 
-    /// Register a newly-authenticated peer (listen role). The listener serves many
+    /// Register a newly-authenticated inbound peer. The serve half handles many
     /// peers at once, so this simply adds a row; duplicate `remote_id`s (a brief
     /// reconnect overlap) are de-duplicated rather than rejected.
     pub fn add_peer(&self, remote_id: String) {

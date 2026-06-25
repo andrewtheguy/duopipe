@@ -46,7 +46,7 @@ to stderr, needs no terminal) and is required for the other test-only vars to ta
 effect.
 - `DUOPIPE_TEST_MODE=1` enables headless test mode and gates the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` present ⇒ dial that node id; absent ⇒ listen.
-- `DUOPIPE_AUTOSTART_TUNNELS=1` starts every configured `[[tunnel]]` (dial role)
+- `DUOPIPE_AUTOSTART_TUNNELS=1` starts every configured `[[tunnel]]` (dial side)
   once the connection is up. Required to exercise tunnels in tests, since tunnels are
   otherwise activated interactively in the TUI and nothing forwards automatically.
 - `DUOPIPE_AUTH_TOKEN=<token>` is the shared auth token (required to dial; for

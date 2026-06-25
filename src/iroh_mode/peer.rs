@@ -113,9 +113,11 @@ pub struct PeerConfig {
     /// identity itself is always ephemeral. Disabled in headless test mode, where
     /// the dialer's node id is wired directly.
     pub nostr_discovery: bool,
-    /// Short identifier for nostr discovery (role-dependent): when listening, the
-    /// name this peer publishes its node id under; when dialing, the target peer's
-    /// name to look up. `None` outside nostr mode.
+    /// Short identifier for nostr discovery. For the always-on serve half (and the
+    /// combined interactive process) this is the name it publishes its node id under;
+    /// for the headless dial test path it is the target peer's name to look up. (An
+    /// interactive dial session resolves its target's name at connect time instead.)
+    /// `None` outside nostr mode.
     pub nostr_identifier: Option<String>,
     /// Whether this config's endpoint owns the node id surfaced in the TUI / published
     /// to nostr. Single roles set `true`; in `Role::Both` only the listen sub-config is
@@ -174,8 +176,8 @@ pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
     // otherwise reject the common loopback-tunnel case.
     config.allowed_sources = config.allowed_sources.with_localhost_defaults();
 
-    // One global stream limiter for the whole process, created up front so a dual-role
-    // process shares a single cap across its listen and dial halves.
+    // One global stream limiter for the whole process, created up front so the
+    // combined process shares a single cap across its serve and dial halves.
     let semaphore = new_stream_semaphore(&config)?;
 
     match config.role {
@@ -361,8 +363,8 @@ async fn run_managed_dial_session(
         };
 
         // Self-dial guard: end the session (not the process) — the target won't change.
-        // Reject both the dial endpoint's own id *and* this process's published (listen)
-        // node id, which is a separate endpoint in the dual-role process — so dialing our
+        // Reject both the dial endpoint's own id *and* this process's published (serve)
+        // node id, which is a separate endpoint in the combined process — so dialing our
         // own published id (a quick-mode paste, or a name that resolves back to us) is
         // caught here as a last line of defense behind the connect prompt's checks.
         if let Ok(id) = &resolved {
@@ -443,7 +445,8 @@ async fn run_managed_dial_session(
 }
 
 // ============================================================================
-// Listen role
+// Serve half (always-on, handles inbound peers) — also the headless `Role::Listen`
+// test path
 // ============================================================================
 
 /// Create the global stream limiter and register it for the TUI gauge. Shared by
@@ -463,8 +466,8 @@ fn new_stream_semaphore(config: &PeerConfig) -> Result<Arc<Semaphore>> {
 }
 
 async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
-    log::info!("Symmetric Peer - Listen Mode");
-    log::info!("============================");
+    log::info!("duopipe serve half — listening for inbound peers");
+    log::info!("=================================================");
 
     let endpoint = create_server_endpoint(
         &config.relay_urls,
@@ -549,7 +552,7 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
 
     connection_tasks.shutdown().await;
     endpoint.close().await;
-    log::info!("Peer (listen) stopped.");
+    log::info!("Serve half stopped.");
     Ok(())
 }
 
@@ -809,18 +812,19 @@ fn nudge_rename(config_path: &Option<PathBuf>, identifier: &str) {
 }
 
 // ============================================================================
-// Dial role
+// Dial half (on-demand, one outbound session) — also the headless `Role::Dial`
+// test path
 // ============================================================================
 
 async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
     if config.peer_node_id.is_none() && config.nostr_identifier.is_none() {
         anyhow::bail!(
-            "dial role requires a peer node id (quick mode) or a peer identifier (nostr mode)"
+            "dialing requires a peer node id (quick mode) or a peer identifier (nostr mode)"
         );
     }
 
-    log::info!("Symmetric Peer - Dial Mode");
-    log::info!("==========================");
+    log::info!("duopipe dial half — connecting to peer");
+    log::info!("======================================");
 
     let endpoint = create_client_endpoint(
         &config.relay_urls,
@@ -1018,9 +1022,9 @@ async fn handle_connection(
         }));
     }
 
-    // Requester side (dial role only): a dialer drives a single connection, so it
-    // owns the tunnel table and supervises start/stop of its own tunnels. A listener
-    // serves many peers at once and initiates no tunnels — there is no single
+    // Requester side (dialing side only): a dialer drives a single connection, so it
+    // owns the tunnel table and supervises start/stop of its own tunnels. The serve
+    // half handles many peers at once and initiates no tunnels — there is no single
     // connection a tunnel could be bound to — so it only runs the acceptor above.
     if is_dialer {
         config.status.seed_tunnels();
@@ -1043,7 +1047,7 @@ async fn handle_connection(
     }
 
     // Run until the connection closes or a local shutdown is requested, then tear
-    // everything down. Observing `shutdown` here is essential for the dial role:
+    // everything down. Observing `shutdown` here is essential for the dialing side:
     // `run_dial` awaits this function inline (not in an abortable task), so without
     // this branch a Ctrl-C while connected would block forever on `conn.closed()`
     // (keep-alive prevents the idle timeout from ever firing).

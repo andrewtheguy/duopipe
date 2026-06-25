@@ -220,7 +220,7 @@ Each iroh connection carries requested tunnels. The **dialer** *requests* a tunn
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-One connection can carry any number of TCP/UDP requests from the dialer at once, and one listener serves many dialers concurrently. The listener is a pure server — to reach a service that lives near the listener box, run that box as the dialer instead.
+One connection can carry any number of TCP/UDP requests from the dialer at once, and one serving peer handles many dialers concurrently. For any single connection the serving side is a pure server — so to reach a service that lives near the *other* box, dial *from* the box that wants to reach it (every node can dial on demand).
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -311,7 +311,7 @@ duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1`
 |---------|---------|
 | `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTOSTART_TUNNELS=1` | Start every configured `[[tunnel]]` (dial role) once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTOSTART_TUNNELS=1` | Start every configured `[[tunnel]]` (dial side) once connected (nothing auto-starts otherwise). |
 | `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
 
 In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
@@ -343,7 +343,7 @@ Both interactive subcommands launch the same always-listening TUI; they differ o
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
-| `DUOPIPE_AUTOSTART_TUNNELS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all dial-role requests on connect. |
+| `DUOPIPE_AUTOSTART_TUNNELS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all dial-side tunnels on connect. |
 
 ## Configuration Files
 
@@ -402,7 +402,7 @@ auth_token_file = "~/.config/duopipe/auth_token.txt"
 dns_server = "https://dns.example.com/pkarr"
 max_streams = 100   # max concurrent forwarded connections across all tunnels and peers
 
-# Tunnel requests (dial role): bind locally, ask the listener to connect out to source.
+# Seed tunnels (dial side): bind locally, ask the connected peer to connect out to source.
 [[tunnel]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
