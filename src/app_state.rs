@@ -339,6 +339,14 @@ impl AppState {
             })
             .collect();
         let next_id = AtomicU64::new(specs.len() as u64);
+        // Seed the display rows from config at startup so the configured tunnels are
+        // visible (Idle) in the dashboard from launch — not only after the dial
+        // session connects. The dial manager calls `seed_tunnels` on each
+        // (re)connection to rebuild this list, carrying the same stable ids.
+        let tunnel_rows: Vec<TunnelRow> = specs
+            .iter()
+            .map(|s| tunnel_row_for(s.id, &s.entry))
+            .collect();
         Arc::new(Self {
             role,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -350,7 +358,7 @@ impl AppState {
             peers: RwLock::new(Vec::new()),
             next_id,
             specs: RwLock::new(specs),
-            tunnels: RwLock::new(Vec::new()),
+            tunnels: RwLock::new(tunnel_rows),
             semaphore: RwLock::new(None),
             streams_max: RwLock::new(0),
             tunnel_tx,
@@ -667,7 +675,8 @@ mod tests {
     fn add_tunnel_appends_tunnel_and_idle_row() {
         let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed, false, None);
-        // Rows mirror the specs only after seeding.
+        // Rows mirror the config specs from construction (seed_tunnels rebuilds the
+        // same list per (re)connection; calling it here is idempotent).
         state.seed_tunnels();
         assert_eq!(state.tunnel_ids().len(), 1);
         assert_eq!(state.tunnel_count(), 1);
@@ -691,6 +700,22 @@ mod tests {
         let id2 = state.add_tunnel(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
         assert_ne!(id2, id);
         assert_eq!(state.get_tunnel(db_id).unwrap().name, "db");
+    }
+
+    #[test]
+    fn seed_tunnels_loaded_into_rows_at_construction() {
+        // Configured tunnels must be visible in the dashboard from launch, before any
+        // dial session connects — not only after the dial manager calls seed_tunnels.
+        let seed = vec![
+            req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678"),
+            req("cache", "tcp://127.0.0.1:5679", "127.0.0.1:15679"),
+        ];
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), seed, false, None);
+        let rows = state.snapshot().tunnels;
+        assert_eq!(rows.len(), 2, "rows seeded at construction");
+        assert_eq!(rows[0].name, "db");
+        assert_eq!(rows[1].name, "cache");
+        assert!(rows.iter().all(|r| r.status == TunnelStatus::Idle));
     }
 
     #[test]
