@@ -289,7 +289,9 @@ mod tests {
         let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
         let fp = token_fingerprint(&token);
         assert!(fingerprint_matches(&token, &fp));
-        assert!(fingerprint_matches(&token, &fp.to_lowercase()));
+        // token_fingerprint() is lowercase; exercise the case-insensitive path with an
+        // uppercase variant (a config may declare the fingerprint in any case).
+        assert!(fingerprint_matches(&token, &fp.to_uppercase()));
         assert!(fingerprint_matches(&token, &format!("  {fp}  ")));
 
         let other = make_test_token([0x01; RANDOM_BYTES_LEN]);
