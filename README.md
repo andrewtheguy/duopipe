@@ -40,7 +40,7 @@ duopipe runs as a peer launched in one of two modes — `duopipe quick` (configl
 
 There is **no listen/dial choice at startup**. Setup only collects the serving allowlist (when config supplies none) and the auth token — supplied via file/env, or chosen interactively (quick mode lets you generate a fresh ephemeral token or paste one; nostr mode pastes a pre-shared token you generated with `duopipe generate-auth-token`) — then the dashboard opens, already listening. To dial a peer, press **`c`** and type the target (its `name` in nostr mode, or its node id in quick mode); press **`D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time.
 
-- The TUI header shows this instance's **node id**, a short **token fingerprint** (a CRC-16 of the token, shown in every mode so you can confirm both devices match even after the token hides), and — when the token was freshly generated — the full **auth token**, so you can copy it to your other device. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
+- The TUI header shows this instance's **node id**, a short **token fingerprint** (the first 8 hex digits of the token's SHA-256, shown in every mode so you can confirm both devices match even after the token hides), and — when the token was freshly generated — the full **auth token**, so you can copy it to your other device. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
 - The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated/entered at setup.
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In nostr mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
@@ -236,7 +236,7 @@ On each machine, point at a config that declares its requests (see [Configuratio
 duopipe nostr -c ./peer.toml
 ```
 
-There is no role prompt — setup just confirms the allowlist/token and the dashboard opens, already listening. Each config must set a `name`. The auth token may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to **paste it** — so `auth_token_file` is optional. The token is a pre-shared secret: generate it once with `duopipe generate-auth-token` and use the same value on every peer (nostr setup does not generate one for you). Each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header shows this instance's **node id** and a short **token fingerprint** (a CRC-16 of the token) so you can confirm both devices share the same token even after the full token is hidden.
+There is no role prompt — setup just confirms the allowlist/token and the dashboard opens, already listening. Each config must set a `name`. The auth token may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to **paste it** — so `auth_token_file` is optional. The token is a pre-shared secret: generate it once with `duopipe generate-auth-token` and use the same value on every peer (nostr setup does not generate one for you). Each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token even after the full token is hidden.
 
 > **Important:** The node id is regenerated on every run (the identity is ephemeral), but in nostr mode you don't copy it by hand — peers find each other by `name`.
 
@@ -330,7 +330,7 @@ Both interactive subcommands launch the same always-listening TUI; they differ o
 
 ### nostr (config-driven mode)
 
-`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It requires a **`name`** (this peer's short identifier) and fails fast if it is missing. It also requires **`auth_token_fingerprint`** — the 4-hex-digit CRC-16 of the shared token — whether or not the token itself is in the config; whatever token is finally resolved (file, `DUOPIPE_AUTH_TOKEN`, or pasted at setup) must match it, or duopipe refuses to start. This pins each config to one pairing, so a config pointed at the wrong token file or a token meant for a different pair of devices is caught up front instead of failing as an auth error later. The auth token (the nostr rendezvous secret) may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to paste it, so `auth_token_file` is optional. The token is pre-shared, so generate it once (`duopipe generate-auth-token`, which prints its fingerprint) and use the same value on every peer — nostr setup does not generate one for you. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
+`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It requires a **`name`** (this peer's short identifier) and fails fast if it is missing. It also requires **`auth_token_fingerprint`** — the 8-hex-digit prefix of the shared token's SHA-256 — whether or not the token itself is in the config; whatever token is finally resolved (file, `DUOPIPE_AUTH_TOKEN`, or pasted at setup) must match it, or duopipe refuses to start. This pins each config to one pairing, so a config pointed at the wrong token file or a token meant for a different pair of devices is caught up front instead of failing as an auth error later. The auth token (the nostr rendezvous secret) may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to paste it, so `auth_token_file` is optional. The token is pre-shared, so generate it once (`duopipe generate-auth-token`, which prints its fingerprint) and use the same value on every peer — nostr setup does not generate one for you. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -399,10 +399,10 @@ name = "web1"
 # existing one.
 auth_token_file = "~/.config/duopipe/auth_token.txt"
 
-# Expected token fingerprint (required in nostr mode) — the 4-hex-digit CRC-16 of the
-# shared token, printed by `duopipe generate-auth-token`. Whatever token is resolved
-# must match it, pinning this config to one pairing. Case-insensitive.
-auth_token_fingerprint = "A1B2"
+# Expected token fingerprint (required in nostr mode) — the first 8 hex digits of the
+# shared token's SHA-256, printed by `duopipe generate-auth-token`. Whatever token is
+# resolved must match it, pinning this config to one pairing. Case-insensitive.
+auth_token_fingerprint = "a1b2c3d4"
 
 # relay_urls = ["https://relay.example.com"]
 # relay_only = false           # requires at least one relay_urls entry
@@ -443,7 +443,7 @@ Generate the shared authentication token used by both peers:
 # Generate a single auth token (the fingerprint trails as an inline `#` comment, so
 # the output is still a valid auth_token_file)
 duopipe generate-auth-token
-# Output: d<base64url-encoded-payload>  # fp: A1B2
+# Output: d<base64url-encoded-payload>  # fp: a1b2c3d4
 
 # Generate multiple auth tokens
 duopipe generate-auth-token -c 5
@@ -453,7 +453,7 @@ duopipe generate-auth-token --json
 duopipe generate-auth-token -c 5 --json
 ```
 
-Auth token format: `d` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total. The 4-hex-digit `fingerprint` is what goes in a nostr config's `auth_token_fingerprint`.
+Auth token format: `d` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total. The 8-hex-digit `fingerprint` (the prefix of the token's SHA-256) is what goes in a nostr config's `auth_token_fingerprint`.
 
 > **Note:** A listening instance that starts without a configured token generates one automatically and shows it in the TUI header, so generating one ahead of time is optional.
 

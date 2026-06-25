@@ -15,6 +15,7 @@
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -77,17 +78,26 @@ pub fn generate_token() -> String {
 /// Short, stable fingerprint of a token for cross-device verification.
 ///
 /// The token itself is shown only briefly (and never on the dialing side), so two
-/// devices cannot easily confirm they share the same token. This 4-hex-digit
-/// CRC16-CCITT-FALSE over the token string is displayed persistently in the UI: if it
-/// matches on both devices the tokens match, without ever re-revealing the secret.
+/// devices cannot easily confirm they share the same token. This fingerprint — the
+/// first 4 bytes of the SHA-256 of the token string, as 8 lowercase hex digits — is
+/// displayed persistently in the UI: if it matches on both devices the tokens match,
+/// without ever re-revealing the secret. The same canonical form is used everywhere
+/// (UI, `--json`, the nostr config's `auth_token_fingerprint`, and the per-name state
+/// file path).
 pub fn token_fingerprint(token: &str) -> String {
-    format!("{:04X}", crc16_ccitt_false(token.as_bytes()))
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(token.as_bytes());
+    let mut hex = String::with_capacity(FINGERPRINT_LENGTH);
+    for b in &digest[..FINGERPRINT_LENGTH / 2] {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Number of hex digits in a token fingerprint (see [`token_fingerprint`]).
-pub const FINGERPRINT_LENGTH: usize = 4;
+pub const FINGERPRINT_LENGTH: usize = 8;
 
-/// Validate that `fp` is a well-formed token fingerprint: exactly four hex digits, as
+/// Validate that `fp` is a well-formed token fingerprint: exactly eight hex digits, as
 /// produced by [`token_fingerprint`]. Case-insensitive. Used to check the
 /// `auth_token_fingerprint` declared in a nostr-mode config before it is compared
 /// against a resolved token.
@@ -240,15 +250,17 @@ mod tests {
     }
 
     #[test]
-    fn test_token_fingerprint_stable_and_4_hex() {
+    fn test_token_fingerprint_stable_and_8_lower_hex() {
         let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
         let fp = token_fingerprint(&token);
-        assert_eq!(fp.len(), 4);
-        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp.len(), FINGERPRINT_LENGTH);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // Deterministic: same token always yields the same fingerprint.
         assert_eq!(fp, token_fingerprint(&token));
-        // It is the CRC16 over the token string bytes.
-        assert_eq!(fp, format!("{:04X}", crc16_ccitt_false(token.as_bytes())));
+        // It is the first 4 bytes of the SHA-256 of the token string, as lowercase hex.
+        let digest = Sha256::digest(token.as_bytes());
+        let expected: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(fp, expected);
     }
 
     #[test]
@@ -259,15 +271,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_fingerprint_accepts_four_hex_digits() {
-        for fp in ["A1B2", "0000", "ffff", " abCD "] {
+    fn test_validate_fingerprint_accepts_eight_hex_digits() {
+        for fp in ["a1b2c3d4", "00000000", "ffffffff", " abCDef12 "] {
             assert!(validate_fingerprint(fp).is_ok(), "should accept {fp:?}");
         }
     }
 
     #[test]
     fn test_validate_fingerprint_rejects_malformed() {
-        for fp in ["", "ABC", "ABCDE", "GHIJ", "12 4"] {
+        for fp in ["", "abcd", "abcdefghi", "abcdefgh", "abcd1234e", "12 4 5678"] {
             assert!(validate_fingerprint(fp).is_err(), "should reject {fp:?}");
         }
     }

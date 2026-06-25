@@ -48,8 +48,9 @@ pub struct PeerConfig {
     /// `DUOPIPE_AUTH_TOKEN` env var) is the only way to supply a token; a fresh
     /// listening instance generates one if neither is set.
     pub auth_token_file: Option<PathBuf>,
-    /// Expected CRC-16 fingerprint of the shared auth token (four hex digits, as shown
-    /// in the dashboard header and by `duopipe generate-auth-token`). REQUIRED in nostr
+    /// Expected fingerprint of the shared auth token (the first 8 hex digits of its
+    /// SHA-256, as shown in the dashboard header and by `duopipe generate-auth-token`).
+    /// REQUIRED in nostr
     /// mode. Whatever token is finally resolved — from `auth_token_file`, the
     /// `DUOPIPE_AUTH_TOKEN` env var, or pasted at the setup screen — must match this
     /// fingerprint, so a config written for one pairing cannot be accidentally run with

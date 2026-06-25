@@ -134,7 +134,7 @@ fn resolve_config_auth_token(
 }
 
 /// Resolve the expected auth-token fingerprint for nostr mode. Nostr configs must
-/// declare `auth_token_fingerprint` (the 4-hex-digit fingerprint of the shared token):
+/// declare `auth_token_fingerprint` (the 8-hex-digit fingerprint of the shared token):
 /// it disambiguates configs meant for different pairings, so a config can't be run with
 /// the wrong pairing's token. Returns the validated fingerprint so a token pasted at the
 /// setup screen can also be checked against it; a token already resolved from file/env is
@@ -154,7 +154,7 @@ fn resolve_expected_fingerprint(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Nostr mode requires `auth_token_fingerprint` in the config: the 4-hex-digit \
+                "Nostr mode requires `auth_token_fingerprint` in the config: the 8-hex-digit \
                  fingerprint of your shared token (shown by `duopipe generate-auth-token` and in \
                  the dashboard header). It guards against running this config with a token meant \
                  for a different pairing."
@@ -504,8 +504,16 @@ async fn run_start_peer(
     // fails fast at startup (the lock is held for the whole process, so there is no
     // mid-session local conflict). `_name_lock` must outlive `run_tui`; dropping it on
     // exit releases the lock. Quick mode (no name) takes no lock.
+    // State/lock files are namespaced by the token fingerprint as well as the name.
+    // The lock path runs only in nostr mode, where `expected_token_fingerprint` is
+    // required and present; the eventual token is validated to match it, so this is the
+    // same value the publisher derives from the resolved token below.
+    let lock_fingerprint = expected_token_fingerprint
+        .as_deref()
+        .map(|fp| fp.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     let _name_lock = match peer_name.as_deref() {
-        Some(name) => match peer_state::acquire_name_lock(name) {
+        Some(name) => match peer_state::acquire_name_lock(name, &lock_fingerprint) {
             Ok(lock) => Some(lock),
             Err(peer_state::NameLockError::Held) => {
                 return Err(TunnelError::config(anyhow::anyhow!(
@@ -583,10 +591,10 @@ mod tests {
     #[test]
     fn nostr_mode_returns_fingerprint_when_no_token_yet() {
         // No file/env token: the fingerprint is returned so setup can check a pasted one.
-        let cfg = cfg_with_fp(Some("A1B2"));
+        let cfg = cfg_with_fp(Some("a1b2c3d4"));
         assert_eq!(
             resolve_expected_fingerprint(&cfg, true, None).unwrap(),
-            Some("A1B2".to_string())
+            Some("a1b2c3d4".to_string())
         );
     }
 
