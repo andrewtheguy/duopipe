@@ -78,13 +78,18 @@ impl LogBuffer {
     }
 
     pub fn push(&self, line: LogLine) {
+        // A zero-capacity ring stores nothing; guard before touching it so the eviction
+        // check below (which assumes len never exceeds cap) stays correct.
+        if self.cap == 0 {
+            return;
+        }
         let ring = if line.verbose_only {
             &self.verbose
         } else {
             &self.concise
         };
         let mut lines = ring.lock();
-        if lines.len() == self.cap {
+        if lines.len() >= self.cap {
             lines.pop_front();
         }
         lines.push_back(line);
@@ -225,6 +230,18 @@ mod tests {
         assert_eq!(snap.len(), 3);
         assert_eq!(snap[0].msg, "msg2");
         assert_eq!(snap[2].msg, "msg4");
+    }
+
+    #[test]
+    fn zero_capacity_ring_stores_nothing() {
+        let buf = LogBuffer::new(0);
+        for i in 0..5 {
+            buf.push(line(Level::Info, &format!("msg{i}")));
+            buf.push(tagged_line(Level::Warn, &format!("churn{i}"), true));
+        }
+        assert_eq!(buf.concise_len(), 0);
+        assert_eq!(buf.verbose_len(), 0);
+        assert!(buf.verbose_snapshot().is_empty());
     }
 
     #[test]

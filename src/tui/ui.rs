@@ -30,7 +30,7 @@ pub enum Screen {
 /// View state owned by the TUI loop (not shared with the runtime).
 #[derive(Default)]
 pub struct UiState {
-    /// Which screen is visible (toggled with Tab).
+    /// Which screen is visible (toggled with `l`).
     pub screen: Screen,
     /// Lines scrolled up from the bottom of the log pane. 0 = follow tail.
     pub log_scroll: usize,
@@ -137,7 +137,7 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
 }
 
 /// The home screen: header, the tunnel table, and the connected-peers table. Logs
-/// live on their own screen (Tab) so their keys don't fight the tunnel navigation.
+/// live on their own screen (`l`) so their keys don't fight the tunnel navigation.
 fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
