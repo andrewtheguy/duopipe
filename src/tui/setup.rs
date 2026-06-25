@@ -422,70 +422,75 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                     "Optional — leave blank to allow localhost only:",
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(
+                lines.push(choice_line(
                     "Allowed TCP sources the peer may request (CIDR):",
+                    state.focus == StartFocus::AllowedTcp,
                 ));
                 lines.push(field_input_line(
                     &state.allowed_tcp,
                     state.focus == StartFocus::AllowedTcp,
                 ));
                 lines.push(Line::from(Span::styled(
-                    "  space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
+                    "      space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
                     Style::default().fg(Color::DarkGray),
                 )));
-                lines.push(Line::from(
+                lines.push(choice_line(
                     "Allowed UDP sources the peer may request (CIDR):",
+                    state.focus == StartFocus::AllowedUdp,
                 ));
                 lines.push(field_input_line(
                     &state.allowed_udp,
                     state.focus == StartFocus::AllowedUdp,
                 ));
                 lines.push(Line::from(Span::styled(
-                    "  space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
+                    "      space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
         }
         SetupPhase::TokenSetup => {
+            let input_active = state.token_focus == TokenFocus::Input;
             if state.nostr_discovery {
-                // Nostr: the token is a pre-shared secret — entry only, no generate.
+                // Nostr: the token is a pre-shared secret — entry only, no generate. One
+                // field, always active, so it needs no choice marker.
                 lines.push(Line::from("Enter the shared auth token:"));
+                lines.push(field_input_line(&state.auth_token_input, input_active));
             } else {
-                // Quick: the "Generate new" button sits above an inline entry field.
-                lines.push(Line::from("No auth token supplied. Set one up:"));
+                // Quick: two stacked choices, each marked with `▶` when it has focus —
+                // generate a fresh token, or type/paste an existing one.
+                lines.push(Line::from("No auth token supplied. Choose one:"));
                 lines.push(Line::raw(""));
-                lines.push(Line::from(button_span(
-                    "Generate new",
+                lines.push(choice_line(
+                    "Generate new token",
                     state.token_focus == TokenFocus::Generate,
-                )));
+                ));
                 lines.push(Line::from(Span::styled(
-                    "  A fresh token for this run, shown so you can copy it to your other device.",
+                    "      A fresh token for this run, shown so you can copy it to your other device.",
                     Style::default().fg(Color::DarkGray),
                 )));
                 lines.push(Line::raw(""));
-                lines.push(Line::from("Or enter an existing token:"));
+                lines.push(choice_line("Enter an existing token:", input_active));
+                lines.push(field_input_line(&state.auth_token_input, input_active));
             }
-            lines.push(field_input_line(
-                &state.auth_token_input,
-                state.token_focus == TokenFocus::Input,
-            ));
+
             let typed = state.auth_token_input.value().trim();
             if !typed.is_empty() && auth::validate_token(typed).is_ok() {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "  fingerprint: {} — confirm this matches your other device",
+                        "      fingerprint: {} — confirm this matches your other device",
                         auth::token_fingerprint(typed)
                     ),
                     Style::default().fg(Color::Green),
                 )));
             }
+            lines.push(Line::raw(""));
             let hint = if state.nostr_discovery {
                 // Nostr has no Generate button: the token is pre-shared, made out of band.
-                "  Both peers need the same token. First time? Run `duopipe generate-auth-token`, then paste that token here on every device."
+                "Both peers need the same token. First time? Run `duopipe generate-auth-token`, then paste that token here on every device."
             } else {
-                // Quick mode: the Generate button above covers a fresh token; this field
+                // Quick mode: the Generate choice above covers a fresh token; this field
                 // is for reusing one shown on the other device.
-                "  Both peers need the same token: paste the one shown on your other device, or pick \"Generate new\" above."
+                "Both peers need the same token: paste the one shown on your other device, or pick \"Generate new token\" above."
             };
             lines.push(Line::from(Span::styled(
                 hint,
@@ -536,10 +541,36 @@ fn button_span(label: &str, focused: bool) -> Span<'static> {
     Span::styled(format!(" {label} "), style)
 }
 
-/// A text-input line. When `active`, a block cursor marks the edit position; otherwise
-/// the value is shown plainly.
+/// Left-margin focus marker for the stacked setup choices: a bold green `▶` on the
+/// active choice, blank (same width) otherwise so every label stays aligned.
+fn choice_marker(active: bool) -> Span<'static> {
+    if active {
+        Span::styled(
+            "▶ ",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    }
+}
+
+/// A choice header line: the focus marker plus a label that brightens when active.
+fn choice_line(label: &str, active: bool) -> Line<'static> {
+    let label_style = if active {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(vec![
+        choice_marker(active),
+        Span::styled(label.to_string(), label_style),
+    ])
+}
+
+/// The text-input line nested under a [`choice_line`]: indented to clear the marker,
+/// with a block cursor at the edit position when `active`.
 fn field_input_line(buffer: &Input, active: bool) -> Line<'static> {
-    let mut spans = vec![Span::raw("  ")];
+    let mut spans = vec![Span::raw("    ")];
     spans.extend(render_field(buffer, Style::default().fg(Color::Cyan), active));
     Line::from(spans)
 }
