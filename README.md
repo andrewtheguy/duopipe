@@ -330,7 +330,7 @@ Both interactive subcommands launch the same always-listening TUI; they differ o
 
 ### nostr (config-driven mode)
 
-`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It requires a **`name`** (this peer's short identifier) and fails fast if it is missing. It also requires **`auth_token_fingerprint`** — the 8-hex-digit prefix of the shared token's SHA-256 — whether or not the token itself is in the config; whatever token is finally resolved (file, `DUOPIPE_AUTH_TOKEN`, or pasted at setup) must match it, or duopipe refuses to start. This pins each config to one pairing, so a config pointed at the wrong token file or a token meant for a different pair of devices is caught up front instead of failing as an auth error later. The auth token (the nostr rendezvous secret) may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to paste it, so `auth_token_file` is optional. The token is pre-shared, so generate it once (`duopipe generate-auth-token`, which prints its fingerprint) and use the same value on every peer — nostr setup does not generate one for you. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
+`duopipe nostr` reads a config file and uses **nostr** for node-id discovery. It requires a **`name`** (this peer's short identifier — ASCII letters, digits, and underscores only) and fails fast if it is missing or malformed. It also requires **`auth_token_fingerprint`** — the 8-hex-digit prefix of the shared token's SHA-256 — whether or not the token itself is in the config; whatever token is finally resolved (file, `DUOPIPE_AUTH_TOKEN`, or pasted at setup) must match it, or duopipe refuses to start. This pins each config to one pairing, so a config pointed at the wrong token file or a token meant for a different pair of devices is caught up front instead of failing as an auth error later. The auth token (the nostr rendezvous secret) may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to paste it, so `auth_token_file` is optional. The token is pre-shared, so generate it once (`duopipe generate-auth-token`, which prints its fingerprint) and use the same value on every peer — nostr setup does not generate one for you. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -391,7 +391,8 @@ The same config shape is used by both peers. Every interactive run serves from l
 # The outbound dial target is chosen interactively from the dashboard.
 
 # This peer's short identifier (required in nostr mode). A dialer types it to find
-# this peer; the listener publishes its node id under this name.
+# this peer; the listener publishes its node id under this name. ASCII letters,
+# digits, and underscores only (used verbatim in the local state-file name).
 name = "web1"
 
 # Shared auth token (optional) — supply via a file (here) or the DUOPIPE_AUTH_TOKEN

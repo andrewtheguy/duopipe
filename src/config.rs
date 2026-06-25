@@ -59,7 +59,8 @@ pub struct PeerConfig {
     /// This peer's short, memorable identifier for nostr discovery. Required in
     /// nostr mode: a listener publishes its node id under this name, and a dialer
     /// types it to look the peer up — so several peers can share one auth token and
-    /// still be reached individually.
+    /// still be reached individually. Must be ASCII letters, digits, and underscores
+    /// only (see [`validate_name`]); it is used verbatim in the local state-file path.
     pub name: Option<String>,
     /// Nostr relay URLs used for node-id discovery (nostr mode only). Absent ⇒ a
     /// built-in set of public relays (see `nostr_discovery::DEFAULT_NOSTR_RELAYS`).
@@ -284,6 +285,32 @@ pub fn validate_tunnel_specs(tunnels: &[TunnelEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Max length of a peer `name` (keeps the verbatim state-file path well under
+/// filesystem limits).
+const MAX_NAME_LEN: usize = 64;
+
+/// Validate a nostr peer `name`: a non-empty identifier of ASCII letters, digits, and
+/// underscores only. The charset makes it safe to use verbatim in the state-file path
+/// and stable as a nostr lookup key.
+pub fn validate_name(name: &str) -> Result<()> {
+    let n = name.trim();
+    if n.is_empty() {
+        anyhow::bail!("Peer `name` must not be empty");
+    }
+    if n.chars().count() > MAX_NAME_LEN {
+        anyhow::bail!(
+            "Peer `name` must be at most {MAX_NAME_LEN} characters, got {}",
+            n.chars().count()
+        );
+    }
+    if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!(
+            "Peer `name` may contain only ASCII letters, digits, and underscores (got {n:?})"
+        );
+    }
+    Ok(())
+}
+
 /// Validate that a string is valid CIDR notation (IPv4 or IPv6).
 pub fn validate_cidr(cidr: &str) -> Result<()> {
     cidr.parse::<ipnet::IpNet>().with_context(|| {
@@ -373,6 +400,11 @@ impl PeerConfig {
         validate_tunnel_specs(&self.tunnel)?;
         validate_allowed_sources(&self.allowed_sources)?;
         validate_transport_tuning(&self.transport, "transport")?;
+        // A name is only required in nostr mode (checked at startup), but if one is
+        // set it must be a valid identifier — it is used verbatim in the state path.
+        if let Some(name) = &self.name {
+            validate_name(name)?;
+        }
 
         Ok(())
     }
@@ -482,6 +514,39 @@ mod tests {
 
     fn peer_config(cfg: PeerConfig) -> PeerConfig {
         cfg
+    }
+
+    #[test]
+    fn validate_name_accepts_alphanumeric_and_underscore() {
+        for n in ["web1", "home_lab", "A1_b2", "  web1  ", "_", "X"] {
+            assert!(validate_name(n).is_ok(), "should accept {n:?}");
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_other_chars_empty_and_too_long() {
+        let too_long = "a".repeat(MAX_NAME_LEN + 1);
+        for n in [
+            "",
+            "   ",
+            "home-lab",
+            "web 1",
+            "web.1",
+            "naïve",
+            too_long.as_str(),
+        ] {
+            assert!(validate_name(n).is_err(), "should reject {n:?}");
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_malformed_name() {
+        let cfg = PeerConfig {
+            name: Some("home-lab".to_string()),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("underscores"), "was: {err}");
     }
 
     #[test]

@@ -614,6 +614,12 @@ fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
                 Some("That is this peer's own name; enter the other peer's name".to_string());
             return;
         }
+        // Every valid listener name is alphanumeric + `_`, so reject anything else up
+        // front rather than dialing a name that can never resolve.
+        if let Err(e) = crate::config::validate_name(&raw) {
+            form.error = Some(e.to_string());
+            return;
+        }
         DialTarget::Name(raw)
     } else {
         if raw.is_empty() {

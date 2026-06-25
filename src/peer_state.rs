@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// Recorded cross-device conflict for a name: another machine superseded us (or we
 /// declined to claim) and should ask the user before publishing under `name` again.
@@ -50,20 +49,13 @@ pub enum NameLockError {
 }
 
 /// Path of a name's state file. Namespaced by the token `fingerprint` (so different
-/// pairings sharing a `name` get distinct state/lock files) and then the `name`,
-/// hashed so arbitrary values are filesystem-safe and don't leak the name into the
-/// path. Generic `state-` prefix (the file holds both the lock and the conflict flag).
+/// pairings sharing a `name` get distinct state/lock files) and then the `name` used
+/// verbatim — safe because `name` is validated to ASCII letters, digits, and `_`
+/// (see `config::validate_name`), so the file is human-readable. Generic `state-`
+/// prefix (the file holds both the lock and the conflict flag).
 fn state_path_in(dir: &Path, name: &str, fingerprint: &str) -> PathBuf {
-    use std::fmt::Write as _;
-    let mut hasher = Sha256::new();
-    hasher.update(name.trim().as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(16);
-    for b in &digest[..8] {
-        let _ = write!(hex, "{b:02x}");
-    }
     let fp = fingerprint.trim().to_ascii_lowercase();
-    dir.join(format!("state-{fp}-{hex}.json"))
+    dir.join(format!("state-{fp}-{}.json", name.trim()))
 }
 
 fn now_secs() -> u64 {
@@ -198,8 +190,8 @@ mod tests {
         );
         let p = state_path_in(dir, "web1", FP);
         let fname = p.file_name().unwrap().to_string_lossy();
-        assert!(fname.starts_with(&format!("state-{FP}-")), "was: {fname}");
-        assert!(fname.ends_with(".json"));
+        // The name appears verbatim (not hashed) for visibility.
+        assert_eq!(fname, format!("state-{FP}-web1.json"), "was: {fname}");
     }
 
     #[test]
