@@ -500,9 +500,12 @@ impl AppState {
     /// each tunnel's stable id. Called once per (re)connection; runtime additions
     /// and deletions persist because they live in `specs`.
     pub fn seed_tunnels(&self) {
-        let rows = self
-            .specs
-            .read()
+        // Hold the specs read lock across the tunnels write-back so a concurrent
+        // add/edit/delete (which locks specs-then-tunnels) can't change specs between
+        // the rebuild and the assignment, leaving the two lists out of sync. Same
+        // specs-then-tunnels lock order as those writers, so this can't deadlock.
+        let specs = self.specs.read();
+        let rows = specs
             .iter()
             .map(|s| tunnel_row_for(s.id, &s.entry))
             .collect();

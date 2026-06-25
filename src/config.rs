@@ -263,6 +263,12 @@ pub fn validate_tunnel_specs(tunnels: &[TunnelEntry]) -> Result<()> {
     for t in tunnels {
         validate_tcp_udp_url(&t.remote_source, "tunnel.remote_source")?;
         validate_host_port(&t.local_listen, "tunnel.local_listen")?;
+        // The name is the display label and uniqueness key, so a blank/whitespace-only
+        // name (only reachable from a config file; the TUI form substitutes one) is
+        // rejected before the duplicate check.
+        if t.name.trim().is_empty() {
+            anyhow::bail!("tunnel name must not be empty");
+        }
         if !seen.insert(t.name.as_str()) {
             anyhow::bail!("duplicate tunnel name {:?}", t.name);
         }
@@ -609,6 +615,26 @@ tcp = ["not-a-cidr"]
             err.to_string().contains("duplicate tunnel name"),
             "error was: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_blank_tunnel_name() {
+        let blank = |name: &str| TunnelEntry {
+            name: name.into(),
+            remote_source: "tcp://127.0.0.1:5678".into(),
+            local_listen: "127.0.0.1:15678".into(),
+        };
+        for name in ["", "   "] {
+            let cfg = peer_config(PeerConfig {
+                tunnel: vec![blank(name)],
+                ..Default::default()
+            });
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("tunnel name must not be empty"),
+                "error was: {err}"
+            );
+        }
     }
 
     #[test]
