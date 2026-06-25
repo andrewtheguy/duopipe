@@ -362,11 +362,17 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     }
 }
 
-/// Logs-screen keys: scroll the log pane with `[`/`]`, `PageUp`/`PageDown`, and
-/// `g`/`G` (top/bottom).
+/// Logs-screen keys: `v` toggles verbose (show the suppressed iroh/quinn churn);
+/// scroll the log pane with `[`/`]`, `PageUp`/`PageDown`, and `g`/`G` (top/bottom).
 fn handle_logs_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let total = state.logs.len();
     match key.code {
+        // Toggle the full unfiltered view. The visible-line count changes, so snap back
+        // to the tail to avoid landing on a stale scroll offset.
+        KeyCode::Char('v') => {
+            ui.verbose = !ui.verbose;
+            ui.log_scroll = 0;
+        }
         KeyCode::Char(']') => {
             ui.log_scroll = ui.log_scroll.saturating_add(1).min(total);
         }
@@ -845,6 +851,23 @@ mod tests {
     }
 
     #[test]
+    fn v_toggles_verbose_only_on_the_logs_screen() {
+        let st = state();
+        let mut ui = UiState::default();
+        // On home, `v` does nothing (it's a logs-screen key).
+        handle_key(key(KeyCode::Char('v')), &mut ui, &st);
+        assert!(!ui.verbose);
+        // On the logs screen it flips verbose and snaps back to the tail.
+        ui.screen = Screen::Logs;
+        ui.log_scroll = 4;
+        handle_key(key(KeyCode::Char('v')), &mut ui, &st);
+        assert!(ui.verbose);
+        assert_eq!(ui.log_scroll, 0);
+        handle_key(key(KeyCode::Char('v')), &mut ui, &st);
+        assert!(!ui.verbose);
+    }
+
+    #[test]
     fn log_scroll_keys_are_scoped_to_the_logs_screen() {
         let st = state();
         for _ in 0..5 {
@@ -852,6 +875,7 @@ mod tests {
                 level: log::Level::Info,
                 msg: "line".to_string(),
                 ts: jiff::Zoned::now(),
+                verbose_only: false,
             });
         }
         let mut ui = UiState::default();

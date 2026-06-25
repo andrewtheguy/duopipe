@@ -1,9 +1,15 @@
 //! In-memory log capture for the TUI.
 //!
 //! Routes `log` crate records into a bounded ring buffer instead of the console
-//! so the TUI can render them in a scrollable pane. Filtering mirrors the
-//! console default the project used previously: `duopipe` at `Info`, everything
-//! else at `Warn`, so iroh/quinn internals don't flood the pane.
+//! so the TUI can render them in a scrollable pane.
+//!
+//! The buffer captures at a verbose threshold (`duopipe` at `Info`+, other targets at
+//! `Warn`+) and tags each line's `verbose_only` flag. The default ("concise") log view
+//! hides `verbose_only` lines — the routine iroh/quinn `Warn` churn from relay
+//! net-report / address-discovery probes — showing only our own `Info`+ and genuine
+//! `Error`s from the stack below us. The TUI's verbose toggle reveals everything
+//! captured; because the noisy lines are always buffered, toggling on doesn't lose
+//! recent history.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -46,6 +52,10 @@ pub struct LogLine {
     pub level: Level,
     pub msg: String,
     pub ts: jiff::Zoned,
+    /// True for records the concise (default) view hides and only the verbose view
+    /// shows — i.e. the routine iroh/quinn `Warn` churn. The buffer always captures
+    /// them so the verbose toggle can reveal them without missing recent history.
+    pub verbose_only: bool,
 }
 
 /// Bounded ring buffer of log lines, shared between the logger and the TUI.
@@ -86,9 +96,26 @@ struct TuiLogger {
 }
 
 impl TuiLogger {
-    /// Two-tier level policy matching the previous env_logger console setup.
-    fn allowed(target: &str, level: Level) -> bool {
-        if target == "duopipe" || target.starts_with("duopipe::") {
+    fn is_own(target: &str) -> bool {
+        target == "duopipe" || target.starts_with("duopipe::")
+    }
+
+    /// Concise (default) policy: our own records at `Info`+, everything else (iroh/quinn
+    /// internals) only at `Error`. Hides the routine `Warn` churn from iroh's relay
+    /// net-report / address-discovery probes.
+    fn concise_allowed(target: &str, level: Level) -> bool {
+        if Self::is_own(target) {
+            level <= Level::Info
+        } else {
+            level <= Level::Error
+        }
+    }
+
+    /// Verbose policy (and the capture threshold): same for our own target, but admits
+    /// non-`duopipe` `Warn` as well. The buffer always captures at this level; the
+    /// extra lines are flagged `verbose_only` and shown only when verbose is toggled on.
+    fn verbose_allowed(target: &str, level: Level) -> bool {
+        if Self::is_own(target) {
             level <= Level::Info
         } else {
             level <= Level::Warn
@@ -98,11 +125,14 @@ impl TuiLogger {
 
 impl Log for TuiLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        Self::allowed(metadata.target(), metadata.level())
+        // Capture at the verbose threshold; the concise view filters further at render.
+        Self::verbose_allowed(metadata.target(), metadata.level())
     }
 
     fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
+        let target = record.metadata().target();
+        let level = record.level();
+        if !Self::verbose_allowed(target, level) {
             return;
         }
         // Prefix with the emitting half ("serve"/"dial") when one is set, so the single
@@ -112,9 +142,10 @@ impl Log for TuiLogger {
             Err(_) => record.args().to_string(),
         };
         self.buffer.push(LogLine {
-            level: record.level(),
+            level,
             msg,
             ts: jiff::Zoned::now(),
+            verbose_only: !Self::concise_allowed(target, level),
         });
     }
 
@@ -145,6 +176,7 @@ mod tests {
             level,
             msg: msg.to_string(),
             ts: jiff::Zoned::now(),
+            verbose_only: false,
         }
     }
 
@@ -161,15 +193,29 @@ mod tests {
     }
 
     #[test]
-    fn two_tier_filter() {
-        // duopipe target: info and above allowed.
-        assert!(TuiLogger::allowed("duopipe", Level::Info));
-        assert!(TuiLogger::allowed("duopipe::iroh_mode", Level::Warn));
-        assert!(!TuiLogger::allowed("duopipe", Level::Debug));
-        // other targets: only warn and above.
-        assert!(!TuiLogger::allowed("iroh", Level::Info));
-        assert!(TuiLogger::allowed("iroh", Level::Warn));
-        assert!(TuiLogger::allowed("quinn", Level::Error));
+    fn concise_filter_hides_iroh_warn_churn() {
+        // Our own target: Info and above shown in the default view.
+        assert!(TuiLogger::concise_allowed("duopipe", Level::Info));
+        assert!(TuiLogger::concise_allowed("duopipe::iroh_mode", Level::Warn));
+        assert!(!TuiLogger::concise_allowed("duopipe", Level::Debug));
+        // Other targets: only Error — iroh/quinn Warn churn is hidden by default.
+        assert!(!TuiLogger::concise_allowed("iroh", Level::Info));
+        assert!(!TuiLogger::concise_allowed("iroh", Level::Warn));
+        assert!(!TuiLogger::concise_allowed("iroh_relay", Level::Warn));
+        assert!(TuiLogger::concise_allowed("quinn", Level::Error));
+    }
+
+    #[test]
+    fn verbose_filter_admits_foreign_warn_but_still_drops_info() {
+        // The capture/verbose threshold reveals non-duopipe Warn (the churn) and Error.
+        assert!(TuiLogger::verbose_allowed("iroh", Level::Warn));
+        assert!(TuiLogger::verbose_allowed("quinn", Level::Error));
+        // But still not their Info/Debug — those never reach the buffer at all.
+        assert!(!TuiLogger::verbose_allowed("iroh", Level::Info));
+        assert!(!TuiLogger::verbose_allowed("iroh", Level::Debug));
+        // Foreign Warn is captured but flagged verbose-only; our own lines never are.
+        assert!(!TuiLogger::concise_allowed("iroh", Level::Warn));
+        assert!(TuiLogger::concise_allowed("duopipe", Level::Info));
     }
 
     #[tokio::test]

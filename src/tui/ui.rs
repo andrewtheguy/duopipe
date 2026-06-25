@@ -34,6 +34,10 @@ pub struct UiState {
     pub screen: Screen,
     /// Lines scrolled up from the bottom of the log pane. 0 = follow tail.
     pub log_scroll: usize,
+    /// When true, the log pane shows every captured line (including the iroh/quinn
+    /// `Warn` churn flagged `verbose_only`); otherwise only the concise view. Toggled
+    /// with `v` on the logs screen.
+    pub verbose: bool,
     /// Index of the highlighted tunnel row (toggled with Enter).
     pub selected: usize,
     /// When `Some`, the "add request" modal is open and captures all keystrokes.
@@ -643,22 +647,32 @@ fn peer_row(p: &PeerRow) -> Row<'static> {
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
+    // The concise view hides verbose-only lines (iroh/quinn Warn churn); verbose shows
+    // everything captured. Filter first so scroll math and the count match the view.
+    let view: Vec<&LogLine> = logs
+        .iter()
+        .filter(|l| ui.verbose || !l.verbose_only)
+        .collect();
+
     // Visible body height inside the border.
     let body = area.height.saturating_sub(2) as usize;
-    let total = logs.len();
+    let total = view.len();
     // Clamp the scroll so at least a full body of lines stays visible.
     let max_scroll = total.saturating_sub(body);
     let scroll = ui.log_scroll.min(max_scroll);
     let end = total - scroll;
     let start = end.saturating_sub(body);
-    let lines: Vec<Line> = logs[start..end].iter().map(log_line).collect();
+    let lines: Vec<Line> = view[start..end].iter().map(|l| log_line(l)).collect();
 
+    let mode = if ui.verbose { "verbose" } else { "concise" };
     let title = if ui.quit_armed {
-        format!(" Logs ({total})  [press Esc again to quit] ")
+        format!(" Logs ({total}, {mode})  [press Esc again to quit] ")
     } else if scroll == 0 {
-        format!(" Logs ({total})  [Esc/l home · [/] or PgUp/PgDn scroll · g/G top/bottom] ")
+        format!(
+            " Logs ({total}, {mode})  [Esc/l home · v verbose · [/] PgUp/Dn scroll · g/G top/bottom] "
+        )
     } else {
-        format!(" Logs ({total})  [scrolled +{scroll} · Esc follow tail] ")
+        format!(" Logs ({total}, {mode})  [scrolled +{scroll} · Esc follow tail] ")
     };
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -755,10 +769,14 @@ mod tests {
     }
 
     fn render_text(snap: &AppSnapshot, ui: &UiState) -> String {
+        render_text_with_logs(snap, &[], ui)
+    }
+
+    fn render_text_with_logs(snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) -> String {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| render(frame, snap, &[], ui))
+            .draw(|frame| render(frame, snap, logs, ui))
             .expect("render");
 
         let buffer = terminal.backend().buffer();
@@ -770,6 +788,51 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn log(level: log::Level, msg: &str, verbose_only: bool) -> LogLine {
+        LogLine {
+            level,
+            msg: msg.to_string(),
+            ts: jiff::Zoned::now(),
+            verbose_only,
+        }
+    }
+
+    #[test]
+    fn verbose_toggle_reveals_verbose_only_lines() {
+        let snap = base_snapshot(false, None);
+        let logs = vec![
+            log(log::Level::Info, "own-line", false),
+            log(log::Level::Warn, "iroh-churn", true),
+        ];
+
+        // Concise (default): the verbose-only churn line is hidden.
+        let concise = render_text_with_logs(
+            &snap,
+            &logs,
+            &UiState {
+                screen: Screen::Logs,
+                ..Default::default()
+            },
+        );
+        assert!(concise.contains("own-line"));
+        assert!(!concise.contains("iroh-churn"));
+        assert!(concise.contains("concise"));
+
+        // Verbose: everything captured is shown.
+        let verbose = render_text_with_logs(
+            &snap,
+            &logs,
+            &UiState {
+                screen: Screen::Logs,
+                verbose: true,
+                ..Default::default()
+            },
+        );
+        assert!(verbose.contains("own-line"));
+        assert!(verbose.contains("iroh-churn"));
+        assert!(verbose.contains("verbose"));
     }
 
     #[test]
