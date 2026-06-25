@@ -35,12 +35,44 @@ enum SetupPhase {
     ConfirmGenerateToken,
 }
 
-/// Which CIDR field of the [`SetupPhase::Start`] screen has focus. Only relevant when
-/// config supplies no `[allowed_sources]` (otherwise there are no editable fields).
+/// Which element of the [`SetupPhase::Start`] screen has focus. The two CIDR fields
+/// only appear (and so are only focusable) when config supplies no `[allowed_sources]`;
+/// the `Start`/`Exit` buttons are always present. Arrow keys move focus; Enter
+/// activates it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StartSection {
+enum StartFocus {
     AllowedTcp,
     AllowedUdp,
+    Start,
+    Exit,
+}
+
+impl StartFocus {
+    fn is_button(self) -> bool {
+        matches!(self, StartFocus::Start | StartFocus::Exit)
+    }
+}
+
+/// Up/Down move between vertical rows, top to bottom as rendered: the Start/Exit
+/// button row (the two buttons share one row; Left/Right pick between them), then the
+/// first CIDR field, then the second. The CIDR rows only exist when shown.
+fn move_focus(state: &mut SetupState, down: bool) {
+    // One representative per row; the button row stays on whichever button is focused
+    // while moving within it, and is entered (from a field) on the primary Start button.
+    let button_row = if state.focus.is_button() {
+        state.focus
+    } else {
+        StartFocus::Start
+    };
+    let rows: &[StartFocus] = if allowlist_fields_shown(state) {
+        &[button_row, StartFocus::AllowedTcp, StartFocus::AllowedUdp]
+    } else {
+        &[button_row]
+    };
+    let i = rows.iter().position(|f| *f == state.focus).unwrap_or(0) as isize;
+    let n = rows.len() as isize;
+    let delta = if down { 1 } else { -1 };
+    state.focus = rows[(((i + delta) % n + n) % n) as usize];
 }
 
 /// Result of running the setup screen to completion.
@@ -64,8 +96,8 @@ pub struct SetupState {
     /// Allowlist supplied by config. When non-empty the interactive allowlist fields
     /// are hidden (config wins); when empty they are shown on the start screen.
     config_allowed_sources: AllowedSources,
-    /// Focused CIDR field (only used when the allowlist fields are shown).
-    section: StartSection,
+    /// Currently focused element of the start screen.
+    focus: StartFocus,
     /// TCP/UDP CIDR text entered on the start screen (only used when
     /// `config_allowed_sources` is empty).
     allowed_tcp: Input,
@@ -94,7 +126,9 @@ impl SetupState {
             phase: SetupPhase::Start,
             config_auth_token,
             config_allowed_sources,
-            section: StartSection::AllowedTcp,
+            // The Start button is the primary action and focused first; the optional
+            // CIDR fields are reached by arrowing down.
+            focus: StartFocus::Start,
             allowed_tcp: Input::default(),
             allowed_udp: Input::default(),
             allowed_sources: AllowedSources::default(),
@@ -146,7 +180,7 @@ fn submit_start(state: &mut SetupState) -> Step {
         let tcp = match parse_cidr_list(state.allowed_tcp.value()) {
             Ok(list) => list,
             Err(e) => {
-                state.section = StartSection::AllowedTcp;
+                state.focus = StartFocus::AllowedTcp;
                 state.error = Some(format!("Invalid TCP CIDR: {e}"));
                 return Step::Continue;
             }
@@ -154,7 +188,7 @@ fn submit_start(state: &mut SetupState) -> Step {
         let udp = match parse_cidr_list(state.allowed_udp.value()) {
             Ok(list) => list,
             Err(e) => {
-                state.section = StartSection::AllowedUdp;
+                state.focus = StartFocus::AllowedUdp;
                 state.error = Some(format!("Invalid UDP CIDR: {e}"));
                 return Step::Continue;
             }
@@ -197,27 +231,41 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
     match state.phase {
         SetupPhase::Start => match key.code {
             KeyCode::Esc => Step::Quit,
-            KeyCode::Enter => submit_start(state),
-            KeyCode::Tab => {
-                // Toggle between the two CIDR fields, but only when they exist.
-                if allowlist_fields_shown(state) {
-                    state.section = match state.section {
-                        StartSection::AllowedTcp => StartSection::AllowedUdp,
-                        StartSection::AllowedUdp => StartSection::AllowedTcp,
-                    };
-                }
+            // Enter activates the focused element: the Exit button quits, anything
+            // else (Start button or a CIDR field) submits and starts.
+            KeyCode::Enter => match state.focus {
+                StartFocus::Exit => Step::Quit,
+                _ => submit_start(state),
+            },
+            // Up/Down (or Tab/BackTab) move between rows: the Start/Exit button group,
+            // then the first CIDR field, then the second.
+            KeyCode::Down | KeyCode::Tab => {
+                move_focus(state, true);
+                Step::Continue
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                move_focus(state, false);
+                Step::Continue
+            }
+            // On the buttons, Left/Right move between Start and Exit. On a CIDR field
+            // they fall through to the text input (cursor movement).
+            KeyCode::Left | KeyCode::Right if state.focus.is_button() => {
+                state.focus = match state.focus {
+                    StartFocus::Exit => StartFocus::Start,
+                    _ => StartFocus::Exit,
+                };
                 Step::Continue
             }
             _ => {
-                if allowlist_fields_shown(state) {
-                    match state.section {
-                        StartSection::AllowedTcp => {
-                            handle_edit(&mut state.allowed_tcp, key, is_cidr_char)
-                        }
-                        StartSection::AllowedUdp => {
-                            handle_edit(&mut state.allowed_udp, key, is_cidr_char)
-                        }
+                match state.focus {
+                    StartFocus::AllowedTcp => {
+                        handle_edit(&mut state.allowed_tcp, key, is_cidr_char)
                     }
+                    StartFocus::AllowedUdp => {
+                        handle_edit(&mut state.allowed_udp, key, is_cidr_char)
+                    }
+                    // Buttons ignore text keystrokes.
+                    StartFocus::Start | StartFocus::Exit => {}
                 }
                 Step::Continue
             }
@@ -274,14 +322,26 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 "  Dial a peer on demand from the dashboard (press Shift-C).",
                 Style::default().fg(Color::DarkGray),
             )));
+            // Primary actions, kept above the optional allowlist fields so Start isn't
+            // buried below advanced settings the user can safely skip.
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                button_span("Start", state.focus == StartFocus::Start),
+                Span::raw("  "),
+                button_span("Exit", state.focus == StartFocus::Exit),
+            ]));
             if allowlist_fields_shown(state) {
                 lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "Optional — leave blank to allow localhost only:",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
                 lines.push(Line::from(
                     "Allowed TCP sources the peer may request (CIDR):",
                 ));
                 lines.push(field_input_line(
                     &state.allowed_tcp,
-                    state.section == StartSection::AllowedTcp,
+                    state.focus == StartFocus::AllowedTcp,
                 ));
                 lines.push(Line::from(Span::styled(
                     "  space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
@@ -292,7 +352,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 ));
                 lines.push(field_input_line(
                     &state.allowed_udp,
-                    state.section == StartSection::AllowedUdp,
+                    state.focus == StartFocus::AllowedUdp,
                 ));
                 lines.push(Line::from(Span::styled(
                     "  space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
@@ -320,13 +380,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
 
     lines.push(Line::raw(""));
     let footer = match state.phase {
-        SetupPhase::Start => {
-            if allowlist_fields_shown(state) {
-                "Tab next field · Enter start · Esc / Ctrl-C quit"
-            } else {
-                "Enter start · Esc / Ctrl-C quit"
-            }
-        }
+        SetupPhase::Start => "↑/↓ ←/→ move · Enter select · Esc / Ctrl-C quit",
         SetupPhase::ConfirmGenerateToken => "Esc back · Ctrl-C quit",
     };
     lines.push(Line::from(Span::styled(
@@ -340,6 +394,19 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
         .block(Block::default().borders(Borders::ALL).title(" setup "))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
+}
+
+/// A focusable button. The focused one is reverse-highlighted; the rest are dim.
+fn button_span(label: &str, focused: bool) -> Span<'static> {
+    let style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Span::styled(format!(" {label} "), style)
 }
 
 /// A text-input line. When `active`, a block cursor marks the edit position; otherwise
@@ -424,15 +491,18 @@ mod tests {
 
     #[test]
     fn start_screen_collects_tcp_then_udp_allowlist() {
-        // Empty config allowlist -> the two CIDR fields appear; TCP is focused first.
+        // Empty config allowlist -> the two CIDR fields appear below the Start/Exit
+        // buttons. Focus starts on Start, so arrow down into the TCP field first.
         let mut s = SetupState::new(
             Some(auth::generate_token()),
             AllowedSources::default(),
             false,
             None,
         );
+        handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
+        assert_eq!(s.focus, StartFocus::AllowedTcp);
         type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
-        handle_key(key(KeyCode::Tab), &mut s); // -> AllowedUdp
+        handle_key(key(KeyCode::Down), &mut s); // -> AllowedUdp
         type_str(&mut s, "10.0.0.0/8");
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
@@ -455,6 +525,7 @@ mod tests {
             false,
             None,
         );
+        handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
         type_str(&mut s, "not-a-cidr");
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert!(s.error.is_some());
@@ -469,11 +540,62 @@ mod tests {
             false,
             None,
         );
+        handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
         type_str(&mut s, "abcd");
+        // On a CIDR field, Left/Right move the text cursor (they only switch buttons
+        // when a button is focused).
         handle_key(key(KeyCode::Left), &mut s);
         handle_key(key(KeyCode::Left), &mut s);
         type_str(&mut s, "XY");
         assert_eq!(s.allowed_tcp.value(), "abXYcd");
+    }
+
+    #[test]
+    fn start_button_focused_first_and_enter_starts() {
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
+        assert_eq!(s.focus, StartFocus::Start);
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Done(_)));
+    }
+
+    #[test]
+    fn exit_button_is_focusable_and_enter_quits() {
+        let mut s = SetupState::new(Some(auth::generate_token()), from_config(), false, None);
+        // No fields shown -> focus order is just [Start, Exit]; Right reaches Exit.
+        handle_key(key(KeyCode::Right), &mut s);
+        assert_eq!(s.focus, StartFocus::Exit);
+        // Left toggles back, Right again to Exit, then Enter quits.
+        handle_key(key(KeyCode::Left), &mut s);
+        assert_eq!(s.focus, StartFocus::Start);
+        handle_key(key(KeyCode::Right), &mut s);
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Quit));
+    }
+
+    #[test]
+    fn up_down_move_between_button_row_and_fields() {
+        let mut s = SetupState::new(
+            Some(auth::generate_token()),
+            AllowedSources::default(),
+            false,
+            None,
+        );
+        // Down steps row-by-row: button group -> first field -> second field -> wrap.
+        assert_eq!(s.focus, StartFocus::Start);
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.focus, StartFocus::AllowedTcp);
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.focus, StartFocus::AllowedUdp);
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.focus, StartFocus::Start, "wraps back to the button row");
+
+        // The button row is one vertical stop: Left/Right pick between Start and Exit,
+        // and Down leaves the whole row for the first field (no Start->Exit step).
+        handle_key(key(KeyCode::Right), &mut s);
+        assert_eq!(s.focus, StartFocus::Exit);
+        handle_key(key(KeyCode::Down), &mut s);
+        assert_eq!(s.focus, StartFocus::AllowedTcp);
+        // Coming back up lands on the primary Start button.
+        handle_key(key(KeyCode::Up), &mut s);
+        assert_eq!(s.focus, StartFocus::Start);
     }
 
     #[test]

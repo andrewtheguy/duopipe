@@ -1,12 +1,12 @@
-//! iroh peer runtime: always-on serving plus request-based dial sessions.
+//! iroh peer runtime: always-on serving plus on-demand dial sessions.
 //!
 //! Interactive peers run as `Role::Both`: an always-on `Role::Listen` half that
 //! serves inbound peers, plus a dial manager that owns at most one outbound
-//! `Role::Dial` session. Within any one connection, only the dialer requests
-//! tunnels: a request binds a local listener and asks the connected peer to
-//! connect out to a remote `source`, bridging the two. Requests are activated on
+//! `Role::Dial` session. Within any one connection, only the dialer opens
+//! tunnels: a tunnel binds a local listener and asks the connected peer to
+//! connect out to a remote `source`, bridging the two. Tunnels are activated on
 //! demand (the TUI sends start/stop commands); nothing starts automatically
-//! unless `DUOPIPE_AUTOSTART_REQUESTS` is set (test mode only).
+//! unless `DUOPIPE_AUTOSTART_TUNNELS` is set (test mode only).
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
@@ -33,7 +33,7 @@ use crate::app_state::{
     TunnelId, TunnelStatus,
 };
 use crate::auth::is_token_valid;
-use crate::config::{AllowedSources, RequestEntry, TransportTuning};
+use crate::config::{AllowedSources, TransportTuning, TunnelEntry};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::net::{
     check_source_allowed, extract_addr_from_source, resolve_all_target_addrs, resolve_listen_addrs,
@@ -99,9 +99,9 @@ pub struct PeerConfig {
     /// CIDR allowlist gating which of our sources the peer may request.
     /// Empty protocol allowlists are defaulted to localhost in `run_peer`.
     pub allowed_sources: AllowedSources,
-    /// When true, start every configured request as soon as a connection is up
-    /// (set from `DUOPIPE_AUTOSTART_REQUESTS` in test mode; see `DUOPIPE_TEST_MODE`).
-    pub autostart_requests: bool,
+    /// When true, start every configured tunnel as soon as a connection is up
+    /// (set from `DUOPIPE_AUTOSTART_TUNNELS` in test mode; see `DUOPIPE_TEST_MODE`).
+    pub autostart_tunnels: bool,
     /// The shared auth token (presented when dialing, required when listening).
     /// Also the rendezvous secret for nostr discovery: both peers derive the same
     /// nostr key from it. **Sensitive - redacted in Debug.**
@@ -113,9 +113,11 @@ pub struct PeerConfig {
     /// identity itself is always ephemeral. Disabled in headless test mode, where
     /// the dialer's node id is wired directly.
     pub nostr_discovery: bool,
-    /// Short identifier for nostr discovery (role-dependent): when listening, the
-    /// name this peer publishes its node id under; when dialing, the target peer's
-    /// name to look up. `None` outside nostr mode.
+    /// Short identifier for nostr discovery. For the always-on serve half (and the
+    /// combined interactive process) this is the name it publishes its node id under;
+    /// for the headless dial test path it is the target peer's name to look up. (An
+    /// interactive dial session resolves its target's name at connect time instead.)
+    /// `None` outside nostr mode.
     pub nostr_identifier: Option<String>,
     /// Whether this config's endpoint owns the node id surfaced in the TUI / published
     /// to nostr. Single roles set `true`; in `Role::Both` only the listen sub-config is
@@ -148,7 +150,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
             .field("allowed_sources", &self.allowed_sources)
-            .field("autostart_requests", &self.autostart_requests)
+            .field("autostart_tunnels", &self.autostart_tunnels)
             .field("auth_token", &"[REDACTED]")
             .field("nostr_relays", &self.nostr_relays)
             .field("nostr_discovery", &self.nostr_discovery)
@@ -174,8 +176,8 @@ pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
     // otherwise reject the common loopback-tunnel case.
     config.allowed_sources = config.allowed_sources.with_localhost_defaults();
 
-    // One global stream limiter for the whole process, created up front so a dual-role
-    // process shares a single cap across its listen and dial halves.
+    // One global stream limiter for the whole process, created up front so the
+    // combined process shares a single cap across its serve and dial halves.
     let semaphore = new_stream_semaphore(&config)?;
 
     match config.role {
@@ -193,7 +195,7 @@ fn split_serve_dial_config(config: &PeerConfig) -> (PeerConfig, PeerConfig) {
     let mut listen = config.clone();
     listen.role = Role::Listen;
     listen.peer_node_id = None;
-    listen.autostart_requests = false;
+    listen.autostart_tunnels = false;
     // The listen endpoint owns the displayed/published node id.
     listen.report_endpoint_id = true;
 
@@ -361,8 +363,8 @@ async fn run_managed_dial_session(
         };
 
         // Self-dial guard: end the session (not the process) — the target won't change.
-        // Reject both the dial endpoint's own id *and* this process's published (listen)
-        // node id, which is a separate endpoint in the dual-role process — so dialing our
+        // Reject both the dial endpoint's own id *and* this process's published (serve)
+        // node id, which is a separate endpoint in the combined process — so dialing our
         // own published id (a quick-mode paste, or a name that resolves back to us) is
         // caught here as a last line of defense behind the connect prompt's checks.
         if let Ok(id) = &resolved {
@@ -443,7 +445,8 @@ async fn run_managed_dial_session(
 }
 
 // ============================================================================
-// Listen role
+// Serve half (always-on, handles inbound peers) — also the headless `Role::Listen`
+// test path
 // ============================================================================
 
 /// Create the global stream limiter and register it for the TUI gauge. Shared by
@@ -463,8 +466,8 @@ fn new_stream_semaphore(config: &PeerConfig) -> Result<Arc<Semaphore>> {
 }
 
 async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
-    log::info!("Symmetric Peer - Listen Mode");
-    log::info!("============================");
+    log::info!("duopipe serve half — listening for inbound peers");
+    log::info!("=================================================");
 
     let endpoint = create_server_endpoint(
         &config.relay_urls,
@@ -549,7 +552,7 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
 
     connection_tasks.shutdown().await;
     endpoint.close().await;
-    log::info!("Peer (listen) stopped.");
+    log::info!("Serve half stopped.");
     Ok(())
 }
 
@@ -809,18 +812,19 @@ fn nudge_rename(config_path: &Option<PathBuf>, identifier: &str) {
 }
 
 // ============================================================================
-// Dial role
+// Dial half (on-demand, one outbound session) — also the headless `Role::Dial`
+// test path
 // ============================================================================
 
 async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
     if config.peer_node_id.is_none() && config.nostr_identifier.is_none() {
         anyhow::bail!(
-            "dial role requires a peer node id (quick mode) or a peer identifier (nostr mode)"
+            "dialing requires a peer node id (quick mode) or a peer identifier (nostr mode)"
         );
     }
 
-    log::info!("Symmetric Peer - Dial Mode");
-    log::info!("==========================");
+    log::info!("duopipe dial half — connecting to peer");
+    log::info!("======================================");
 
     let endpoint = create_client_endpoint(
         &config.relay_urls,
@@ -1018,12 +1022,12 @@ async fn handle_connection(
         }));
     }
 
-    // Requester side (dial role only): a dialer drives a single connection, so it
-    // owns the tunnel table and supervises start/stop of its own requests. A listener
-    // serves many peers at once and initiates no tunnels — there is no single
-    // connection a request could be bound to — so it only runs the acceptor above.
+    // Requester side (dialing side only): a dialer drives a single connection, so it
+    // owns the tunnel table and supervises start/stop of its own tunnels. The serve
+    // half handles many peers at once and initiates no tunnels — there is no single
+    // connection a tunnel could be bound to — so it only runs the acceptor above.
     if is_dialer {
-        config.status.seed_tunnels_from_requests();
+        config.status.seed_tunnels();
         // Subscribe before spawning so an autostart burst cannot race the subscription.
         let command_rx = config.status.subscribe_commands();
         {
@@ -1031,19 +1035,19 @@ async fn handle_connection(
             let semaphore = semaphore.clone();
             let status = config.status.clone();
             tasks.spawn(crate::logging::inherit_source(async move {
-                request_supervisor(conn, semaphore, status, command_rx).await;
+                tunnel_supervisor(conn, semaphore, status, command_rx).await;
             }));
         }
-        // Optionally autostart every configured request (non-interactive/test mode).
-        if config.autostart_requests {
-            for id in config.status.request_ids() {
+        // Optionally autostart every configured tunnel (non-interactive/test mode).
+        if config.autostart_tunnels {
+            for id in config.status.tunnel_ids() {
                 config.status.send_command(TunnelCommand::Start(id));
             }
         }
     }
 
     // Run until the connection closes or a local shutdown is requested, then tear
-    // everything down. Observing `shutdown` here is essential for the dial role:
+    // everything down. Observing `shutdown` here is essential for the dialing side:
     // `run_dial` awaits this function inline (not in an abortable task), so without
     // this branch a Ctrl-C while connected would block forever on `conn.closed()`
     // (keep-alive prevents the idle timeout from ever firing).
@@ -1064,12 +1068,12 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Supervise this peer's tunnel requests over one connection. Listens for
-/// [`TunnelCommand`]s and starts/stops each request, tracking a cancellation
-/// token per running request so a `Stop` (or the connection closing) frees the
-/// bound local port. Requests are read live from [`AppState`] so runtime-added
+/// Supervise this peer's tunnels over one connection. Listens for
+/// [`TunnelCommand`]s and starts/stops each tunnel, tracking a cancellation
+/// token per running tunnel so a `Stop` (or the connection closing) frees the
+/// bound local port. Tunnels are read live from [`AppState`] so runtime-added
 /// ones are visible without restarting the supervisor.
-async fn request_supervisor(
+async fn tunnel_supervisor(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
@@ -1087,7 +1091,7 @@ async fn request_supervisor(
                     if running.contains_key(&id) {
                         continue; // already running
                     }
-                    let Some(req) = status.get_request(id) else { continue };
+                    let Some(req) = status.get_tunnel(id) else { continue };
                     let token = CancellationToken::new();
                     running.insert(id, token.clone());
 
@@ -1097,7 +1101,7 @@ async fn request_supervisor(
                     let done_tx = done_tx.clone();
                     tokio::spawn(crate::logging::inherit_source(async move {
                         let outcome = tokio::select! {
-                            r = run_request(conn.clone(), req, semaphore, status.clone(), id) => Some(r),
+                            r = run_tunnel(conn.clone(), req, semaphore, status.clone(), id) => Some(r),
                             _ = token.cancelled() => None,
                             // Tie the listener's lifetime to the connection so it
                             // never outlives it (which would leak the bound port).
@@ -1106,7 +1110,7 @@ async fn request_supervisor(
                         match outcome {
                             Some(Err(e)) => {
                                 status.update_tunnel(id, TunnelStatus::Error, e.to_string());
-                                log::warn!("Request {} ended: {}", id, e);
+                                log::warn!("Tunnel {} ended: {}", id, e);
                             }
                             // Stopped, connection closed, or the listen loop ended cleanly.
                             Some(Ok(())) | None => {
@@ -1346,13 +1350,13 @@ async fn connect_side(
 // Tunnel requests: opener / listen side
 // ============================================================================
 
-/// Run one tunnel request: bind the local `local_listen` address and, for each
+/// Run one tunnel: bind the local `local_listen` address and, for each
 /// incoming connection, open a stream asking the peer to connect out to
 /// `remote_source`. Runs until the listener errors or the caller cancels it
 /// (freeing the bound port).
-async fn run_request(
+async fn run_tunnel(
     conn: Arc<iroh::endpoint::Connection>,
-    req: RequestEntry,
+    req: TunnelEntry,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
     id: TunnelId,
@@ -1360,12 +1364,12 @@ async fn run_request(
     let hello = StreamHello::local_forward(&req.remote_source);
     let listen_addrs = resolve_listen_addrs(&req.local_listen)
         .await
-        .with_context(|| format!("Invalid request listen address '{}'", req.local_listen))?;
+        .with_context(|| format!("Invalid tunnel listen address '{}'", req.local_listen))?;
 
     if req.remote_source.starts_with("udp://") {
         let listen_addr = *listen_addrs
             .first()
-            .context("No listen address resolved for request")?;
+            .context("No listen address resolved for tunnel")?;
         let udp_socket = Arc::new(
             UdpSocket::bind(listen_addr)
                 .await
@@ -1530,7 +1534,7 @@ mod tests {
             role,
             peer_node_id: None,
             allowed_sources: AllowedSources::default(),
-            autostart_requests: false,
+            autostart_tunnels: false,
             auth_token: token.to_string(),
             nostr_relays: vec![],
             nostr_discovery: false,
@@ -1567,7 +1571,7 @@ mod tests {
                 tcp: vec!["10.0.0.0/8".to_string()],
                 udp: vec![],
             },
-            autostart_requests: true,
+            autostart_tunnels: true,
             auth_token: "tok".to_string(),
             nostr_relays: vec![],
             nostr_discovery: true,
@@ -1591,7 +1595,7 @@ mod tests {
         // Listen publishes under its own name and owns the reported node id.
         assert_eq!(listen.nostr_identifier.as_deref(), Some("homelab"));
         assert!(listen.report_endpoint_id);
-        assert!(!listen.autostart_requests);
+        assert!(!listen.autostart_tunnels);
         assert_eq!(listen.allowed_sources.tcp, vec!["10.0.0.0/8".to_string()]);
 
         // The dial half carries no fixed target (it dials runtime requests) and its

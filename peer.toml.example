@@ -14,16 +14,16 @@
 # `duopipe nostr` is interactive and always starts serving inbound peers. There is
 # no startup listen/dial role choice and no dial target in this file: press `c` on
 # the dashboard and type the target peer's `name` to start the single outbound dial
-# session. This file supplies the shared auth token, this peer's own `name`, tunnel
-# requests, the allowlist, relays, tuning, and the nostr relay override.
+# session. This file supplies the shared auth token, this peer's own `name`, the
+# seed tunnel list, the allowlist, relays, tuning, and the nostr relay override.
 #
-# Tunnel model: the DIALER *requests* tunnels; the LISTENER is a pure server. A
-# [[request]] (used when this peer dials) binds a local listener and asks the
-# listener peer to connect out to a remote 'source'; traffic is bridged between
-# them. Requests do NOT start automatically — the TUI lists them and you start/stop
-# each one with Enter (in test mode only, with DUOPIPE_TEST_MODE=1, set
-# DUOPIPE_AUTOSTART_REQUESTS=1 to auto-start all on connect). When listening, this
-# peer serves any number of dialers at once and initiates no tunnels of its own.
+# Tunnel model: every node always serves inbound peers AND can open outbound tunnels
+# on demand over its dial session. The [[tunnel]] entries are a seed list of tunnels
+# this node can dial: each binds a local listener and asks the connected peer to
+# connect out to a remote 'source', bridging the two. Tunnels do NOT start
+# automatically — the TUI lists them and you start/stop each one with Enter (in test
+# mode only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start
+# all on connect). Inbound, this peer serves any number of dialers at once.
 #
 # Trust model: once token auth succeeds the dialer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
@@ -35,9 +35,9 @@
 # channel to publish & look up the current node id, keyed off the shared auth_token
 # (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
-# This peer's short, memorable identifier. REQUIRED in nostr mode. When listening,
-# this peer publishes its node id under this name; a dialer types it to find this
-# peer. Several peers can share one auth token and be reached individually by name
+# This peer's short, memorable identifier. REQUIRED in nostr mode. This peer's
+# always-on serve half publishes its node id under this name; another peer dials it
+# by typing this name. Several peers can share one auth token and be reached by name
 # (duplicate names just mean newest-wins). For the raw node-id flow, use quick mode
 # (`duopipe quick`).
 name = "web1"
@@ -78,18 +78,20 @@ auth_token_file = "~/.config/duopipe/token.txt"
 # dns_server = "none"
 
 # ============================================================================
-# Tunnel requests (used when this peer DIALS): ask the listener to connect out to
-# 'remote_source'; deliver traffic to a local listener bound at 'local_listen'. The
-# 'remote_source' scheme (tcp:// or udp://) selects the protocol. 'name' is the label
-# shown in the TUI. Nothing starts until you connect to a peer and activate it
-# (Enter in the TUI, or DUOPIPE_AUTOSTART_REQUESTS=1 in test mode).
+# Seed tunnels this node can open over its outbound dial session: ask the connected
+# peer to connect out to 'remote_source'; deliver traffic to a local listener bound
+# at 'local_listen'. The 'remote_source' scheme (tcp:// or udp://) selects the
+# protocol. 'name' is the label shown in the TUI and must be unique. Nothing starts
+# until you connect to a peer and activate it (Enter in the TUI, or
+# DUOPIPE_AUTOSTART_TUNNELS=1 in test mode). Tunnels can also be added (a) or edited
+# (e, while not running) from the dashboard at runtime.
 # ============================================================================
-[[request]]
+[[tunnel]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 
-[[request]]
+[[tunnel]]
 name = "cache"
 remote_source = "tcp://127.0.0.1:5679"
 local_listen = "127.0.0.1:15679"

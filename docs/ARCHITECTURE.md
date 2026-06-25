@@ -34,7 +34,7 @@ Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that 
 
 Config declares **tunnel requests** and the **serving allowlist** (the dial target is chosen interactively at runtime, not here):
 
-- **`[[request]]`** (`name`, `remote_source`, `local_listen`): templates for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source`, then bridges the two. Activated on demand (TUI `Enter`/`a`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode) — nothing forwards automatically.
+- **`[[tunnel]]`** (`name`, `remote_source`, `local_listen`): templates for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source`, then bridges the two. Activated on demand (TUI `Enter`/`a`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
 - **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): the **serve** half uses these to gate which `remote_source` addresses it will connect out to when a connected peer requests one. Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`).
 
 #### Non-interactive mode (testing)
@@ -43,7 +43,7 @@ The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_
 
 - `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
-- `DUOPIPE_AUTOSTART_REQUESTS=1` — start every configured `[[request]]` (dial role) on connect.
+- `DUOPIPE_AUTOSTART_TUNNELS=1` — start every configured `[[tunnel]]` (dial side) on connect.
 - `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
@@ -158,7 +158,7 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe nostr`): an always-on serve half plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** tunnels (`[[request]]`), running its own request listeners; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
+Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe nostr`): an always-on serve half plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** tunnels (`[[tunnel]]`), running its own request listeners; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
 
 ```mermaid
 graph TB
@@ -275,7 +275,7 @@ A single global `Semaphore` (default `max_streams = 100`), shared across all con
 
 ### Request Data Flow
 
-A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_REQUESTS=1` in test mode); stopping one cancels its task and frees the bound port.
+A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping one cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
@@ -414,7 +414,7 @@ graph TB
 
 ## Configuration System
 
-A single, symmetric `PeerConfig` drives both halves of an interactive peer. There is no `role` key and no `connect` key: interactive runs always use the dual-role runtime, and the outbound dial target is chosen later from the dashboard. Only headless test mode derives a single listen/dial role from environment variables.
+A single, symmetric `PeerConfig` drives both halves of an interactive peer. There is no `role` key and no `connect` key: interactive runs always use the single combined serve+dial runtime, and the outbound dial target is chosen later from the dashboard. Only headless test mode derives a single listen/dial role from environment variables.
 
 ### Configuration File Structure
 
@@ -426,7 +426,7 @@ graph TB
 
     subgraph "Options"
         E[auth_token_file — path to the single shared token<br/>both peers]
-        G[request[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
+        G[tunnel[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
@@ -460,7 +460,7 @@ Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) 
 # peer.toml
 auth_token_file = "/etc/duopipe/auth_token.txt"
 
-[[request]]
+[[tunnel]]
 name = "ssh"
 remote_source = "tcp://127.0.0.1:22"
 local_listen = "127.0.0.1:2222"
@@ -582,9 +582,9 @@ graph TB
 - **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, connected peers, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* is done by you (one person across your screens), not automatically.
 - **Trust assumed between your devices.** Because the dialer can *request* tunnels of the listener once authenticated, the token should only ever live on endpoints you control; the listener's `[allowed_sources]` allowlist then bounds what a dialer can actually reach.
 
-**Multiple peers, no session binding (listen role).** A listener accepts **many concurrent dialers** over its one iroh endpoint; authentication is the only gate. Each authenticated connection is served independently and shown as a row in the TUI peer list (`AppState::add_peer` / `remove_peer`). There is no sticky single-peer binding and no fatal "wrong peer" rejection — different node ids are all admitted. Because each dialer is a separate process binding its own local ports, N dialers can request the same listener source at once with no conflict; the listener simply makes N independent outbound connects. A brief duplicate connection from the same node id (a reconnect overlap) is de-duplicated in the peer list rather than rejected.
+**Multiple peers, no session binding (serve half).** The serve half accepts **many concurrent dialers** over its one iroh endpoint; authentication is the only gate. Each authenticated connection is served independently and shown as a row in the TUI peer list (`AppState::add_peer` / `remove_peer`). There is no sticky single-peer binding and no fatal "wrong peer" rejection — different node ids are all admitted. Because each dialer is a separate process binding its own local ports, N dialers can request the same listener source at once with no conflict; the listener simply makes N independent outbound connects. A brief duplicate connection from the same node id (a reconnect overlap) is de-duplicated in the peer list rather than rejected.
 
-**Dialer requests, listener serves.** Connection setup is asymmetric, and so is the tunnel model: the **dialer** initiates tunnels (it owns the tunnel table and a `request_supervisor`), while the **listener is a pure server** — it runs only the acceptor loop and initiates none of its own (with many peers there would be no single connection a request could bind to). A request asks the listener to connect out to a `source`; before connecting, the listener checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Tunnels are activated on demand from the dialer's TUI; nothing forwards until started. To expose a service that lives near the listener box, run that box as the dialer instead. Only grant a peer the token if you trust it to reach the networks in your allowlist.
+**Dialer requests, listener serves.** Connection setup is asymmetric, and so is the tunnel model: the **dialer** initiates tunnels (it owns the tunnel table and a `tunnel_supervisor`), while the **listener is a pure server** — it runs only the acceptor loop and initiates none of its own (with many peers there would be no single connection a request could bind to). A request asks the listener to connect out to a `source`; before connecting, the listener checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Tunnels are activated on demand from the dialer's TUI; nothing forwards until started. To reach a service that lives near the *other* box, dial *from* the box that wants to reach it — every node can dial on demand. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
@@ -851,7 +851,7 @@ The `iroh::Endpoint` provides:
 - `run_dial_manager` — interactive-only manager for the single outbound session. It reuses one client endpoint, idles until a `DialCommand::Connect`, and replaces or disconnects the active session on dashboard commands.
 - `run_dial` — headless test path for a fixed target: `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out, capped by the global semaphore). The **dialer** additionally runs a `request_supervisor` that starts/stops its own requests (`run_request`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running request; the **listener** runs only the acceptor (it is a pure server). In test mode, `DUOPIPE_AUTOSTART_REQUESTS=1` starts every dial-role request on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out, capped by the global semaphore). The **dialer** additionally runs a `tunnel_supervisor` that starts/stops its own tunnels (`run_tunnel`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running tunnel; the **listener** runs only the acceptor (it is a pure server). In test mode, `DUOPIPE_AUTOSTART_TUNNELS=1` starts every dial-side tunnel on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
 
 ---
 
@@ -939,7 +939,7 @@ Retry guidance:
 |---------|---------|
 | Bidirectional tunnels | **Yes** — the dialer requests tunnels; the listener serves them, and each tunnel carries traffic both ways |
 | Multi-Stream | **Yes** — many concurrent forwarded data streams per connection (`max_streams`) |
-| Per-tunnel addresses | **Yes** — each `[[request]]` names its own `remote_source` / `local_listen` |
+| Per-tunnel addresses | **Yes** — each `[[tunnel]]` names its own `remote_source` / `local_listen` |
 | Encryption | QUIC/TLS 1.3 |
 | Platform | Linux, macOS, Windows |
 

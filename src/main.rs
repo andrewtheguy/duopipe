@@ -133,8 +133,8 @@ fn resolve_config_auth_token(
 struct TestEnv {
     /// `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial that id; absent ⇒ Listen.
     peer_node_id: Option<String>,
-    /// `DUOPIPE_AUTOSTART_REQUESTS`: auto-start all requests once connected.
-    autostart_requests: bool,
+    /// `DUOPIPE_AUTOSTART_TUNNELS`: auto-start all tunnels once connected.
+    autostart_tunnels: bool,
 }
 
 impl TestEnv {
@@ -145,7 +145,7 @@ impl TestEnv {
         }
         Some(TestEnv {
             peer_node_id: env_var_opt("DUOPIPE_PEER_NODE_ID"),
-            autostart_requests: env_truthy("DUOPIPE_AUTOSTART_REQUESTS"),
+            autostart_tunnels: env_truthy("DUOPIPE_AUTOSTART_TUNNELS"),
         })
     }
 
@@ -213,7 +213,7 @@ async fn run_peer_headless(
     cfg: &PeerConfig,
     relay_urls: Vec<String>,
     relay_only: bool,
-    autostart_requests: bool,
+    autostart_tunnels: bool,
 ) -> Result<()> {
     let logs = logging::LogBuffer::new(LOG_CAPACITY);
     // Headless test mode is single-role and never uses nostr, so the dial-prompt
@@ -222,7 +222,7 @@ async fn run_peer_headless(
         resolved.role,
         resolved.token_generated,
         logs,
-        cfg.request.clone(),
+        cfg.tunnel.clone(),
         false,
         None,
     );
@@ -230,7 +230,7 @@ async fn run_peer_headless(
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
         allowed_sources: resolved.allowed_sources.clone(),
-        autostart_requests,
+        autostart_tunnels,
         auth_token: resolved.auth_token,
         // Headless test mode never uses nostr: the node id is wired directly via
         // DUOPIPE_PEER_NODE_ID, so tests stay hermetic (no live relays).
@@ -401,7 +401,7 @@ async fn run_start_peer(
             &cfg,
             relay_urls,
             relay_only,
-            test_env.autostart_requests,
+            test_env.autostart_tunnels,
         )
         .await;
     }
@@ -456,7 +456,7 @@ async fn run_start_peer(
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
         logs: log_buffer,
-        requests: cfg.request.clone(),
+        tunnels: cfg.tunnel.clone(),
         allowed_sources: cfg.allowed_sources.clone(),
         relay_urls,
         relay_only,

@@ -57,7 +57,7 @@ A peer can serve **many inbound peers at once** — laptop + phone + VPS all dia
 
 ### Tunnel requests at a glance
 
-Every tunnel is a **request** (SSH `-L`–style, pull direction): the **dialer** declares `[[request]]` entries in config, and activating one binds a local listener and asks the **listener** peer to connect out to a remote source.
+Every tunnel is a **request** (SSH `-L`–style, pull direction): the **dialer** declares `[[tunnel]]` entries in config, and activating one binds a local listener and asks the **listener** peer to connect out to a remote source.
 
 | Field | Meaning |
 |-------|---------|
@@ -192,7 +192,7 @@ A minimal config is essentially the requests you can make, the sources you'll ex
 auth_token_file = "/etc/duopipe/auth_token.txt"
 
 # A tunnel we can request: bind locally, ask the peer to reach its source.
-[[request]]
+[[tunnel]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
@@ -202,7 +202,7 @@ local_listen = "127.0.0.1:15678"
 tcp = ["127.0.0.0/8"]
 ```
 
-The instance always listens; the dial target is chosen **interactively** at runtime (press `c`), not in the config file. `[[request]]` entries are templates for that dial session, started/stopped from the TUI — nothing forwards automatically.
+The instance always listens; the dial target is chosen **interactively** at runtime (press `c`), not in the config file. `[[tunnel]]` entries are templates for that dial session, started/stopped from the TUI — nothing forwards automatically.
 
 ---
 
@@ -220,7 +220,7 @@ Each iroh connection carries requested tunnels. The **dialer** *requests* a tunn
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-One connection can carry any number of TCP/UDP requests from the dialer at once, and one listener serves many dialers concurrently. The listener is a pure server — to reach a service that lives near the listener box, run that box as the dialer instead.
+One connection can carry any number of TCP/UDP requests from the dialer at once, and one serving peer handles many dialers concurrently. For any single connection the serving side is a pure server — so to reach a service that lives near the *other* box, dial *from* the box that wants to reach it (every node can dial on demand).
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -247,7 +247,7 @@ In the TUI on either machine, press **`c`** and type the **`name`** of the peer 
 Once connected, the requests you start in the TUI flow over that session. For example, a config with:
 
 ```toml
-[[request]]
+[[tunnel]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
@@ -260,7 +260,7 @@ Requests are started/stopped independently in the TUI. A single instance serves 
 
 ### 3. SSH over a requested tunnel
 
-With a `[[request]]` of `remote_source = "tcp://127.0.0.1:22"`, `local_listen = "127.0.0.1:2222"` (the other peer reaches the SSH server, and allows `127.0.0.0/8` in `[allowed_sources]`):
+With a `[[tunnel]]` of `remote_source = "tcp://127.0.0.1:22"`, `local_listen = "127.0.0.1:2222"` (the other peer reaches the SSH server, and allows `127.0.0.0/8` in `[allowed_sources]`):
 
 ```bash
 ssh -p 2222 user@127.0.0.1
@@ -272,7 +272,7 @@ UDP works too; the `remote_source` scheme selects the protocol, and the address 
 
 ```toml
 # This peer listens on UDP 51820; the other peer connects out to the UDP service.
-[[request]]
+[[tunnel]]
 name = "wg"
 remote_source = "udp://127.0.0.1:51820"
 local_listen = "0.0.0.0:51820"
@@ -287,13 +287,13 @@ other side serves.** But every instance both serves and dials, so you get both
 directions naturally — just dial from whichever side needs to pull:
 
 - `homelab` wants a service on `laptop`: on `homelab` press `c`, dial `laptop`, and
-  start its `[[request]]` for that service.
+  start its `[[tunnel]]` for that service.
 - `laptop` wants a service on `homelab`: on `laptop` press `c`, dial `homelab`, and
   start its request.
 
 Both can be connected at the same time — each instance's serve half accepts the
 other's inbound dial while its own dial session pulls the other way. Each box's
-`[[request]]` list is what *it* pulls when dialing; its `[allowed_sources]` gates what
+`[[tunnel]]` list is what *it* pulls when dialing; its `[allowed_sources]` gates what
 a connected peer may reach when serving — one config carries both halves.
 
 **This does not conflict on nostr.** Each instance publishes its node id under its own
@@ -311,7 +311,7 @@ duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1`
 |---------|---------|
 | `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTOSTART_REQUESTS=1` | Start every configured `[[request]]` (dial role) once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTOSTART_TUNNELS=1` | Start every configured `[[tunnel]]` (dial side) once connected (nothing auto-starts otherwise). |
 | `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
 
 In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
@@ -343,7 +343,7 @@ Both interactive subcommands launch the same always-listening TUI; they differ o
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
-| `DUOPIPE_AUTOSTART_REQUESTS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all dial-role requests on connect. |
+| `DUOPIPE_AUTOSTART_TUNNELS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start all dial-side tunnels on connect. |
 
 ## Configuration Files
 
@@ -402,8 +402,8 @@ auth_token_file = "~/.config/duopipe/auth_token.txt"
 dns_server = "https://dns.example.com/pkarr"
 max_streams = 100   # max concurrent forwarded connections across all tunnels and peers
 
-# Tunnel requests (dial role): bind locally, ask the listener to connect out to source.
-[[request]]
+# Seed tunnels (dial side): bind locally, ask the connected peer to connect out to source.
+[[tunnel]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"

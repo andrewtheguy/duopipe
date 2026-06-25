@@ -23,13 +23,13 @@ use ratatui::crossterm::event::{
 use crate::app_state::{
     AppSnapshot, AppState, DialCommand, DialTarget, NameCommand, NameConflict, Role, TunnelCommand,
 };
-use crate::config::{AllowedSources, RequestEntry, TransportTuning, validate_request_specs};
+use crate::config::{AllowedSources, TransportTuning, TunnelEntry, validate_tunnel_specs};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use iroh::EndpointId;
 use setup::{SetupOutcome, SetupState, Step};
 use textinput::handle_edit;
-use ui::{AddField, AddRequestForm, ConnectForm, Screen, UiState};
+use ui::{AddField, AddTunnelForm, ConnectForm, Screen, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
@@ -39,7 +39,7 @@ const GENERATED_TOKEN_AUTO_HIDE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Everything the TUI needs to run setup and build the runtime `PeerConfig`.
 pub struct TuiLaunch {
     pub logs: Arc<LogBuffer>,
-    pub requests: Vec<RequestEntry>,
+    pub tunnels: Vec<TunnelEntry>,
     pub allowed_sources: AllowedSources,
     pub relay_urls: Vec<String>,
     pub relay_only: bool,
@@ -91,7 +91,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         resolved.role,
         resolved.token_generated,
         launch.logs.clone(),
-        launch.requests.clone(),
+        launch.tunnels.clone(),
         launch.nostr_discovery,
         launch.peer_name.clone(),
     );
@@ -121,7 +121,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                 let _ = terminal.draw(|f| {
                     ui::render(f, &snap, &logs, &ui_state);
                     if let Some(form) = &ui_state.add_form {
-                        ui::render_add_request_dialog(f, form);
+                        ui::render_add_tunnel_dialog(f, form);
                     }
                     if let Some(form) = &ui_state.connect_form {
                         ui::render_connect_dialog(f, form, state.nostr_discovery);
@@ -181,7 +181,7 @@ fn build_peer_config(
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
         allowed_sources: resolved.allowed_sources.clone(),
-        autostart_requests: false,
+        autostart_tunnels: false,
         auth_token: resolved.auth_token.clone(),
         nostr_relays: launch.nostr_relays.clone(),
         nostr_discovery: launch.nostr_discovery,
@@ -316,17 +316,28 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
 
 /// Home-screen keys: tunnel navigation/actions plus the connection-info dump.
 ///
-/// Tunnels are a dial-role concept (the dialer requests them); the listen role is a
-/// pure server and shows only its connected peers. Arrows / `j`/`k` move the tunnel
-/// selection cursor; `Enter`/`Space` start or stop the selected tunnel; `a` opens the
-/// add-request modal; `d`/`Del` removes the selected tunnel from the session (config
-/// is untouched); `w` writes (dumps) the connection info to a file.
+/// Tunnels belong to the combined node's outbound dial session; a pure listen-only
+/// half shows only its connected peers. Arrows / `j`/`k` move the tunnel selection
+/// cursor; `Enter`/`Space` start or stop the selected tunnel; `a` opens the
+/// add-tunnel modal; `e` edits the selected tunnel in place while it is not running;
+/// `d`/`Del` removes the selected tunnel from the session (config is untouched);
+/// `w` writes (dumps) the connection info to a file.
 fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let tunnels = state.tunnel_count();
     match key.code {
-        // Tunnels are driven by the dial half; the pure listener initiates none.
+        // Tunnels are driven by the dial half; a pure listen-only half initiates none.
         KeyCode::Char('a') if matches!(state.role, Role::Dial | Role::Both) => {
-            ui.add_form = Some(AddRequestForm::default());
+            ui.add_form = Some(AddTunnelForm::default());
+        }
+        // Edit the selected tunnel in place — only while it is not running (a
+        // Listening tunnel must be stopped first so its bound port isn't orphaned).
+        KeyCode::Char('e') if matches!(state.role, Role::Dial | Role::Both) => {
+            if let Some(id) = state.tunnel_id_at(ui.selected)
+                && !state.tunnel_running(id)
+                && let Some(entry) = state.get_tunnel(id)
+            {
+                ui.add_form = Some(AddTunnelForm::edit(id, &entry));
+            }
         }
         // Connect / re-point the on-demand dial session (interactive serve+dial mode).
         // Shift-C pairs with Shift-D below as the dial-session lifecycle controls,
@@ -353,7 +364,7 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         }
         KeyCode::Char('d') | KeyCode::Delete => {
             if let Some(id) = state.tunnel_id_at(ui.selected) {
-                state.delete_request(id);
+                state.delete_tunnel(id);
                 // The row is gone; keep the cursor on a valid row (clamp to the last
                 // remaining one, or 0 when the list is now empty).
                 ui.selected = ui.selected.min(state.tunnel_count().saturating_sub(1));
@@ -449,9 +460,10 @@ fn is_field_char(c: char, field: AddField) -> bool {
     c.is_ascii_graphic() || (c == ' ' && field == AddField::Name)
 }
 
-/// Handle a key while the add-request modal is open. Tab/Enter advance the field;
-/// Enter on the last field validates and (on success) adds + auto-starts the
-/// request. Esc cancels.
+/// Handle a key while the add/edit-tunnel modal is open. Up/Down (or Tab/BackTab)
+/// move between fields; Enter advances, and Enter on the last field validates and
+/// (on success) adds + auto-starts a new tunnel, or saves an edit in place. Esc
+/// cancels.
 fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
@@ -461,17 +473,19 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         KeyCode::Esc => {
             ui.add_form = None;
         }
-        KeyCode::Tab => {
+        // Vertical form: Up/Down (and Tab/BackTab) move between fields.
+        KeyCode::Down | KeyCode::Tab => {
             form.field = next_field(form.field);
         }
+        KeyCode::Up | KeyCode::BackTab => {
+            form.field = prev_field(form.field);
+        }
         KeyCode::Enter => match form.field {
-            AddField::LocalListen => submit_add_form(ui, state),
+            AddField::LocalListen => submit_tunnel_form(ui, state),
             other => form.field = next_field(other),
         },
-        // The protocol selector is a toggle, not a text field.
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-            if form.field == AddField::Protocol =>
-        {
+        // The protocol selector is a left/right toggle (Up/Down navigate fields).
+        KeyCode::Left | KeyCode::Right if form.field == AddField::Protocol => {
             form.protocol = form.protocol.toggled();
         }
         _ => {
@@ -484,7 +498,7 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     }
 }
 
-/// The field reached by Tab / Enter from `field`, cycling back to the top.
+/// The field reached by Down / Tab / Enter from `field`, cycling back to the top.
 fn next_field(field: AddField) -> AddField {
     match field {
         AddField::Name => AddField::Protocol,
@@ -494,14 +508,25 @@ fn next_field(field: AddField) -> AddField {
     }
 }
 
-/// Validate the modal's fields and, on success, append the request to `AppState`
-/// and dispatch a `Start` so it auto-starts. A blank `name` falls back to the
-/// `remote_source` string as the row label.
+/// The field reached by Up / BackTab from `field`, cycling back to the bottom.
+fn prev_field(field: AddField) -> AddField {
+    match field {
+        AddField::Name => AddField::LocalListen,
+        AddField::Protocol => AddField::Name,
+        AddField::RemoteSource => AddField::Protocol,
+        AddField::LocalListen => AddField::RemoteSource,
+    }
+}
+
+/// Validate the modal's fields and, on success, either append a new tunnel and
+/// dispatch a `Start` so it auto-starts (add mode), or replace the selected
+/// tunnel's spec in place without starting it (edit mode). A blank `name` falls
+/// back to the `remote_source` string as the row label, and names must be unique.
 ///
-/// `Start` is broadcast: if currently disconnected there's no supervisor to
-/// receive it, so the row stays Idle until started (consistent with config
-/// requests after a reconnect).
-fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
+/// `Start` (add mode) is broadcast: if currently disconnected there's no supervisor
+/// to receive it, so the row stays Idle until started (consistent with config
+/// tunnels after a reconnect).
+fn submit_tunnel_form(ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
     };
@@ -513,23 +538,35 @@ fn submit_add_form(ui: &mut UiState, state: &Arc<AppState>) {
     } else {
         form.name.value().trim().to_string()
     };
-    let req = RequestEntry {
+    let entry = TunnelEntry {
         name,
         remote_source,
         local_listen: form.local_listen.value().trim().to_string(),
     };
-    match validate_request_specs(std::slice::from_ref(&req)) {
-        Ok(()) => {
-            let id = state.add_request(req);
+    if let Err(e) = validate_tunnel_specs(std::slice::from_ref(&entry)) {
+        form.error = Some(e.to_string());
+        return;
+    }
+    // Names must stay unique. When editing, the tunnel keeps its own name freely
+    // (`editing` excludes its own row from the collision check).
+    if state.tunnel_name_taken(&entry.name, form.editing) {
+        form.error = Some(format!("tunnel name {:?} already in use", entry.name));
+        return;
+    }
+    match form.editing {
+        Some(id) => {
+            // Edit in place: replace the spec, keep id/position, do not start. The
+            // row stays where it was, so the cursor already points at it.
+            state.edit_tunnel(id, entry);
+        }
+        None => {
+            let id = state.add_tunnel(entry);
             state.send_command(TunnelCommand::Start(id));
             // The new row is appended last; point the cursor at it.
             ui.selected = state.tunnel_count().saturating_sub(1);
-            ui.add_form = None;
-        }
-        Err(e) => {
-            form.error = Some(e.to_string());
         }
     }
+    ui.add_form = None;
 }
 
 /// Handle a key while the connect modal is open. Enter validates the target and (on
@@ -628,11 +665,11 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         snap.endpoint_id.as_deref().unwrap_or("(pending)")
     );
     if let Some(target) = snap.dial_target.as_deref() {
-        let _ = writeln!(out, "dial:      {target}");
+        let _ = writeln!(out, "outbound:  {target}");
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
     } else {
-        let _ = writeln!(out, "dial:      not connected");
+        let _ = writeln!(out, "outbound:  not connected");
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
 
@@ -732,7 +769,7 @@ mod tests {
     fn add_form_valid_submit_appends_and_closes() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddRequestForm::default()),
+            add_form: Some(AddTunnelForm::default()),
             ..Default::default()
         };
         type_str(&mut ui, &st, "ssh");
@@ -747,7 +784,7 @@ mod tests {
         assert_eq!(st.tunnel_count(), 1);
         assert_eq!(ui.selected, 0);
         let id = st.tunnel_id_at(0).unwrap();
-        let req = st.get_request(id).unwrap();
+        let req = st.get_tunnel(id).unwrap();
         assert_eq!(req.name, "ssh");
         assert_eq!(req.remote_source, "tcp://127.0.0.1:22");
         assert_eq!(req.local_listen, "127.0.0.1:2222");
@@ -757,7 +794,7 @@ mod tests {
     fn add_form_protocol_selection_sets_udp_scheme() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddRequestForm::default()),
+            add_form: Some(AddTunnelForm::default()),
             ..Default::default()
         };
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // Name -> Protocol
@@ -771,15 +808,60 @@ mod tests {
 
         assert!(ui.add_form.is_none());
         let id = st.tunnel_id_at(0).unwrap();
-        let req = st.get_request(id).unwrap();
+        let req = st.get_tunnel(id).unwrap();
         assert_eq!(req.remote_source, "udp://127.0.0.1:53");
+    }
+
+    #[test]
+    fn add_form_up_down_navigate_fields() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::default()),
+            ..Default::default()
+        };
+        let field = |ui: &UiState| ui.add_form.as_ref().unwrap().field;
+        assert_eq!(field(&ui), AddField::Name);
+
+        // Down walks forward through the vertical form...
+        handle_add_form(key(KeyCode::Down), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::Protocol);
+        handle_add_form(key(KeyCode::Down), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::RemoteSource);
+
+        // ...and Up walks back, even off the Protocol field (which no longer eats it).
+        handle_add_form(key(KeyCode::Up), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::Protocol);
+        handle_add_form(key(KeyCode::Up), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::Name);
+
+        // Up from the top wraps to the bottom.
+        handle_add_form(key(KeyCode::Up), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::LocalListen);
+    }
+
+    #[test]
+    fn add_form_left_right_toggle_protocol_only_on_protocol_field() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::default()),
+            ..Default::default()
+        };
+        let proto = |ui: &UiState| ui.add_form.as_ref().unwrap().protocol;
+        let default_proto = proto(&ui);
+        // On the Name field, Left/Right are text-cursor moves, not a protocol toggle.
+        handle_add_form(key(KeyCode::Right), &mut ui, &st);
+        assert_eq!(proto(&ui), default_proto);
+        // On the Protocol field, Left/Right toggle it.
+        handle_add_form(key(KeyCode::Down), &mut ui, &st); // -> Protocol
+        handle_add_form(key(KeyCode::Right), &mut ui, &st);
+        assert_ne!(proto(&ui), default_proto);
     }
 
     #[test]
     fn add_form_invalid_source_keeps_form_open_with_error() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddRequestForm::default()),
+            add_form: Some(AddTunnelForm::default()),
             ..Default::default()
         };
         // Skip name; bad remote_source (host without a port); any local_listen.
@@ -795,8 +877,8 @@ mod tests {
         assert_eq!(st.tunnel_count(), 0, "no request added on invalid input");
     }
 
-    fn req(name: &str, src: &str, listen: &str) -> RequestEntry {
-        RequestEntry {
+    fn req(name: &str, src: &str, listen: &str) -> TunnelEntry {
+        TunnelEntry {
             name: name.into(),
             remote_source: src.into(),
             local_listen: listen.into(),
@@ -806,8 +888,8 @@ mod tests {
     #[test]
     fn delete_key_removes_selected_tunnel_and_clamps_cursor() {
         let st = state();
-        st.add_request(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        st.add_request(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        st.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        st.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
         let mut ui = UiState {
             selected: 1,
             ..Default::default()
@@ -818,7 +900,7 @@ mod tests {
         assert!(!handle_key(key(KeyCode::Char('d')), &mut ui, &st));
         assert_eq!(st.tunnel_count(), 1);
         assert_eq!(ui.selected, 0);
-        assert_eq!(st.tunnel_id_at(0).and_then(|id| st.get_request(id)).unwrap().name, "a");
+        assert_eq!(st.tunnel_id_at(0).and_then(|id| st.get_tunnel(id)).unwrap().name, "a");
 
         // `Delete` removes the last remaining tunnel; cursor clamps to 0.
         assert!(!handle_key(key(KeyCode::Delete), &mut ui, &st));
@@ -827,6 +909,90 @@ mod tests {
         // Pressing delete on an empty list is a harmless no-op.
         assert!(!handle_key(key(KeyCode::Char('d')), &mut ui, &st));
         assert_eq!(st.tunnel_count(), 0);
+    }
+
+    #[test]
+    fn e_key_opens_edit_form_prefilled_for_idle_tunnel() {
+        let st = state();
+        let id = st.add_tunnel(req("db", "udp://127.0.0.1:53", "127.0.0.1:5353"));
+        let mut ui = UiState {
+            selected: 0,
+            ..Default::default()
+        };
+
+        assert!(!handle_key(key(KeyCode::Char('e')), &mut ui, &st));
+        let form = ui.add_form.as_ref().expect("edit form opened");
+        assert_eq!(form.editing, Some(id));
+        assert_eq!(form.name.value(), "db");
+        // The scheme is split off into the protocol selector; the field holds host:port.
+        assert_eq!(form.protocol, ui::Protocol::Udp);
+        assert_eq!(form.remote_source.value(), "127.0.0.1:53");
+        assert_eq!(form.local_listen.value(), "127.0.0.1:5353");
+    }
+
+    #[test]
+    fn edit_form_submit_updates_in_place_without_changing_count() {
+        let st = state();
+        let id = st.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        st.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        // Simulate the user having edited the form to new values.
+        let edited = req("a2", "udp://127.0.0.1:9", "127.0.0.1:99");
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::edit(id, &edited)),
+            selected: 0,
+            ..Default::default()
+        };
+
+        submit_tunnel_form(&mut ui, &st);
+
+        assert!(ui.add_form.is_none(), "form closes on successful edit");
+        assert_eq!(st.tunnel_count(), 2, "edit replaces in place, never appends");
+        let got = st.get_tunnel(id).expect("tunnel still present");
+        assert_eq!(got.name, "a2");
+        assert_eq!(got.remote_source, "udp://127.0.0.1:9");
+        assert_eq!(got.local_listen, "127.0.0.1:99");
+        // The edited tunnel keeps its position.
+        assert_eq!(st.tunnel_id_at(0), Some(id));
+    }
+
+    #[test]
+    fn edit_to_another_tunnels_name_is_rejected() {
+        let st = state();
+        let a = st.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        st.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+        // Try to rename "a" to "b" (already taken by the other tunnel).
+        let collide = req("b", "tcp://127.0.0.1:1", "127.0.0.1:11");
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::edit(a, &collide)),
+            ..Default::default()
+        };
+
+        submit_tunnel_form(&mut ui, &st);
+
+        let form = ui.add_form.as_ref().expect("form stays open on collision");
+        assert!(form.error.as_deref().unwrap().contains("already in use"));
+        assert_eq!(st.get_tunnel(a).unwrap().name, "a", "name unchanged");
+    }
+
+    #[test]
+    fn add_form_duplicate_name_is_rejected() {
+        let st = state();
+        st.add_tunnel(req("db", "tcp://127.0.0.1:1", "127.0.0.1:11"));
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::default()),
+            ..Default::default()
+        };
+        type_str(&mut ui, &st, "db"); // collides with the existing tunnel
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> Protocol
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> RemoteSource
+        type_str(&mut ui, &st, "127.0.0.1:2");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
+        type_str(&mut ui, &st, "127.0.0.1:12");
+        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit -> error
+
+        let form = ui.add_form.as_ref().expect("form stays open on duplicate name");
+        assert!(form.error.as_deref().unwrap().contains("already in use"));
+        assert_eq!(st.tunnel_count(), 1, "no tunnel added on duplicate name");
     }
 
     #[test]
@@ -994,7 +1160,7 @@ mod tests {
 
         assert!(text.contains("mode:      nostr"));
         assert!(text.contains("name:      web1"));
-        assert!(text.contains("dial:      not connected"));
+        assert!(text.contains("outbound:  not connected"));
         assert!(!text.contains("role:"));
         assert!(!text.contains("status:"));
         assert!(!text.contains("path:"));
@@ -1004,7 +1170,7 @@ mod tests {
     fn add_form_field_supports_cursor_editing() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddRequestForm::default()),
+            add_form: Some(AddTunnelForm::default()),
             ..Default::default()
         };
         type_str(&mut ui, &st, "ace");
@@ -1022,7 +1188,7 @@ mod tests {
     fn add_form_esc_cancels() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddRequestForm::default()),
+            add_form: Some(AddTunnelForm::default()),
             ..Default::default()
         };
         type_str(&mut ui, &st, "x");

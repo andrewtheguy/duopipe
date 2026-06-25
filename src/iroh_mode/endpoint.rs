@@ -474,8 +474,9 @@ impl Drop for PathWatcherGuard {
 
 /// Log the current connection paths and spawn a background task that
 /// logs updates whenever the active path changes (e.g., relay -> direct).
-/// Each update is also written into [`AppState`] for the TUI: the dial role
-/// updates the single connection path, the listen role updates the matching peer.
+/// Each update is also written into [`AppState`] for the TUI: an outbound (dial)
+/// connection updates the single connection path, an inbound (served) connection
+/// updates the matching peer.
 ///
 /// The returned [`PathWatcherGuard`] aborts the background task when dropped.
 /// Callers must keep the guard alive for the duration of the connection.
@@ -494,9 +495,9 @@ pub fn watch_connection_paths(
         let mut last_key = None;
         while let Some(paths) = stream.next().await {
             let info = classify_paths(&paths);
-            // A dialer drives one outbound connection (the single `path`); a listener
-            // updates the matching inbound peer. Keyed off this connection's role, not
-            // the process role, so it stays correct in a dual-role process.
+            // A dialer drives one outbound connection (the single `path`); the serve
+            // half updates the matching inbound peer. Keyed off this connection's
+            // direction, not the process, so it stays correct in the combined process.
             if is_dialer {
                 state.set_path(info);
             } else {

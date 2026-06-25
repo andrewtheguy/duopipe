@@ -3,12 +3,13 @@
 //! A single symmetric peer config with all keys at the top level.
 //!
 //! Interactive runs always serve inbound peers, and the outbound dial target is
-//! chosen later from the dashboard, not in the config. Over one established dial
-//! connection, this peer's `[[request]]` entries name remote sources on the
-//! connected peer and local listener addresses where traffic is delivered.
-//! Requests are activated interactively (nothing starts automatically). When a
-//! connected peer requests one of *our* sources, the `[allowed_sources]` CIDR
-//! lists gate what we are willing to expose. Empty or absent protocol lists
+//! chosen later from the dashboard, not in the config. The `[[tunnel]]` entries
+//! are a seed list of tunnels this node can open over its outbound dial session:
+//! each names a remote source on the connected peer and a local listener address
+//! where traffic is delivered. Seeds are activated interactively (nothing starts
+//! automatically). When a connected peer asks for one of *our* sources, the
+//! `[allowed_sources]` CIDR lists gate what we are willing to expose. Empty or
+//! absent protocol lists
 //! default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). `validate()`
 //! checks address and CIDR formats at parse time. The single `auth_token` is the
 //! shared secret used by both sides.
@@ -25,11 +26,12 @@ use std::path::{Path, PathBuf};
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
-    /// Tunnel requests this peer can make of the other party. Each entry asks the
-    /// peer to connect out to a remote `source`; traffic is delivered to a local
-    /// `listen` address. Activated interactively — nothing starts automatically.
+    /// Seed list of tunnels this node can open over its outbound dial session.
+    /// Each entry asks the connected peer to connect out to a remote `source`;
+    /// traffic is delivered to a local `listen` address. Activated interactively —
+    /// nothing starts automatically. Names must be unique.
     #[serde(default)]
-    pub request: Vec<RequestEntry>,
+    pub tunnel: Vec<TunnelEntry>,
     /// Source networks (CIDR) this peer is willing to expose when the other party
     /// requests one of *our* sources. Runtime defaulting fills empty protocol
     /// lists with dual-stack localhost.
@@ -59,11 +61,11 @@ pub struct PeerConfig {
     pub transport: TransportTuning,
 }
 
-/// A tunnel request: ask the peer to connect out to `remote_source` and deliver
+/// A seed tunnel: ask the peer to connect out to `remote_source` and deliver
 /// the traffic to a local listener bound at `local_listen`.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct RequestEntry {
+pub struct TunnelEntry {
     /// Display label shown in the TUI tunnel list.
     pub name: String,
     /// Remote origin on the peer to connect to (tcp://host:port or udp://host:port).
@@ -254,12 +256,22 @@ fn validate_host_port(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate tunnel-request address formats (`remote_source` URL + `local_listen`
-/// host:port).
-pub fn validate_request_specs(requests: &[RequestEntry]) -> Result<()> {
-    for r in requests {
-        validate_tcp_udp_url(&r.remote_source, "request.remote_source")?;
-        validate_host_port(&r.local_listen, "request.local_listen")?;
+/// Validate seed-tunnel address formats (`remote_source` URL + `local_listen`
+/// host:port) and that tunnel names are unique.
+pub fn validate_tunnel_specs(tunnels: &[TunnelEntry]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for t in tunnels {
+        validate_tcp_udp_url(&t.remote_source, "tunnel.remote_source")?;
+        validate_host_port(&t.local_listen, "tunnel.local_listen")?;
+        // The name is the display label and uniqueness key, so a blank/whitespace-only
+        // name (only reachable from a config file; the TUI form substitutes one) is
+        // rejected before the duplicate check.
+        if t.name.trim().is_empty() {
+            anyhow::bail!("tunnel name must not be empty");
+        }
+        if !seen.insert(t.name.as_str()) {
+            anyhow::bail!("duplicate tunnel name {:?}", t.name);
+        }
     }
     Ok(())
 }
@@ -350,7 +362,7 @@ impl PeerConfig {
     /// headless test role is resolved from env vars, so neither is part of the
     /// config or checked here.
     pub fn validate(&self) -> Result<()> {
-        validate_request_specs(&self.request)?;
+        validate_tunnel_specs(&self.tunnel)?;
         validate_allowed_sources(&self.allowed_sources)?;
         validate_transport_tuning(&self.transport, "transport")?;
 
@@ -490,7 +502,7 @@ mod tests {
         let toml = r#"
 max_streams = 100
 
-[[request]]
+[[tunnel]]
 name = "db"
 remote_source = "tcp://127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
@@ -505,8 +517,8 @@ receive_window = 67108864
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
         assert_eq!(cfg.max_streams, Some(100));
-        assert_eq!(cfg.request.len(), 1);
-        assert_eq!(cfg.request[0].name, "db");
+        assert_eq!(cfg.tunnel.len(), 1);
+        assert_eq!(cfg.tunnel[0].name, "db");
         assert_eq!(cfg.allowed_sources.tcp.len(), 2);
         assert_eq!(cfg.allowed_sources.udp.len(), 1);
         assert_eq!(
@@ -555,9 +567,9 @@ tcp = ["not-a-cidr"]
     }
 
     #[test]
-    fn validates_request_address_formats() {
+    fn validates_tunnel_address_formats() {
         let cfg = peer_config(PeerConfig {
-            request: vec![RequestEntry {
+            tunnel: vec![TunnelEntry {
                 name: "ok".into(),
                 remote_source: "tcp://127.0.0.1:5678".into(),
                 local_listen: "127.0.0.1:15678".into(),
@@ -567,7 +579,7 @@ tcp = ["not-a-cidr"]
         assert!(cfg.validate().is_ok());
 
         let bad_listen = peer_config(PeerConfig {
-            request: vec![RequestEntry {
+            tunnel: vec![TunnelEntry {
                 name: "bad-listen".into(),
                 remote_source: "tcp://127.0.0.1:5678".into(),
                 local_listen: "127.0.0.1".into(), // missing port
@@ -577,7 +589,7 @@ tcp = ["not-a-cidr"]
         assert!(bad_listen.validate().is_err());
 
         let bad_source = peer_config(PeerConfig {
-            request: vec![RequestEntry {
+            tunnel: vec![TunnelEntry {
                 name: "bad-source".into(),
                 remote_source: "127.0.0.1:5678".into(), // missing scheme
                 local_listen: "127.0.0.1:15678".into(),
@@ -585,6 +597,44 @@ tcp = ["not-a-cidr"]
             ..Default::default()
         });
         assert!(bad_source.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_tunnel_names() {
+        let dup = |name: &str| TunnelEntry {
+            name: name.into(),
+            remote_source: "tcp://127.0.0.1:5678".into(),
+            local_listen: "127.0.0.1:15678".into(),
+        };
+        let cfg = peer_config(PeerConfig {
+            tunnel: vec![dup("db"), dup("db")],
+            ..Default::default()
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate tunnel name"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_blank_tunnel_name() {
+        let blank = |name: &str| TunnelEntry {
+            name: name.into(),
+            remote_source: "tcp://127.0.0.1:5678".into(),
+            local_listen: "127.0.0.1:15678".into(),
+        };
+        for name in ["", "   "] {
+            let cfg = peer_config(PeerConfig {
+                tunnel: vec![blank(name)],
+                ..Default::default()
+            });
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("tunnel name must not be empty"),
+                "error was: {err}"
+            );
+        }
     }
 
     #[test]
