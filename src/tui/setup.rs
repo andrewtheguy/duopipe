@@ -469,6 +469,14 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 // Nostr: the token is a pre-shared secret — entry only, no generate. One
                 // field, always active, so it needs no choice marker.
                 lines.push(Line::from("Enter the shared auth token:"));
+                // The config declares the token's fingerprint; show it so the user knows
+                // what their pasted token must match before they even submit.
+                if let Some(expected) = &state.expected_token_fingerprint {
+                    lines.push(Line::from(Span::styled(
+                        format!("  expected fingerprint: {expected} — your token must match this"),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
                 lines.push(field_input_line(&state.auth_token_input, input_active));
             } else {
                 // Quick: two stacked choices, each marked with `▶` when it has focus —
@@ -490,13 +498,24 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
 
             let typed = state.auth_token_input.value().trim();
             if !typed.is_empty() && auth::validate_token(typed).is_ok() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "      fingerprint: {} — confirm this matches your other device",
-                        auth::token_fingerprint(typed)
+                let fp = auth::token_fingerprint(typed);
+                // When the config pins a fingerprint, show match/mismatch directly against
+                // it; otherwise just surface the fingerprint to cross-check by hand.
+                let line = match &state.expected_token_fingerprint {
+                    Some(expected) if auth::fingerprint_matches(typed, expected) => Span::styled(
+                        format!("      fingerprint: {fp} ✓ matches the config"),
+                        Style::default().fg(Color::Green),
                     ),
-                    Style::default().fg(Color::Green),
-                )));
+                    Some(expected) => Span::styled(
+                        format!("      fingerprint: {fp} ✗ does not match the config ({expected})"),
+                        Style::default().fg(Color::Red),
+                    ),
+                    None => Span::styled(
+                        format!("      fingerprint: {fp} — confirm this matches your other device"),
+                        Style::default().fg(Color::Green),
+                    ),
+                };
+                lines.push(Line::from(line));
             }
             lines.push(Line::raw(""));
             let hint = if state.nostr_discovery {
@@ -711,6 +730,52 @@ mod tests {
             Step::Done(r) => assert_eq!(r.auth_token, token),
             _ => panic!("expected Done with the matching token"),
         }
+    }
+
+    /// Render the setup screen to plain text for assertions.
+    fn render_text(state: &SetupState) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("test terminal");
+        terminal.draw(|f| render(f, state)).expect("render");
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn nostr_token_screen_shows_expected_fingerprint_and_match_state() {
+        let token = auth::generate_token();
+        let expected = auth::token_fingerprint(&token);
+        let mut s = SetupState::new(
+            None,
+            Some(expected.clone()),
+            from_config(),
+            true,
+            Some("hl".into()),
+        );
+        handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
+
+        // Before typing: the expected fingerprint is shown up front.
+        let empty = render_text(&s);
+        assert!(empty.contains("expected fingerprint:"));
+        assert!(empty.contains(&expected));
+
+        // A matching token reports ✓; a different one reports ✗.
+        type_str(&mut s, &token);
+        assert!(render_text(&s).contains('✓'));
+
+        let other = auth::generate_token();
+        let mut mismatch = SetupState::new(None, Some(expected), from_config(), true, Some("hl".into()));
+        handle_key(key(KeyCode::Enter), &mut mismatch);
+        type_str(&mut mismatch, &other);
+        assert!(render_text(&mismatch).contains('✗'));
     }
 
     #[test]
