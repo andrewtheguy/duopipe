@@ -58,7 +58,7 @@ pub struct UiState {
 }
 
 /// Which field the "add request" modal is currently editing.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AddField {
     #[default]
     Name,
@@ -490,9 +490,9 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         if editing {
-            "Tab/Enter next field · ←/→ switch protocol · Enter on local_listen saves · Esc cancel"
+            "↑/↓ move field · ←/→ switch protocol · Enter on local_listen saves · Esc cancel"
         } else {
-            "Tab/Enter next field · ←/→ switch protocol · Enter on local_listen adds & starts · Esc cancel"
+            "↑/↓ move field · ←/→ switch protocol · Enter on local_listen adds & starts · Esc cancel"
         },
         Style::default().fg(Color::DarkGray),
     )));

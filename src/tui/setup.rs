@@ -198,8 +198,9 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
         SetupPhase::Start => match key.code {
             KeyCode::Esc => Step::Quit,
             KeyCode::Enter => submit_start(state),
-            KeyCode::Tab => {
-                // Toggle between the two CIDR fields, but only when they exist.
+            // Vertical form: Up/Down (or Tab/BackTab) move between the two CIDR
+            // fields, but only when they exist.
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
                 if allowlist_fields_shown(state) {
                     state.section = match state.section {
                         StartSection::AllowedTcp => StartSection::AllowedUdp,
@@ -322,7 +323,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     let footer = match state.phase {
         SetupPhase::Start => {
             if allowlist_fields_shown(state) {
-                "Tab next field · Enter start · Esc / Ctrl-C quit"
+                "↑/↓ move field · Enter start · Esc / Ctrl-C quit"
             } else {
                 "Enter start · Esc / Ctrl-C quit"
             }

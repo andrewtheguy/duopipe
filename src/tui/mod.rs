@@ -460,9 +460,10 @@ fn is_field_char(c: char, field: AddField) -> bool {
     c.is_ascii_graphic() || (c == ' ' && field == AddField::Name)
 }
 
-/// Handle a key while the add/edit-tunnel modal is open. Tab/Enter advance the
-/// field; Enter on the last field validates and (on success) adds + auto-starts a
-/// new tunnel, or saves an edit in place. Esc cancels.
+/// Handle a key while the add/edit-tunnel modal is open. Up/Down (or Tab/BackTab)
+/// move between fields; Enter advances, and Enter on the last field validates and
+/// (on success) adds + auto-starts a new tunnel, or saves an edit in place. Esc
+/// cancels.
 fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
@@ -472,17 +473,19 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         KeyCode::Esc => {
             ui.add_form = None;
         }
-        KeyCode::Tab => {
+        // Vertical form: Up/Down (and Tab/BackTab) move between fields.
+        KeyCode::Down | KeyCode::Tab => {
             form.field = next_field(form.field);
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            form.field = prev_field(form.field);
         }
         KeyCode::Enter => match form.field {
             AddField::LocalListen => submit_tunnel_form(ui, state),
             other => form.field = next_field(other),
         },
-        // The protocol selector is a toggle, not a text field.
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-            if form.field == AddField::Protocol =>
-        {
+        // The protocol selector is a left/right toggle (Up/Down navigate fields).
+        KeyCode::Left | KeyCode::Right if form.field == AddField::Protocol => {
             form.protocol = form.protocol.toggled();
         }
         _ => {
@@ -495,13 +498,23 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     }
 }
 
-/// The field reached by Tab / Enter from `field`, cycling back to the top.
+/// The field reached by Down / Tab / Enter from `field`, cycling back to the top.
 fn next_field(field: AddField) -> AddField {
     match field {
         AddField::Name => AddField::Protocol,
         AddField::Protocol => AddField::RemoteSource,
         AddField::RemoteSource => AddField::LocalListen,
         AddField::LocalListen => AddField::Name,
+    }
+}
+
+/// The field reached by Up / BackTab from `field`, cycling back to the bottom.
+fn prev_field(field: AddField) -> AddField {
+    match field {
+        AddField::Name => AddField::LocalListen,
+        AddField::Protocol => AddField::Name,
+        AddField::RemoteSource => AddField::Protocol,
+        AddField::LocalListen => AddField::RemoteSource,
     }
 }
 
@@ -797,6 +810,51 @@ mod tests {
         let id = st.tunnel_id_at(0).unwrap();
         let req = st.get_tunnel(id).unwrap();
         assert_eq!(req.remote_source, "udp://127.0.0.1:53");
+    }
+
+    #[test]
+    fn add_form_up_down_navigate_fields() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::default()),
+            ..Default::default()
+        };
+        let field = |ui: &UiState| ui.add_form.as_ref().unwrap().field;
+        assert_eq!(field(&ui), AddField::Name);
+
+        // Down walks forward through the vertical form...
+        handle_add_form(key(KeyCode::Down), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::Protocol);
+        handle_add_form(key(KeyCode::Down), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::RemoteSource);
+
+        // ...and Up walks back, even off the Protocol field (which no longer eats it).
+        handle_add_form(key(KeyCode::Up), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::Protocol);
+        handle_add_form(key(KeyCode::Up), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::Name);
+
+        // Up from the top wraps to the bottom.
+        handle_add_form(key(KeyCode::Up), &mut ui, &st);
+        assert_eq!(field(&ui), AddField::LocalListen);
+    }
+
+    #[test]
+    fn add_form_left_right_toggle_protocol_only_on_protocol_field() {
+        let st = state();
+        let mut ui = UiState {
+            add_form: Some(AddTunnelForm::default()),
+            ..Default::default()
+        };
+        let proto = |ui: &UiState| ui.add_form.as_ref().unwrap().protocol;
+        let default_proto = proto(&ui);
+        // On the Name field, Left/Right are text-cursor moves, not a protocol toggle.
+        handle_add_form(key(KeyCode::Right), &mut ui, &st);
+        assert_eq!(proto(&ui), default_proto);
+        // On the Protocol field, Left/Right toggle it.
+        handle_add_form(key(KeyCode::Down), &mut ui, &st); // -> Protocol
+        handle_add_form(key(KeyCode::Right), &mut ui, &st);
+        assert_ne!(proto(&ui), default_proto);
     }
 
     #[test]
