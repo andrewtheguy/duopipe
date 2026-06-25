@@ -74,6 +74,16 @@ pub fn generate_token() -> String {
     format!("{}{}", TOKEN_PREFIX, URL_SAFE_NO_PAD.encode(payload))
 }
 
+/// Short, stable fingerprint of a token for cross-device verification.
+///
+/// The token itself is shown only briefly (and never on the dialing side), so two
+/// devices cannot easily confirm they share the same token. This 4-hex-digit
+/// CRC16-CCITT-FALSE over the token string is displayed persistently in the UI: if it
+/// matches on both devices the tokens match, without ever re-revealing the secret.
+pub fn token_fingerprint(token: &str) -> String {
+    format!("{:04X}", crc16_ccitt_false(token.as_bytes()))
+}
+
 /// Validate token format.
 ///
 /// Returns Ok(()) if valid, Err with description if invalid.
@@ -201,6 +211,25 @@ mod tests {
     fn test_crc16_ccitt_false_known_vector() {
         // Standard check value for CRC16-CCITT-FALSE with "123456789".
         assert_eq!(crc16_ccitt_false(b"123456789"), 0x29B1);
+    }
+
+    #[test]
+    fn test_token_fingerprint_stable_and_4_hex() {
+        let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
+        let fp = token_fingerprint(&token);
+        assert_eq!(fp.len(), 4);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic: same token always yields the same fingerprint.
+        assert_eq!(fp, token_fingerprint(&token));
+        // It is the CRC16 over the token string bytes.
+        assert_eq!(fp, format!("{:04X}", crc16_ccitt_false(token.as_bytes())));
+    }
+
+    #[test]
+    fn test_token_fingerprint_differs_for_different_tokens() {
+        let a = make_test_token([0x01; RANDOM_BYTES_LEN]);
+        let b = make_test_token([0x02; RANDOM_BYTES_LEN]);
+        assert_ne!(token_fingerprint(&a), token_fingerprint(&b));
     }
 
     #[test]

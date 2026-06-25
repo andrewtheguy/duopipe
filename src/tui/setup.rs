@@ -30,9 +30,21 @@ enum SetupPhase {
     /// Start screen: a summary plus — when config supplies no `[allowed_sources]` — the
     /// TCP/UDP CIDR allowlists gating what inbound peers may request. Enter proceeds.
     Start,
-    /// When no token came from config/env: confirm a fresh one will be generated for
-    /// this run before generating it.
-    ConfirmGenerateToken,
+    /// When no token came from config/env: choose whether to generate a fresh token or
+    /// enter an existing one. Symmetric across quick and nostr modes.
+    ChooseTokenSource,
+    /// "Enter existing" path: type or paste a token, validated before it is accepted.
+    EnterToken,
+}
+
+/// Which option is focused on the [`SetupPhase::ChooseTokenSource`] screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChooseFocus {
+    /// Generate a fresh token for this run (shown in the dashboard so it can be copied
+    /// to the other device).
+    Generate,
+    /// Enter/paste a token shared from another device.
+    Enter,
 }
 
 /// Which element of the [`SetupPhase::Start`] screen has focus. The two CIDR fields
@@ -108,6 +120,10 @@ pub struct SetupState {
     nostr_discovery: bool,
     /// This machine's own nostr name (config `name`) — display only, for the summary.
     own_name: Option<String>,
+    /// Focused option on the [`SetupPhase::ChooseTokenSource`] screen.
+    choose_focus: ChooseFocus,
+    /// Token typed/pasted on the [`SetupPhase::EnterToken`] screen.
+    auth_token_input: Input,
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
     token_generated: bool,
@@ -134,6 +150,8 @@ impl SetupState {
             allowed_sources: AllowedSources::default(),
             nostr_discovery,
             own_name,
+            choose_focus: ChooseFocus::Generate,
+            auth_token_input: Input::default(),
             auth_token: None,
             token_generated: false,
             error: None,
@@ -141,15 +159,26 @@ impl SetupState {
     }
 }
 
-/// Resolve the credential (config/env token or a freshly generated one) and finish.
-fn finalize(state: &mut SetupState) -> Step {
-    let (auth_token, token_generated) = match state.config_auth_token.clone() {
-        Some(token) => (token, false),
-        None => (auth::generate_token(), true),
-    };
+/// Record the resolved credential and finish. `generated` is `true` only for a
+/// freshly generated token (the dashboard then surfaces it for copying); a
+/// config/env or pasted token is `false`.
+fn finalize(state: &mut SetupState, auth_token: String, generated: bool) -> Step {
     state.auth_token = Some(auth_token);
-    state.token_generated = token_generated;
+    state.token_generated = generated;
     Step::Done(build_resolved(state))
+}
+
+/// Validate the typed/pasted token and finish on success; on failure keep the
+/// `EnterToken` screen open with an inline error.
+fn submit_token(state: &mut SetupState) -> Step {
+    let token = state.auth_token_input.value().trim().to_string();
+    match auth::validate_token(&token) {
+        Ok(()) => finalize(state, token, false),
+        Err(e) => {
+            state.error = Some(format!("Invalid token: {e}"));
+            Step::Continue
+        }
+    }
 }
 
 /// Build the final `ResolvedPeer`. Interactive runs are always `Role::Both` (serve
@@ -197,12 +226,12 @@ fn submit_start(state: &mut SetupState) -> Step {
     };
     state.allowed_sources = allowed;
 
-    if state.config_auth_token.is_some() {
-        // A config/env token is used as-is, no confirmation.
-        finalize(state)
+    if let Some(token) = state.config_auth_token.clone() {
+        // A config/env token is used as-is, no further prompt.
+        finalize(state, token, false)
     } else {
-        // No token: confirm before generating a fresh one.
-        state.phase = SetupPhase::ConfirmGenerateToken;
+        // No token: offer generate-or-enter (symmetric across quick and nostr modes).
+        state.phase = SetupPhase::ChooseTokenSource;
         Step::Continue
     }
 }
@@ -270,13 +299,38 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                 Step::Continue
             }
         },
-        SetupPhase::ConfirmGenerateToken => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => finalize(state),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        SetupPhase::ChooseTokenSource => match key.code {
+            KeyCode::Esc => {
                 state.phase = SetupPhase::Start;
                 Step::Continue
             }
+            // Left/Right (or Tab) toggle between the two options.
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                state.choose_focus = match state.choose_focus {
+                    ChooseFocus::Generate => ChooseFocus::Enter,
+                    ChooseFocus::Enter => ChooseFocus::Generate,
+                };
+                Step::Continue
+            }
+            KeyCode::Enter => match state.choose_focus {
+                ChooseFocus::Generate => finalize(state, auth::generate_token(), true),
+                ChooseFocus::Enter => {
+                    state.phase = SetupPhase::EnterToken;
+                    Step::Continue
+                }
+            },
             _ => Step::Continue,
+        },
+        SetupPhase::EnterToken => match key.code {
+            KeyCode::Esc => {
+                state.phase = SetupPhase::ChooseTokenSource;
+                Step::Continue
+            }
+            KeyCode::Enter => submit_token(state),
+            _ => {
+                handle_edit(&mut state.auth_token_input, key, is_token_char);
+                Step::Continue
+            }
         },
     }
 }
@@ -284,6 +338,11 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
 /// CIDR entry accepts printable ASCII plus spaces/commas as separators between entries.
 fn is_cidr_char(c: char) -> bool {
     c.is_ascii_graphic() || c == ' '
+}
+
+/// Token entry accepts printable ASCII with no spaces (tokens are `d` + base64url).
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_graphic()
 }
 
 /// Center a fixed-size area within `area`.
@@ -322,6 +381,15 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 "  Dial a peer on demand from the dashboard (press Shift-C).",
                 Style::default().fg(Color::DarkGray),
             )));
+            if let Some(token) = &state.config_auth_token {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  Auth token loaded (fingerprint: {}).",
+                        auth::token_fingerprint(token)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
             // Primary actions, kept above the optional allowlist fields so Start isn't
             // buried below advanced settings the user can safely skip.
             lines.push(Line::raw(""));
@@ -360,13 +428,41 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 )));
             }
         }
-        SetupPhase::ConfirmGenerateToken => {
-            lines.push(Line::from("No auth token configured."));
+        SetupPhase::ChooseTokenSource => {
+            lines.push(Line::from("No auth token supplied. Choose how to set one up:"));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                button_span("Generate new", state.choose_focus == ChooseFocus::Generate),
+                Span::raw("  "),
+                button_span("Enter existing", state.choose_focus == ChooseFocus::Enter),
+            ]));
+            lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "  A fresh token will be generated for this session (changes every run).",
+                "  Generate new — the first device makes a token, shown so you can copy it.",
                 Style::default().fg(Color::DarkGray),
             )));
-            lines.push(Line::from("Proceed? (Y/n)"));
+            lines.push(Line::from(Span::styled(
+                "  Enter existing — the second device pastes the token shown on the first.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        SetupPhase::EnterToken => {
+            lines.push(Line::from("Enter the shared auth token from your other device:"));
+            lines.push(field_input_line(&state.auth_token_input, true));
+            let typed = state.auth_token_input.value().trim();
+            if !typed.is_empty() && auth::validate_token(typed).is_ok() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  fingerprint: {} — confirm this matches your other device",
+                        auth::token_fingerprint(typed)
+                    ),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "  Both devices must use the same token. Generate one with: duopipe generate-auth-token",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
 
@@ -381,7 +477,8 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
     lines.push(Line::raw(""));
     let footer = match state.phase {
         SetupPhase::Start => "↑/↓ ←/→ move · Enter select · Esc / Ctrl-C quit",
-        SetupPhase::ConfirmGenerateToken => "Esc back · Ctrl-C quit",
+        SetupPhase::ChooseTokenSource => "←/→ move · Enter select · Esc back · Ctrl-C quit",
+        SetupPhase::EnterToken => "Enter confirm · Esc back · Ctrl-C quit",
     };
     lines.push(Line::from(Span::styled(
         footer,
@@ -462,12 +559,13 @@ mod tests {
     }
 
     #[test]
-    fn start_without_token_confirms_then_generates() {
+    fn start_without_token_offers_choice_then_generates() {
+        // Quick mode: no config token -> the choice screen, focused on Generate.
         let mut s = SetupState::new(None, from_config(), false, None);
-        // Without a config token, the start screen first asks for confirmation.
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
-        match handle_key(key(KeyCode::Char('y')), &mut s) {
+        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
+        assert_eq!(s.choose_focus, ChooseFocus::Generate);
+        match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
                 assert!(r.token_generated);
@@ -478,15 +576,58 @@ mod tests {
     }
 
     #[test]
-    fn confirm_decline_returns_to_start() {
-        let mut s = SetupState::new(None, from_config(), false, None);
+    fn nostr_without_token_can_enter_existing() {
+        // Nostr mode also reaches the same choice screen (no hard token requirement).
+        let token = auth::generate_token();
+        let mut s = SetupState::new(None, from_config(), true, Some("hl".into()));
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert_eq!(s.phase, SetupPhase::ConfirmGenerateToken);
-        assert!(matches!(
-            handle_key(key(KeyCode::Char('n')), &mut s),
-            Step::Continue
-        ));
+        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
+        // Move to "Enter existing" and open the entry screen.
+        handle_key(key(KeyCode::Right), &mut s);
+        assert_eq!(s.choose_focus, ChooseFocus::Enter);
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::EnterToken);
+        // Paste a valid token (whitespace around it is trimmed).
+        type_str(&mut s, &token);
+        match handle_key(key(KeyCode::Enter), &mut s) {
+            Step::Done(r) => {
+                assert_eq!(r.role, Role::Both);
+                assert!(!r.token_generated, "an entered token is not 'generated'");
+                assert_eq!(r.auth_token, token);
+            }
+            _ => panic!("expected Done(Both) with the entered token"),
+        }
+    }
+
+    #[test]
+    fn enter_token_rejects_invalid_and_stays_open() {
+        let mut s = SetupState::new(None, from_config(), false, None);
+        handle_key(key(KeyCode::Enter), &mut s); // -> ChooseTokenSource
+        handle_key(key(KeyCode::Right), &mut s); // focus Enter
+        handle_key(key(KeyCode::Enter), &mut s); // -> EnterToken
+        type_str(&mut s, "not-a-real-token");
+        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
+        assert_eq!(s.phase, SetupPhase::EnterToken);
+        assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn choose_token_source_esc_returns_to_start() {
+        let mut s = SetupState::new(None, from_config(), false, None);
+        handle_key(key(KeyCode::Enter), &mut s);
+        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
+        handle_key(key(KeyCode::Esc), &mut s);
         assert_eq!(s.phase, SetupPhase::Start);
+    }
+
+    #[test]
+    fn enter_token_esc_returns_to_choice() {
+        let mut s = SetupState::new(None, from_config(), false, None);
+        handle_key(key(KeyCode::Enter), &mut s); // -> ChooseTokenSource
+        handle_key(key(KeyCode::Right), &mut s);
+        handle_key(key(KeyCode::Enter), &mut s); // -> EnterToken
+        handle_key(key(KeyCode::Esc), &mut s);
+        assert_eq!(s.phase, SetupPhase::ChooseTokenSource);
     }
 
     #[test]

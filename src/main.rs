@@ -49,26 +49,27 @@ enum Command {
     /// one on-demand outbound dial session.
     ///
     /// Everything is ephemeral and nostr is off: the node id changes every run and
-    /// a dialer enters the peer's node id manually. The auth token is generated
-    /// fresh each run (shown in the TUI), or loaded from --auth-token-file /
-    /// DUOPIPE_AUTH_TOKEN. No config file is read.
+    /// a dialer enters the peer's node id manually. The auth token is loaded from
+    /// --auth-token-file / DUOPIPE_AUTH_TOKEN; without either, setup lets you generate
+    /// a fresh one (shown in the TUI) or paste an existing token. No config file is read.
     ///
     /// On startup the TUI confirms setup, then opens the dashboard already
     /// listening. Press `c` in the dashboard to dial a peer by node id.
     Quick {
         /// Path to a file containing the shared auth token. Takes precedence over
-        /// DUOPIPE_AUTH_TOKEN. Without it (or the env var) a fresh ephemeral token
-        /// is generated each run.
+        /// DUOPIPE_AUTH_TOKEN. Without it (or the env var) setup prompts to generate
+        /// a fresh token or enter an existing one.
         #[arg(long)]
         auth_token_file: Option<PathBuf>,
     },
     /// Start a peer in nostr mode (interactive TUI): always serving, with one
     /// on-demand outbound dial session.
     ///
-    /// Requires a config file and a provided auth token (it is the nostr rendezvous
-    /// secret — supply it via config `auth_token_file` or DUOPIPE_AUTH_TOKEN). The
-    /// listener publishes its current ephemeral node id to nostr and a dialer looks
-    /// it up, so the node id need not be exchanged by hand.
+    /// Requires a config file. The auth token (the nostr rendezvous secret) may be
+    /// supplied via config `auth_token_file` or DUOPIPE_AUTH_TOKEN; if neither is set,
+    /// setup lets you generate a fresh token or paste an existing one. The listener
+    /// publishes its current ephemeral node id to nostr and a dialer looks it up, so
+    /// the node id need not be exchanged by hand.
     ///
     /// On startup the TUI confirms setup, then opens the dashboard already
     /// listening. Press `c` in the dashboard to dial a peer by name.
@@ -406,15 +407,11 @@ async fn run_start_peer(
         .await;
     }
 
-    // Nostr mode requires a provided auth token: it is the rendezvous secret both
-    // peers derive their nostr key from, so a generated one could not be discovered
-    // by the other side.
-    if nostr_discovery_enabled && config_auth_token.is_none() {
-        return Err(TunnelError::config(anyhow::anyhow!(
-            "Nostr mode requires an auth token. Supply it via the config `auth_token_file` or the DUOPIPE_AUTH_TOKEN env var."
-        ))
-        .into());
-    }
+    // When no token is supplied via file/env, the interactive setup screen resolves it
+    // (generate a fresh one or paste an existing one) for both quick and nostr mode —
+    // so `auth_token_file` is fully optional. The token is the rendezvous secret both
+    // nostr peers derive their key from: generate it on the first device (it is shown
+    // for copying) and enter it on the second.
 
     // Nostr mode requires a `name`: each peer publishes its node id under this short
     // identifier, and a dialer types it to look the peer up.

@@ -95,6 +95,9 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         launch.nostr_discovery,
         launch.peer_name.clone(),
     );
+    // Seed the active token now so the header fingerprint is populated from the first
+    // frame (the runtime sets the same value again once it starts — idempotent).
+    state.set_auth_token(resolved.auth_token.clone());
     let cfg = build_peer_config(&resolved, &launch, state.clone());
     let mut runtime = tokio::spawn(crate::iroh_mode::run_peer(cfg));
 
@@ -672,6 +675,9 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         let _ = writeln!(out, "outbound:  not connected");
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
+    if let Some(token) = snap.auth_token.as_deref() {
+        let _ = writeln!(out, "token fp:  {}", crate::auth::token_fingerprint(token));
+    }
 
     let _ = writeln!(out, "\nTunnels:");
     if snap.tunnels.is_empty() {

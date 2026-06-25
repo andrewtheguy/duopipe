@@ -273,6 +273,16 @@ fn render_header(
         "{}/{}",
         snap.streams_used, snap.streams_max
     )));
+    // A short, stable fingerprint of the active token, shown in every mode and role so
+    // the user can confirm two devices share the same token even after the full token
+    // is hidden (it is the only place the token can be cross-checked).
+    if let Some(token) = snap.auth_token.as_deref() {
+        app_line.push(Span::raw("  token fp: "));
+        app_line.push(Span::styled(
+            crate::auth::token_fingerprint(token),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let mut lines = vec![
         Line::from(app_line),
@@ -284,7 +294,7 @@ fn render_header(
         // Freshly generated token, not yet dismissed: surface it so the dialer can
         // copy it. Hidden once a peer connects or the user presses `h`.
         let token = snap.auth_token.as_deref().unwrap_or("(pending)");
-        lines.push(Line::from(vec![
+        let mut token_line = vec![
             Span::raw("auth token: "),
             Span::styled(
                 token.to_string(),
@@ -292,7 +302,14 @@ fn render_header(
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]));
+        ];
+        if let Some(token) = snap.auth_token.as_deref() {
+            token_line.push(Span::styled(
+                format!("  (fp: {})", crate::auth::token_fingerprint(token)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(token_line));
         lines.push(Line::from(Span::styled(
             "auth token hides after 10 minutes, press h to hide now",
             Style::default().fg(Color::DarkGray),

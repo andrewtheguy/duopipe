@@ -454,7 +454,9 @@ The outbound dial target is not a config field. In interactive mode it is entere
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. The token is supplied only via a file or env var — never written inline in the config. In configless mode (no config file) the listener generates an ephemeral token if none is supplied; nostr mode (a config file is loaded) requires a provided token and fails fast otherwise.
+Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. When none of these supply a token, the interactive setup screen resolves it for **both** modes: generate a fresh token (surfaced in the dashboard header so it can be copied to the other device) or paste an existing one (validated against its CRC). `auth_token_file` is therefore optional in nostr mode too — only a `name` is mandatory.
+
+The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, a CRC16-CCITT-FALSE over the token string rendered as 4 hex digits — persistently in the header (all modes/roles) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret.
 
 ```toml
 # peer.toml
