@@ -1,15 +1,15 @@
 //! In-memory log capture for the TUI.
 //!
-//! Routes `log` crate records into a bounded ring buffer instead of the console
-//! so the TUI can render them in a scrollable pane.
+//! Routes `log` crate records into bounded ring buffers instead of the console so the
+//! TUI can render them in a scrollable pane.
 //!
-//! The buffer captures at a verbose threshold (`duopipe` at `Info`+, other targets at
-//! `Warn`+) and tags each line's `verbose_only` flag. The default ("concise") log view
-//! hides `verbose_only` lines — the routine iroh/quinn `Warn` churn from relay
-//! net-report / address-discovery probes — showing only our own `Info`+ and genuine
-//! `Error`s from the stack below us. The TUI's verbose toggle reveals everything
-//! captured; because the noisy lines are always buffered, toggling on doesn't lose
-//! recent history.
+//! Records are captured at a verbose threshold (`duopipe` at `Info`+, other targets at
+//! `Warn`+) and split by a `verbose_only` flag into two independent rings: concise lines
+//! (our own `Info`+ and genuine foreign `Error`s) and the verbose-only churn (the routine
+//! iroh/quinn `Warn` from relay net-report / address-discovery probes). The default view
+//! reads only the concise ring; the TUI's verbose toggle merges both chronologically.
+//! Keeping them separate means a churn burst can only evict other churn — it never
+//! shortens the concise history the default view shows.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -58,35 +58,66 @@ pub struct LogLine {
     pub verbose_only: bool,
 }
 
-/// Bounded ring buffer of log lines, shared between the logger and the TUI.
+/// Two independent bounded ring buffers shared between the logger and the TUI: one for
+/// concise lines (our own output + foreign errors) and one for the `verbose_only` churn
+/// (foreign `Warn`). Splitting them means a burst of iroh/quinn churn can only evict
+/// other churn, never the concise history the default view shows.
 pub struct LogBuffer {
-    lines: Mutex<VecDeque<LogLine>>,
+    concise: Mutex<VecDeque<LogLine>>,
+    verbose: Mutex<VecDeque<LogLine>>,
     cap: usize,
 }
 
 impl LogBuffer {
     pub fn new(cap: usize) -> Arc<Self> {
         Arc::new(Self {
-            lines: Mutex::new(VecDeque::with_capacity(cap.min(256))),
+            concise: Mutex::new(VecDeque::with_capacity(cap.min(256))),
+            verbose: Mutex::new(VecDeque::with_capacity(cap.min(256))),
             cap,
         })
     }
 
     pub fn push(&self, line: LogLine) {
-        let mut lines = self.lines.lock();
+        let ring = if line.verbose_only {
+            &self.verbose
+        } else {
+            &self.concise
+        };
+        let mut lines = ring.lock();
         if lines.len() == self.cap {
             lines.pop_front();
         }
         lines.push_back(line);
     }
 
-    /// Snapshot the buffer (oldest first) for rendering.
-    pub fn snapshot(&self) -> Vec<LogLine> {
-        self.lines.lock().iter().cloned().collect()
+    /// The default view: only the concise ring (oldest first).
+    pub fn concise_snapshot(&self) -> Vec<LogLine> {
+        self.concise.lock().iter().cloned().collect()
     }
 
-    pub fn len(&self) -> usize {
-        self.lines.lock().len()
+    /// The verbose view: concise + verbose-only lines merged chronologically. Both rings
+    /// are already in insertion order, so a stable sort by timestamp interleaves them
+    /// correctly (concise wins ties, which is irrelevant for display).
+    pub fn verbose_snapshot(&self) -> Vec<LogLine> {
+        // Lock order concise-then-verbose matches `verbose_len`; `push` never nests, so
+        // there is no deadlock.
+        let concise = self.concise.lock();
+        let verbose = self.verbose.lock();
+        let mut merged = Vec::with_capacity(concise.len() + verbose.len());
+        merged.extend(concise.iter().cloned());
+        merged.extend(verbose.iter().cloned());
+        merged.sort_by(|a, b| a.ts.timestamp().cmp(&b.ts.timestamp()));
+        merged
+    }
+
+    /// Number of lines in the default view.
+    pub fn concise_len(&self) -> usize {
+        self.concise.lock().len()
+    }
+
+    /// Number of lines in the verbose view (both rings combined).
+    pub fn verbose_len(&self) -> usize {
+        self.concise.lock().len() + self.verbose.lock().len()
     }
 }
 
@@ -172,11 +203,15 @@ mod tests {
     use super::*;
 
     fn line(level: Level, msg: &str) -> LogLine {
+        tagged_line(level, msg, false)
+    }
+
+    fn tagged_line(level: Level, msg: &str, verbose_only: bool) -> LogLine {
         LogLine {
             level,
             msg: msg.to_string(),
             ts: jiff::Zoned::now(),
-            verbose_only: false,
+            verbose_only,
         }
     }
 
@@ -186,10 +221,53 @@ mod tests {
         for i in 0..5 {
             buf.push(line(Level::Info, &format!("msg{i}")));
         }
-        let snap = buf.snapshot();
+        let snap = buf.concise_snapshot();
         assert_eq!(snap.len(), 3);
         assert_eq!(snap[0].msg, "msg2");
         assert_eq!(snap[2].msg, "msg4");
+    }
+
+    #[test]
+    fn churn_burst_does_not_evict_concise_history() {
+        let buf = LogBuffer::new(2);
+        buf.push(line(Level::Info, "keep-1"));
+        buf.push(line(Level::Info, "keep-2"));
+        // A flood of verbose-only churn fills its own ring without touching concise.
+        for i in 0..10 {
+            buf.push(tagged_line(Level::Warn, &format!("churn{i}"), true));
+        }
+
+        let concise = buf.concise_snapshot();
+        assert_eq!(concise.len(), 2);
+        assert_eq!(concise[0].msg, "keep-1");
+        assert_eq!(concise[1].msg, "keep-2");
+
+        // The verbose view merges both rings; the verbose ring evicted its own oldest
+        // (cap 2), leaving the two newest churn lines plus the concise pair.
+        let verbose = buf.verbose_snapshot();
+        let msgs: Vec<&str> = verbose.iter().map(|l| l.msg.as_str()).collect();
+        assert_eq!(buf.verbose_len(), 4);
+        assert!(msgs.contains(&"keep-1"));
+        assert!(msgs.contains(&"churn9"));
+        assert!(!msgs.contains(&"churn0"));
+    }
+
+    #[test]
+    fn verbose_snapshot_merges_in_timestamp_order() {
+        let buf = LogBuffer::new(8);
+        // Interleave pushes; insertion order is timestamp order (now() is monotonic in
+        // this test's wall-clock sense), so the merge must restore the interleaving.
+        buf.push(line(Level::Info, "a"));
+        buf.push(tagged_line(Level::Warn, "b", true));
+        buf.push(line(Level::Info, "c"));
+        buf.push(tagged_line(Level::Warn, "d", true));
+
+        let merged: Vec<String> = buf
+            .verbose_snapshot()
+            .into_iter()
+            .map(|l| l.msg)
+            .collect();
+        assert_eq!(merged, vec!["a", "b", "c", "d"]);
     }
 
     #[test]

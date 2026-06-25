@@ -106,7 +106,12 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         tokio::select! {
             _ = tick.tick() => {
                 let snap = state.snapshot();
-                let logs = state.logs.snapshot();
+                // Pick the ring view matching the toggle; the verbose view merges both.
+                let logs = if ui_state.verbose {
+                    state.logs.verbose_snapshot()
+                } else {
+                    state.logs.concise_snapshot()
+                };
                 // Once a peer has connected, the generated-token banner is no longer
                 // needed (the dialer already has it); hide it for the rest of the run.
                 if !snap.peers.is_empty() {
@@ -365,7 +370,11 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
 /// Logs-screen keys: `v` toggles verbose (show the suppressed iroh/quinn churn);
 /// scroll the log pane with `[`/`]`, `PageUp`/`PageDown`, and `g`/`G` (top/bottom).
 fn handle_logs_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
-    let total = state.logs.len();
+    let total = if ui.verbose {
+        state.logs.verbose_len()
+    } else {
+        state.logs.concise_len()
+    };
     match key.code {
         // Toggle the full unfiltered view. The visible-line count changes, so snap back
         // to the tail to avoid landing on a stale scroll offset.
@@ -887,7 +896,7 @@ mod tests {
         // Switch to the logs screen; now `g` jumps to the top.
         handle_key(key(KeyCode::Char('l')), &mut ui, &st);
         handle_key(key(KeyCode::Char('g')), &mut ui, &st);
-        assert_eq!(ui.log_scroll, st.logs.len());
+        assert_eq!(ui.log_scroll, st.logs.concise_len());
     }
 
     #[test]

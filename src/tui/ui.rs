@@ -647,22 +647,17 @@ fn peer_row(p: &PeerRow) -> Row<'static> {
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
-    // The concise view hides verbose-only lines (iroh/quinn Warn churn); verbose shows
-    // everything captured. Filter first so scroll math and the count match the view.
-    let view: Vec<&LogLine> = logs
-        .iter()
-        .filter(|l| ui.verbose || !l.verbose_only)
-        .collect();
-
+    // `logs` is already the right view for the mode (concise ring, or both rings merged
+    // for verbose) — the caller picks which snapshot to pass, so render just paints it.
     // Visible body height inside the border.
     let body = area.height.saturating_sub(2) as usize;
-    let total = view.len();
+    let total = logs.len();
     // Clamp the scroll so at least a full body of lines stays visible.
     let max_scroll = total.saturating_sub(body);
     let scroll = ui.log_scroll.min(max_scroll);
     let end = total - scroll;
     let start = end.saturating_sub(body);
-    let lines: Vec<Line> = view[start..end].iter().map(|l| log_line(l)).collect();
+    let lines: Vec<Line> = logs[start..end].iter().map(log_line).collect();
 
     let mode = if ui.verbose { "verbose" } else { "concise" };
     let title = if ui.quit_armed {
@@ -800,17 +795,19 @@ mod tests {
     }
 
     #[test]
-    fn verbose_toggle_reveals_verbose_only_lines() {
+    fn log_screen_labels_the_active_view_mode() {
         let snap = base_snapshot(false, None);
-        let logs = vec![
+        // The caller passes the view that matches the toggle (concise ring vs merged);
+        // render paints it and labels the mode in the title.
+        let concise_logs = vec![log(log::Level::Info, "own-line", false)];
+        let merged_logs = vec![
             log(log::Level::Info, "own-line", false),
             log(log::Level::Warn, "iroh-churn", true),
         ];
 
-        // Concise (default): the verbose-only churn line is hidden.
         let concise = render_text_with_logs(
             &snap,
-            &logs,
+            &concise_logs,
             &UiState {
                 screen: Screen::Logs,
                 ..Default::default()
@@ -820,10 +817,9 @@ mod tests {
         assert!(!concise.contains("iroh-churn"));
         assert!(concise.contains("concise"));
 
-        // Verbose: everything captured is shown.
         let verbose = render_text_with_logs(
             &snap,
-            &logs,
+            &merged_logs,
             &UiState {
                 screen: Screen::Logs,
                 verbose: true,
