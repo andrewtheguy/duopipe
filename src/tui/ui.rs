@@ -15,9 +15,23 @@ use crate::app_state::{
 };
 use crate::logging::LogLine;
 
+/// Which top-level screen the dashboard is showing. Logs live on their own screen
+/// so their scroll keys (`[`/`]`, `g`/`G`, PgUp/PgDn) don't collide with the home
+/// screen's tunnel navigation.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Screen {
+    /// Header + tunnels + connected peers.
+    #[default]
+    Home,
+    /// Header + a full-height log pane.
+    Logs,
+}
+
 /// View state owned by the TUI loop (not shared with the runtime).
 #[derive(Default)]
 pub struct UiState {
+    /// Which screen is visible (toggled with Tab).
+    pub screen: Screen,
     /// Lines scrolled up from the bottom of the log pane. 0 = follow tail.
     pub log_scroll: usize,
     /// Index of the highlighted tunnel row (toggled with Enter).
@@ -112,24 +126,65 @@ pub struct ConnectForm {
 }
 
 pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
+    match ui.screen {
+        Screen::Home => render_home(frame, snap, ui),
+        Screen::Logs => render_logs_screen(frame, snap, logs, ui),
+    }
+}
+
+/// The home screen: header, the tunnel table, and the connected-peers table. Logs
+/// live on their own screen (Tab) so their keys don't fight the tunnel navigation.
+fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
     let show_token_banner = show_generated_token_banner(snap, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
-    let [header_area, tunnels_area, peers_area, logs_area] = Layout::vertical([
+    let [header_area, tunnels_area, peers_area, _filler, footer_area] = Layout::vertical([
         Constraint::Length(header_height(show_token_banner, show_conflict_warning)),
         Constraint::Length(tunnel_rows.clamp(4, 10)),
         Constraint::Length(peer_rows.clamp(3, 8)),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    // The dial hint advertises the home-only Shift-C/Shift-D controls, so it shows
+    // only here (not on the logs screen, where those keys are inert).
+    render_header(frame, header_area, snap, show_token_banner, true);
+    render_tunnels(frame, tunnels_area, snap, ui);
+    render_peers(frame, peers_area, snap);
+    render_home_footer(frame, footer_area, ui);
+}
+
+/// The logs screen: the same header plus a full-height log pane.
+fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
+    let show_token_banner = show_generated_token_banner(snap, ui);
+    let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
+    let [header_area, logs_area] = Layout::vertical([
+        Constraint::Length(header_height(show_token_banner, show_conflict_warning)),
         Constraint::Min(3),
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, snap, show_token_banner);
-    render_tunnels(frame, tunnels_area, snap, ui);
-    render_peers(frame, peers_area, snap);
+    render_header(frame, header_area, snap, show_token_banner, false);
     render_logs(frame, logs_area, logs, ui);
+}
+
+/// One-line footer for the home screen carrying the global key hints (the per-pane
+/// hints live in the tunnel/log titles).
+fn render_home_footer(frame: &mut Frame, area: Rect, ui: &UiState) {
+    let text = if ui.quit_armed {
+        "press Esc again to quit".to_string()
+    } else {
+        "l logs · w dump · h hide token · Esc Esc quit".to_string()
+    };
+    let para = Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(para, area);
 }
 
 fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
@@ -141,10 +196,20 @@ fn header_height(show_token_banner: bool, show_conflict_warning: bool) -> u16 {
     base + if show_conflict_warning { 1 } else { 0 }
 }
 
-fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_banner: bool) {
+fn render_header(
+    frame: &mut Frame,
+    area: Rect,
+    snap: &AppSnapshot,
+    show_token_banner: bool,
+    show_dial_hint: bool,
+) {
     let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
     let mut app_line = vec![
         Span::styled("duopipe", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            concat!(" v", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(" @ "),
         Span::styled(
             snap.hostname.clone(),
@@ -169,7 +234,7 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &AppSnapshot, show_token_b
     let mut lines = vec![
         Line::from(app_line),
         Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
-        dial_header_line(snap),
+        dial_header_line(snap, show_dial_hint),
     ];
 
     if show_token_banner {
@@ -256,15 +321,39 @@ pub(super) fn dial_text(snap: &AppSnapshot) -> String {
     snap.dial_target
         .as_deref()
         .map(|target| format!("dial → {target}"))
-        .unwrap_or_else(|| "dial: not connected (press c)".to_string())
+        .unwrap_or_else(|| "dial: not connected".to_string())
 }
 
-fn dial_header_line(snap: &AppSnapshot) -> Line<'static> {
+/// The dial-session control hint, styled to stand out as an action. It lives on the
+/// dial header line (not the Tunnels box) so connecting/disconnecting the outbound
+/// session reads as separate from the per-tunnel actions. `Shift-C` connects (or
+/// re-points) the session; `Shift-D` disconnects it.
+fn dial_hint(connected: bool) -> Span<'static> {
+    let text = if connected {
+        "   [Shift-D disconnect]"
+    } else {
+        "   [Shift-C connect]"
+    };
+    Span::styled(
+        text,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// `show_hint` is false on the logs screen, where the Shift-C/Shift-D dial controls
+/// are inert — the status still shows, just without the dead action hint.
+fn dial_header_line(snap: &AppSnapshot, show_hint: bool) -> Line<'static> {
     let Some(target) = snap.dial_target.as_deref() else {
-        return Line::from(Span::raw(dial_text(snap)));
+        let mut spans = vec![Span::raw(dial_text(snap))];
+        if show_hint {
+            spans.push(dial_hint(false));
+        }
+        return Line::from(spans);
     };
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(format!("dial → {target}   status: ")),
         Span::styled(
             snap.conn_status.label(),
@@ -272,7 +361,11 @@ fn dial_header_line(snap: &AppSnapshot) -> Line<'static> {
         ),
         Span::raw("   path: "),
         Span::raw(snap.path.describe()),
-    ])
+    ];
+    if show_hint {
+        spans.push(dial_hint(true));
+    }
+    Line::from(spans)
 }
 
 /// Modal for adding a tunnel request at runtime. Three labeled fields; the active
@@ -466,9 +559,11 @@ fn tunnel_title(snap: &AppSnapshot) -> &'static str {
     match snap.role {
         Role::Listen => " Tunnels ",
         Role::Dial | Role::Both if has_connected_dial(snap) => {
-            " Tunnels  [↑/↓ select · Enter start/stop · a add · x/Del delete] "
+            " Tunnels  [↑/↓ select · Enter start/stop · a add · d/Del delete] "
         }
-        Role::Dial | Role::Both => " Tunnels  [c connect · a add · x/Del delete] ",
+        // Without a dial session tunnels can be edited but not started; the connect
+        // hint lives on the dial header line above, not here.
+        Role::Dial | Role::Both => " Tunnels  [a add · d/Del delete] ",
     }
 }
 
@@ -561,11 +656,9 @@ fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
     let title = if ui.quit_armed {
         format!(" Logs ({total})  [press Esc again to quit] ")
     } else if scroll == 0 {
-        format!(
-            " Logs ({total})  [Esc Esc quit · [/] or PgUp/PgDn scroll · g/G top/bottom · d dump] "
-        )
+        format!(" Logs ({total})  [Esc/l home · [/] or PgUp/PgDn scroll · g/G top/bottom] ")
     } else {
-        format!(" Logs ({total})  [scrolled +{scroll}] ")
+        format!(" Logs ({total})  [scrolled +{scroll} · Esc follow tail] ")
     };
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -687,7 +780,62 @@ mod tests {
 
         assert!(text.contains("mode: nostr"));
         assert!(text.contains("name: web1"));
-        assert!(text.contains("dial: not connected (press c)"));
+        assert!(text.contains("dial: not connected"));
+        // The connect control hint lives on the dial header line, not the Tunnels box.
+        assert!(text.contains("Shift-C connect"));
+    }
+
+    #[test]
+    fn header_shows_app_version_on_both_screens() {
+        let snap = base_snapshot(false, None);
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
+
+        let home = render_text(&snap, &UiState::default());
+        assert!(home.contains(version), "home header should show the version");
+
+        let logs_ui = UiState {
+            screen: Screen::Logs,
+            ..Default::default()
+        };
+        let logs = render_text(&snap, &logs_ui);
+        assert!(logs.contains(version), "logs header should show the version");
+    }
+
+    #[test]
+    fn home_screen_hides_log_pane_and_logs_screen_shows_it() {
+        let snap = base_snapshot(false, None);
+
+        // Home screen: no log pane, but a footer pointing at the logs screen.
+        let home = render_text(&snap, &UiState::default());
+        assert!(!home.contains("Logs ("));
+        assert!(home.contains("l logs"));
+
+        // Logs screen: the log pane is present, peers/tunnels are not.
+        let logs_ui = UiState {
+            screen: Screen::Logs,
+            ..Default::default()
+        };
+        let logs = render_text(&snap, &logs_ui);
+        assert!(logs.contains("Logs ("));
+        assert!(!logs.contains("Connected peers"));
+    }
+
+    #[test]
+    fn dial_hint_shows_on_home_but_not_on_logs_screen() {
+        let snap = base_snapshot(true, Some("web1"));
+
+        let home = render_text(&snap, &UiState::default());
+        assert!(home.contains("Shift-C connect"));
+
+        // The Shift-C/Shift-D dial controls are home-only, so the logs header drops
+        // the hint while still showing the dial status line.
+        let logs_ui = UiState {
+            screen: Screen::Logs,
+            ..Default::default()
+        };
+        let logs = render_text(&snap, &logs_ui);
+        assert!(logs.contains("dial: not connected"));
+        assert!(!logs.contains("Shift-C connect"));
     }
 
     #[test]
@@ -722,6 +870,8 @@ mod tests {
         assert!(text.contains("dial → homelab"));
         assert!(text.contains("status: Connecting"));
         assert!(text.contains("path: establishing…"));
+        // An active session offers disconnect (not connect) on the dial header line.
+        assert!(text.contains("Shift-D disconnect"));
     }
 
     #[test]
@@ -740,8 +890,10 @@ mod tests {
     fn tunnel_title_matches_dial_state() {
         let snap = base_snapshot(false, None);
         let idle_text = render_text(&snap, &UiState::default());
-        assert!(idle_text.contains("c connect"));
+        // Idle: no start/stop hint, and the Tunnels box carries only tunnel actions
+        // (the connect hint moved to the dial header line).
         assert!(!idle_text.contains("Enter start/stop"));
+        assert!(idle_text.contains("[a add · d/Del delete]"));
 
         let mut connected = base_snapshot(false, None);
         connected.dial_target = Some("peer".to_string());

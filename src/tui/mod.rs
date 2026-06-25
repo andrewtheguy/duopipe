@@ -29,7 +29,7 @@ use crate::peer_params::ResolvedPeer;
 use iroh::EndpointId;
 use setup::{SetupOutcome, SetupState, Step};
 use textinput::handle_edit;
-use ui::{AddField, AddRequestForm, ConnectForm, UiState};
+use ui::{AddField, AddRequestForm, ConnectForm, Screen, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
@@ -234,12 +234,12 @@ async fn run_setup(
 
 /// Handle a dashboard key press. Returns `true` when the UI should exit.
 ///
-/// Tunnels are a dial-role concept (the dialer requests them); the listen role is a
-/// pure server and shows only its connected peers. Arrows / `j`/`k` move the tunnel
-/// selection cursor; `Enter`/`Space` start or stop the selected tunnel; `a` opens the
-/// add-request modal; `x`/`Del` removes the selected tunnel from the session (config
-/// is untouched); `h` hides the generated-token banner. Logs scroll with
-/// `PageUp`/`PageDown` and `[`/`]`. A double `Esc` quits (or `Ctrl-C`).
+/// The dashboard has two screens, toggled with `l`: the home screen (tunnels +
+/// peers) and the logs screen. Keys that only make sense for one screen are routed
+/// to that screen's handler so they don't collide (e.g. `g`/`G` scroll logs but do
+/// nothing on home). Emergency quit (`Ctrl-C`), the screen toggle, and `h` (hide the
+/// generated-token banner) work on either screen. `Esc` dismisses the logs screen back
+/// to home; on the home screen a double-`Esc` quits.
 fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     // Ctrl-C is an always-available emergency quit, even with the modal open.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -262,9 +262,21 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         return false;
     }
 
-    // Quit on a double Esc: the first Esc arms it, a second (with no other key in
-    // between) confirms. Any other key disarms it.
     if key.code == KeyCode::Esc {
+        // On the logs screen, Esc first exits scroll mode (back to following the
+        // tail); only once already at the tail does it dismiss back to home. Neither
+        // quits.
+        if ui.screen == Screen::Logs {
+            if ui.log_scroll > 0 {
+                ui.log_scroll = 0;
+            } else {
+                ui.screen = Screen::Home;
+            }
+            ui.quit_armed = false;
+            return false;
+        }
+        // On home, quit on a double Esc: the first Esc arms it, a second (with no
+        // other key in between) confirms. Any other key disarms it.
         if ui.quit_armed {
             state.shutdown.cancel();
             return true;
@@ -274,23 +286,52 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     }
     ui.quit_armed = false;
 
-    let total = state.logs.len();
+    // Screen toggle and the token-banner hide work regardless of which screen is up.
+    match key.code {
+        KeyCode::Char('l') => {
+            ui.screen = match ui.screen {
+                Screen::Home => Screen::Logs,
+                Screen::Logs => Screen::Home,
+            };
+            return false;
+        }
+        KeyCode::Char('h') => {
+            hide_token_banner(ui);
+            return false;
+        }
+        _ => {}
+    }
+
+    match ui.screen {
+        Screen::Home => handle_home_key(key, ui, state),
+        Screen::Logs => handle_logs_key(key, ui, state),
+    }
+    false
+}
+
+/// Home-screen keys: tunnel navigation/actions plus the connection-info dump.
+///
+/// Tunnels are a dial-role concept (the dialer requests them); the listen role is a
+/// pure server and shows only its connected peers. Arrows / `j`/`k` move the tunnel
+/// selection cursor; `Enter`/`Space` start or stop the selected tunnel; `a` opens the
+/// add-request modal; `d`/`Del` removes the selected tunnel from the session (config
+/// is untouched); `w` writes (dumps) the connection info to a file.
+fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let tunnels = state.tunnel_count();
     match key.code {
         // Tunnels are driven by the dial half; the pure listener initiates none.
         KeyCode::Char('a') if matches!(state.role, Role::Dial | Role::Both) => {
             ui.add_form = Some(AddRequestForm::default());
         }
-        // Connect / change the on-demand dial target (interactive serve+dial mode).
-        KeyCode::Char('c') if state.role == Role::Both => {
+        // Connect / re-point the on-demand dial session (interactive serve+dial mode).
+        // Shift-C pairs with Shift-D below as the dial-session lifecycle controls,
+        // kept distinct from the lowercase per-tunnel keys (a/d) to avoid confusion.
+        KeyCode::Char('C') if state.role == Role::Both => {
             ui.connect_form = Some(ConnectForm::default());
         }
         // Disconnect the current dial session, returning to serve-only.
         KeyCode::Char('D') if state.role == Role::Both => {
             state.send_dial(DialCommand::Disconnect);
-        }
-        KeyCode::Char('h') => {
-            hide_token_banner(ui);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             ui.selected = ui.selected.saturating_sub(1);
@@ -305,7 +346,7 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
                 state.toggle_tunnel(id);
             }
         }
-        KeyCode::Char('x') | KeyCode::Delete => {
+        KeyCode::Char('d') | KeyCode::Delete => {
             if let Some(id) = state.tunnel_id_at(ui.selected) {
                 state.delete_request(id);
                 // The row is gone; keep the cursor on a valid row (clamp to the last
@@ -313,6 +354,19 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
                 ui.selected = ui.selected.min(state.tunnel_count().saturating_sub(1));
             }
         }
+        KeyCode::Char('w') => match dump_connection_info(&state.snapshot()) {
+            Ok(path) => log::info!("Wrote connection info (no auth token) to {path}"),
+            Err(e) => log::warn!("Failed to write connection info: {e}"),
+        },
+        _ => {}
+    }
+}
+
+/// Logs-screen keys: scroll the log pane with `[`/`]`, `PageUp`/`PageDown`, and
+/// `g`/`G` (top/bottom).
+fn handle_logs_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
+    let total = state.logs.len();
+    match key.code {
         KeyCode::Char(']') => {
             ui.log_scroll = ui.log_scroll.saturating_add(1).min(total);
         }
@@ -327,13 +381,8 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
         }
         KeyCode::Char('g') => ui.log_scroll = total,
         KeyCode::Char('G') => ui.log_scroll = 0,
-        KeyCode::Char('d') => match dump_connection_info(&state.snapshot()) {
-            Ok(path) => log::info!("Wrote connection info (no auth token) to {path}"),
-            Err(e) => log::warn!("Failed to write connection info: {e}"),
-        },
         _ => {}
     }
-    false
 }
 
 /// Handle a key while a name-conflict prompt is showing. The decision is sent to the
@@ -568,7 +617,7 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         let _ = writeln!(out, "status:    {}", snap.conn_status.label());
         let _ = writeln!(out, "path:      {}", snap.path.describe());
     } else {
-        let _ = writeln!(out, "dial:      not connected (press c)");
+        let _ = writeln!(out, "dial:      not connected");
     }
     let _ = writeln!(out, "streams:   {}/{}", snap.streams_used, snap.streams_max);
 
@@ -749,9 +798,9 @@ mod tests {
             ..Default::default()
         };
 
-        // `x` deletes the selected (last) tunnel and clamps the cursor onto the
+        // `d` deletes the selected (last) tunnel and clamps the cursor onto the
         // remaining row.
-        assert!(!handle_key(key(KeyCode::Char('x')), &mut ui, &st));
+        assert!(!handle_key(key(KeyCode::Char('d')), &mut ui, &st));
         assert_eq!(st.tunnel_count(), 1);
         assert_eq!(ui.selected, 0);
         assert_eq!(st.tunnel_id_at(0).and_then(|id| st.get_request(id)).unwrap().name, "a");
@@ -761,8 +810,60 @@ mod tests {
         assert_eq!(st.tunnel_count(), 0);
         assert_eq!(ui.selected, 0);
         // Pressing delete on an empty list is a harmless no-op.
-        assert!(!handle_key(key(KeyCode::Char('x')), &mut ui, &st));
+        assert!(!handle_key(key(KeyCode::Char('d')), &mut ui, &st));
         assert_eq!(st.tunnel_count(), 0);
+    }
+
+    #[test]
+    fn l_toggles_between_home_and_logs_screens() {
+        let st = state();
+        let mut ui = UiState::default();
+        assert_eq!(ui.screen, Screen::Home);
+        assert!(!handle_key(key(KeyCode::Char('l')), &mut ui, &st));
+        assert_eq!(ui.screen, Screen::Logs);
+        assert!(!handle_key(key(KeyCode::Char('l')), &mut ui, &st));
+        assert_eq!(ui.screen, Screen::Home);
+    }
+
+    #[test]
+    fn esc_exits_scroll_mode_before_dismissing_the_logs_screen() {
+        let st = state();
+        let mut ui = UiState {
+            screen: Screen::Logs,
+            log_scroll: 7,
+            ..Default::default()
+        };
+        // First Esc only drops out of scroll mode (back to the tail), still on logs.
+        assert!(!handle_key(key(KeyCode::Esc), &mut ui, &st));
+        assert_eq!(ui.log_scroll, 0);
+        assert_eq!(ui.screen, Screen::Logs);
+        assert!(!ui.quit_armed);
+        // A second Esc, now at the tail, dismisses back to home (still no quit).
+        assert!(!handle_key(key(KeyCode::Esc), &mut ui, &st));
+        assert_eq!(ui.screen, Screen::Home);
+        assert!(!ui.quit_armed);
+    }
+
+    #[test]
+    fn log_scroll_keys_are_scoped_to_the_logs_screen() {
+        let st = state();
+        for _ in 0..5 {
+            st.logs.push(crate::logging::LogLine {
+                level: log::Level::Info,
+                msg: "line".to_string(),
+                ts: jiff::Zoned::now(),
+            });
+        }
+        let mut ui = UiState::default();
+
+        // On the home screen `g` is inert (it no longer collides with anything).
+        handle_key(key(KeyCode::Char('g')), &mut ui, &st);
+        assert_eq!(ui.log_scroll, 0);
+
+        // Switch to the logs screen; now `g` jumps to the top.
+        handle_key(key(KeyCode::Char('l')), &mut ui, &st);
+        handle_key(key(KeyCode::Char('g')), &mut ui, &st);
+        assert_eq!(ui.log_scroll, st.logs.len());
     }
 
     #[test]
@@ -860,7 +961,7 @@ mod tests {
 
         assert!(text.contains("mode:      nostr"));
         assert!(text.contains("name:      web1"));
-        assert!(text.contains("dial:      not connected (press c)"));
+        assert!(text.contains("dial:      not connected"));
         assert!(!text.contains("role:"));
         assert!(!text.contains("status:"));
         assert!(!text.contains("path:"));

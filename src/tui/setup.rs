@@ -253,7 +253,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 pub fn render(frame: &mut Frame, state: &SetupState) {
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            "duopipe — setup",
+            concat!("duopipe v", env!("CARGO_PKG_VERSION"), " — setup"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
@@ -271,7 +271,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
                 )));
             }
             lines.push(Line::from(Span::styled(
-                "  Dial a peer on demand from the dashboard (press c).",
+                "  Dial a peer on demand from the dashboard (press Shift-C).",
                 Style::default().fg(Color::DarkGray),
             )));
             if allowlist_fields_shown(state) {
