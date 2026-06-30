@@ -420,13 +420,18 @@ impl AppState {
 
     /// Tear down the serve half's surfaced state once it has stopped: back to `Stopped`,
     /// drop the displayed node id, and clear any rotating PIN (a fresh start mints new
-    /// ones). The auth token value is left seeded — the UI gates its display on
-    /// `listening()` instead of mutating it.
+    /// ones). Also drops the inbound peer rows (added only by the listener side) and any
+    /// nostr name-conflict prompt/warning (raised only by the serve half's publisher):
+    /// their owning tasks are aborted on stop and don't run their own cleanup, so without
+    /// this the TUI would show stale peers/conflicts after the serve half is down. The auth
+    /// token value is left seeded — the UI gates its display on `listening()` instead.
     pub fn clear_listen(&self) {
         *self.listen_status.write() = ListenStatus::Stopped;
         *self.endpoint_id.write() = None;
         *self.current_pin.write() = None;
         *self.pin_deadline.write() = None;
+        self.peers.write().clear();
+        *self.name_conflict.write() = NameConflict::Inactive;
     }
 
     /// Subscribe to name-conflict decisions. The node-id publisher subscribes once.
