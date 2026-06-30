@@ -102,7 +102,7 @@ impl AddTunnelForm {
 /// In-progress entry for the runtime "connect to peer" modal (single text field).
 #[derive(Default)]
 pub struct ConnectForm {
-    /// The target: a peer name (connect mode) or a full node id (quick mode).
+    /// The target: a peer name (config mode) or a full node id (quick mode).
     pub target: Input,
     /// Inline validation error from the last failed submit; cleared on next keypress.
     pub error: Option<String>,
@@ -181,8 +181,15 @@ fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &Ui
     let text = if ui.quit_armed {
         "press Esc again to quit".to_string()
     } else {
-        let secret = if snap.pin_mode { "PIN" } else { "token" };
-        format!("l logs · w dump · h show/hide {secret} · Esc Esc quit")
+        // The show/hide-secret hint only makes sense while listening — there is no node
+        // id / PIN / token banner to toggle before the serve half is up.
+        let (listen, secret_hint) = if snap.listening {
+            let secret = if snap.pin_mode { "PIN" } else { "token" };
+            ("Shift+L stop listening", format!(" · h show/hide {secret}"))
+        } else {
+            ("Shift+L start listening", String::new())
+        };
+        format!("{listen} · l logs · w dump{secret_hint} · Esc Esc quit")
     };
     let para = Paragraph::new(Line::from(Span::styled(
         text,
@@ -193,7 +200,9 @@ fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &Ui
 
 fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
     // In quick PIN mode the rotating-PIN banner replaces the raw token banner entirely.
-    matches!(snap.role, Role::Listen | Role::Both)
+    // Hidden until the serve half is up, since there is nothing to pair with before then.
+    snap.listening
+        && matches!(snap.role, Role::Listen | Role::Both)
         && snap.token_generated
         && !snap.pin_mode
         && !ui.token_banner_hidden
@@ -203,7 +212,8 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
 /// shown once the publisher has minted the first PIN. Like the token banner it auto-hides
 /// after a few minutes and is toggled with `h`.
 fn show_pin_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
-    matches!(snap.role, Role::Listen | Role::Both)
+    snap.listening
+        && matches!(snap.role, Role::Listen | Role::Both)
         && snap.pin_mode
         && snap.current_pin.is_some()
         && !ui.token_banner_hidden
@@ -255,7 +265,7 @@ fn render_header(
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
-    // This peer's identity: mode and (in connect mode) its name.
+    // This peer's identity: mode and (in config mode) its name.
     let mut id_line = vec![
         Span::raw("mode: "),
         Span::styled(mode_label(snap), Style::default().add_modifier(Modifier::BOLD)),
@@ -274,7 +284,8 @@ fn render_header(
         Span::raw("streams: "),
         Span::raw(format!("{}/{}", snap.streams_used, snap.streams_max)),
     ];
-    if let Some(token) = snap.auth_token.as_deref() {
+    // Only meaningful once the serve half is up and there is a live endpoint to pair with.
+    if snap.listening && let Some(token) = snap.auth_token.as_deref() {
         status_line.push(Span::raw("  token fp: "));
         status_line.push(Span::styled(
             crate::auth::token_fingerprint(token),
@@ -282,11 +293,25 @@ fn render_header(
         ));
     }
 
+    // The serve half is started on-demand: before it is up there is no node id to show, so
+    // point the user at Shift+L. `(pending)` covers the brief window after start before the
+    // endpoint reports its id.
+    let node_id_line = if snap.listening {
+        vec![Span::raw("node id: "), Span::raw(endpoint)]
+    } else {
+        vec![Span::styled(
+            "not listening — press Shift+L to start",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]
+    };
+
     let mut lines = vec![
         Line::from(app_line),
         Line::from(id_line),
         Line::from(status_line),
-        Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
+        Line::from(node_id_line),
         dial_header_line(snap, show_dial_hint),
     ];
 
@@ -403,7 +428,7 @@ pub fn render_name_conflict_dialog(frame: &mut Frame, message: &str) {
 
 pub(super) fn mode_label(snap: &AppSnapshot) -> &'static str {
     if snap.nostr_discovery {
-        "connect"
+        "config"
     } else {
         "quick"
     }
@@ -891,6 +916,9 @@ mod tests {
         AppSnapshot {
             role: Role::Both,
             hostname: "test-host".to_string(),
+            // Most existing assertions expect the node id / banners to render, which now
+            // requires the serve half to be up.
+            listening: true,
             token_generated: false,
             nostr_discovery,
             pin_mode: false,
@@ -1019,12 +1047,12 @@ mod tests {
     }
 
     #[test]
-    fn connect_idle_dashboard_shows_mode_name_and_idle_dial() {
+    fn config_idle_dashboard_shows_mode_name_and_idle_dial() {
         let snap = base_snapshot(true, Some("web1"));
 
         let text = render_text(&snap, &UiState::default());
 
-        assert!(text.contains("mode: connect"));
+        assert!(text.contains("mode: config"));
         assert!(text.contains("name: web1"));
         assert!(text.contains("Outbound: not connected"));
         // The connect control hint lives on the dial header line, not the Tunnels box.
@@ -1130,6 +1158,51 @@ mod tests {
 
         assert!(text.contains("auth token:"));
         assert!(text.contains("generated-secret-token"));
+    }
+
+    #[test]
+    fn non_listening_dashboard_prompts_for_shift_l_and_hides_node_id_and_secrets() {
+        // The serve half is started on-demand: until then the header points the user at
+        // Shift+L instead of a node id, and no secret (token banner / PIN) is surfaced.
+        let mut snap = base_snapshot(false, None);
+        snap.listening = false;
+        // A generated token *and* a rotating PIN exist, but neither must show pre-listen.
+        snap.token_generated = true;
+        snap.pin_mode = true;
+        snap.auth_token = Some("generated-secret-token".to_string());
+        snap.current_pin = Some("K7P29QXM".to_string());
+        snap.pin_deadline = Some(Instant::now() + std::time::Duration::from_secs(41));
+        snap.endpoint_id = Some("node-123".to_string());
+
+        let text = render_text(&snap, &UiState::default());
+
+        // Node-id row replaced by the call-to-action; the id itself stays hidden.
+        assert!(text.contains("not listening — press Shift+L to start"));
+        assert!(!text.contains("node id:"));
+        assert!(!text.contains("node-123"));
+        // Both secret banners are suppressed while not listening.
+        assert!(!text.contains("auth token:"), "token banner suppressed pre-listen");
+        assert!(!text.contains("generated-secret-token"));
+        assert!(!text.contains("dial PIN"), "PIN banner suppressed pre-listen");
+        // The token fingerprint line is gated too (nothing to pair with yet).
+        assert!(!text.contains("token fp:"));
+        // Footer offers to start listening and drops the show/hide-secret hint.
+        assert!(text.contains("Shift+L start listening"));
+        assert!(!text.contains("h show/hide"));
+    }
+
+    #[test]
+    fn listening_dashboard_shows_node_id_and_stop_hint() {
+        // The flip side of the idle state: once listening, the node id renders and the
+        // footer offers to stop and to show/hide the secret.
+        let snap = base_snapshot(false, None); // base_snapshot is listening = true
+
+        let text = render_text(&snap, &UiState::default());
+
+        assert!(text.contains("node id: node-123"));
+        assert!(!text.contains("not listening — press Shift+L to start"));
+        assert!(text.contains("Shift+L stop listening"));
+        assert!(text.contains("h show/hide"));
     }
 
     #[test]

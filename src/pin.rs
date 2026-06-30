@@ -12,7 +12,12 @@
 //! `O` → `0` as a courtesy. The canonical form fed to the KDF is the de-grouped uppercase
 //! string.
 //!
-//! Because the PIN is short (~40 bits) and the encrypted record sits on public relays,
+//! The last of the PIN's characters is a **check digit** (a position-weighted sum of the
+//! preceding data characters, mirroring `../secure-send-web`), so a mistyped PIN is
+//! rejected on input rather than silently deriving the wrong key. That leaves 7 random
+//! data characters (~35 bits); the check digit adds no secrecy, only typo rejection.
+//!
+//! Because the PIN is short (~35 bits) and the encrypted record sits on public relays,
 //! the key derivation is deliberately slow and memory-hard (**Argon2id**): a captured
 //! record resists offline brute-force, and the 60-second rotation plus a short record TTL
 //! bound the exposure window.
@@ -24,9 +29,14 @@ use rand::Rng;
 /// Crockford base32 alphabet: digits + uppercase letters minus the ambiguous `I L O U`.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// Number of significant characters in a PIN (the canonical, de-grouped form). 8 Crockford
-/// characters is ~40 bits.
+/// Number of significant characters in a PIN (the canonical, de-grouped form). The last
+/// is a check digit, leaving 7 random data characters (~35 bits).
 pub const PIN_LEN: usize = 8;
+
+/// Trailing characters of a PIN that form the check digit (typo detection).
+const PIN_CHECK_LEN: usize = 1;
+/// Random data characters: the PIN minus its check digit.
+const PIN_DATA_LEN: usize = PIN_LEN - PIN_CHECK_LEN;
 
 /// Rotation period, in seconds. The displayed PIN (and the relay record under it) changes
 /// every bucket; the dialer searches a small window of adjacent buckets.
@@ -43,23 +53,38 @@ const ARGON2_LANES: u32 = 1;
 /// so each rotation derives an independent key.
 const KDF_SALT_DOMAIN: &[u8] = b"duopipe:pin-rendezvous:v1";
 
+/// Position-weighted check character over canonical data chars, mirroring
+/// `../secure-send-web`: `sum(index(c) * (i + 1)) mod 32`, mapped back into the alphabet.
+/// `data` must contain only `ALPHABET` bytes (guaranteed for canonical PINs). It catches
+/// the common single-character typo and many transpositions — it is not a cryptographic
+/// integrity check.
+fn check_char(data: &[u8]) -> u8 {
+    let mut sum: usize = 0;
+    for (i, &b) in data.iter().enumerate() {
+        let idx = ALPHABET.iter().position(|&a| a == b).unwrap_or(0);
+        sum += idx * (i + 1);
+    }
+    ALPHABET[sum % ALPHABET.len()]
+}
+
 /// Generate a fresh random PIN in canonical form (`PIN_LEN` uppercase Crockford chars, no
-/// grouping). Uses rejection sampling so every character is uniform over the 32-symbol
-/// alphabet.
+/// grouping): `PIN_DATA_LEN` uniform random characters followed by a check digit.
 pub fn generate_pin() -> String {
     let mut rng = rand::rng();
     let mut out = String::with_capacity(PIN_LEN);
-    while out.len() < PIN_LEN {
+    while out.len() < PIN_DATA_LEN {
         // 256 is a multiple of 32, so `byte % 32` is already unbiased; no rejection needed.
         let byte: u8 = rng.random();
         out.push(ALPHABET[(byte % 32) as usize] as char);
     }
+    out.push(check_char(out.as_bytes()) as char);
     out
 }
 
 /// Normalize user-typed input to the canonical PIN form, or `None` if it is not a valid
 /// PIN. Strips spaces/dashes, uppercases, maps the look-alikes `I`/`L` → `1` and `O` → `0`,
-/// and requires exactly `PIN_LEN` Crockford characters.
+/// requires exactly `PIN_LEN` Crockford characters, and verifies the trailing check digit
+/// so a typo is rejected here rather than later as a failed lookup.
 pub fn normalize_pin(input: &str) -> Option<String> {
     let mut out = String::with_capacity(PIN_LEN);
     for ch in input.chars() {
@@ -81,7 +106,14 @@ pub fn normalize_pin(input: &str) -> Option<String> {
             return None;
         }
     }
-    (out.len() == PIN_LEN).then_some(out)
+    if out.len() != PIN_LEN {
+        return None;
+    }
+    let (data, check) = out.as_bytes().split_at(PIN_DATA_LEN);
+    if check[0] != check_char(data) {
+        return None; // right shape, wrong check digit => typo
+    }
+    Some(out)
 }
 
 /// Format a canonical PIN for display: uppercase, split into two dash-separated groups
@@ -151,13 +183,33 @@ mod tests {
         }
     }
 
+    /// Build a valid canonical PIN from a 7-char data prefix by appending its check digit.
+    fn pin_with_checksum(data: &str) -> String {
+        assert_eq!(data.len(), PIN_DATA_LEN);
+        let mut out = data.to_string();
+        out.push(check_char(out.as_bytes()) as char);
+        out
+    }
+
     #[test]
     fn normalize_strips_grouping_and_maps_lookalikes() {
+        // Use a valid canonical PIN so the checksum holds while the mapping is exercised.
+        let canonical = pin_with_checksum("K7P29QX"); // 7 data chars + check digit
+        let lower = canonical.to_ascii_lowercase();
+        let mid = PIN_LEN / 2;
         // Dashes/spaces ignored, lowercase uppercased.
-        assert_eq!(normalize_pin("k7p2-9qxm").as_deref(), Some("K7P29QXM"));
-        assert_eq!(normalize_pin(" K7P2 9QXM ").as_deref(), Some("K7P29QXM"));
-        // Look-alikes map to digits.
-        assert_eq!(normalize_pin("iLoO0000").as_deref(), Some("11000000"));
+        let grouped = format!("{}-{}", &lower[..mid], &lower[mid..]);
+        assert_eq!(normalize_pin(&grouped).as_deref(), Some(canonical.as_str()));
+        let spaced = format!(" {} {} ", &canonical[..mid], &canonical[mid..]);
+        assert_eq!(normalize_pin(&spaced).as_deref(), Some(canonical.as_str()));
+
+        // Look-alikes map to digits: data "1100000" typed as "iLoO000".
+        let mapped = pin_with_checksum("1100000");
+        let check = &mapped[PIN_DATA_LEN..];
+        // Re-type the 7 data chars with look-alikes ('i','L'->'1', 'o','O'->'0') and keep
+        // the (look-alike-free) check digit; it must normalize back to the canonical PIN.
+        let typed = format!("iLoO000{check}");
+        assert_eq!(normalize_pin(&typed).as_deref(), Some(mapped.as_str()));
     }
 
     #[test]
@@ -169,22 +221,59 @@ mod tests {
     }
 
     #[test]
+    fn normalize_rejects_single_char_typo() {
+        let pin = generate_pin();
+        // Flip the first data char to a different alphabet symbol; the check digit no
+        // longer matches, so the typo is caught.
+        let first = pin.as_bytes()[0];
+        let replacement = if first == b'0' { '1' } else { '0' };
+        let mut bytes = pin.clone().into_bytes();
+        bytes[0] = replacement as u8;
+        let typoed = String::from_utf8(bytes).unwrap();
+        assert_ne!(typoed, pin);
+        assert!(
+            normalize_pin(&typoed).is_none(),
+            "a single-character typo must fail the checksum"
+        );
+    }
+
+    #[test]
+    fn generated_pins_always_validate() {
+        for _ in 0..200 {
+            let pin = generate_pin();
+            assert_eq!(
+                normalize_pin(&pin).as_deref(),
+                Some(pin.as_str()),
+                "a freshly generated PIN must pass its own checksum"
+            );
+        }
+    }
+
+    #[test]
     fn format_groups_into_two_halves() {
-        assert_eq!(format_pin("K7P29QXM"), "K7P2-9QXM");
+        let canonical = pin_with_checksum("K7P29QX");
+        let mid = PIN_LEN / 2;
+        let expected = format!("{}-{}", &canonical[..mid], &canonical[mid..]);
+        assert_eq!(format_pin(&canonical), expected);
         // Round-trips back through normalize.
-        assert_eq!(normalize_pin(&format_pin("K7P29QXM")).as_deref(), Some("K7P29QXM"));
+        assert_eq!(
+            normalize_pin(&format_pin(&canonical)).as_deref(),
+            Some(canonical.as_str())
+        );
     }
 
     #[test]
     fn key_material_is_deterministic_and_bucket_pin_specific() {
-        let a = derive_key_material("K7P29QXM", 100).unwrap();
-        let a_again = derive_key_material("K7P29QXM", 100).unwrap();
+        let pin = pin_with_checksum("K7P29QX");
+        let a = derive_key_material(&pin, 100).unwrap();
+        let a_again = derive_key_material(&pin, 100).unwrap();
         assert_eq!(a, a_again, "same pin + bucket must derive the same key");
 
-        let other_bucket = derive_key_material("K7P29QXM", 101).unwrap();
+        let other_bucket = derive_key_material(&pin, 101).unwrap();
         assert_ne!(a, other_bucket, "a different bucket must derive a different key");
 
-        let other_pin = derive_key_material("9QXMK7P2", 100).unwrap();
-        assert_ne!(a, other_pin, "a different pin must derive a different key");
+        let other_pin = pin_with_checksum("9QXMK7P");
+        let other = derive_key_material(&other_pin, 100).unwrap();
+        assert_ne!(a, other, "a different pin must derive a different key");
     }
 }

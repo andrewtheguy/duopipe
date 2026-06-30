@@ -22,6 +22,7 @@ use crate::logging::LogBuffer;
 const TUNNEL_COMMAND_CAPACITY: usize = 64;
 const DIAL_COMMAND_CAPACITY: usize = 16;
 const NAME_COMMAND_CAPACITY: usize = 8;
+const LISTEN_COMMAND_CAPACITY: usize = 8;
 
 /// A request to start or stop this peer's single tunnel. Sent by the TUI,
 /// consumed by the connection supervisor.
@@ -39,6 +40,15 @@ pub enum DialCommand {
     Connect(DialTarget),
     /// Tear down the current dial session and return to idle.
     Disconnect,
+}
+
+/// A request to start or stop this peer's serve (listen) half. Sent by the TUI when the
+/// user presses Shift+L, consumed by `run_listen_supervisor`. The serve half does not
+/// auto-start; it idles until a `Start` arrives.
+#[derive(Debug, Clone, Copy)]
+pub enum ListenCommand {
+    Start,
+    Stop,
 }
 
 /// A user decision on a nostr name conflict, sent by the TUI's conflict prompt to the
@@ -72,7 +82,7 @@ pub enum NameConflict {
 }
 
 /// What to dial, as typed at runtime: a full node id (quick manual mode), a peer name
-/// looked up via nostr (connect mode), or a rotating PIN resolved via nostr to the peer's
+/// looked up via nostr (config mode), or a rotating PIN resolved via nostr to the peer's
 /// node id + auth token (quick PIN mode).
 #[derive(Debug, Clone)]
 pub enum DialTarget {
@@ -187,6 +197,17 @@ impl PathInfo {
     }
 }
 
+/// Lifecycle status of the serve (listen) half. Unlike the tunnel, the serve half does
+/// not auto-start: it begins `Stopped` and the user toggles it with Shift+L.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ListenStatus {
+    /// Not listening: no public endpoint, no node id / PIN / token displayed.
+    #[default]
+    Stopped,
+    /// The serve endpoint is up (or coming up) and accepting inbound peers.
+    Listening,
+}
+
 /// Lifecycle status of a configured tunnel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TunnelStatus {
@@ -269,6 +290,10 @@ pub struct AppState {
     tunnel_tx: broadcast::Sender<TunnelCommand>,
     /// Broadcast channel for dial connect/disconnect commands (TUI -> dial manager).
     dial_tx: broadcast::Sender<DialCommand>,
+    /// Broadcast channel for serve-half start/stop commands (TUI -> listen supervisor).
+    listen_tx: broadcast::Sender<ListenCommand>,
+    /// Current status of the serve (listen) half. Starts `Stopped`; toggled by Shift+L.
+    listen_status: RwLock<ListenStatus>,
     /// Broadcast channel for name-conflict decisions (TUI -> node-id publisher).
     name_tx: broadcast::Sender<NameCommand>,
     /// Current nostr name-conflict state, surfaced to the TUI.
@@ -276,12 +301,12 @@ pub struct AppState {
     /// Display string for the current dial target (`Some` while a session is up or
     /// being established), shown in the header. `None` when idle (serving only).
     dial_target: RwLock<Option<String>>,
-    /// Whether nostr discovery is active (connect mode). Read by the connect prompt to
+    /// Whether nostr discovery is active (config mode). Read by the connect prompt to
     /// decide whether the user types a peer name (true) or a node id (false).
     pub nostr_discovery: bool,
     /// Quick mode's nostr PIN signaling: the listener publishes a rotating PIN carrying its
     /// node id + token, and the connect prompt asks for a PIN instead of a node id. `false`
-    /// in connect mode and in quick manual (copy-paste) mode.
+    /// in config mode and in quick manual (copy-paste) mode.
     pub pin_mode: bool,
     /// The current rotating PIN (canonical form) and the instant it rolls over, set by the
     /// PIN publisher each rotation. Drives the PIN + refresh-countdown header in PIN mode.
@@ -307,6 +332,7 @@ impl AppState {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
         let (name_tx, _) = broadcast::channel(NAME_COMMAND_CAPACITY);
+        let (listen_tx, _) = broadcast::channel(LISTEN_COMMAND_CAPACITY);
         Arc::new(Self {
             role,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -323,6 +349,8 @@ impl AppState {
             streams_max: RwLock::new(0),
             tunnel_tx,
             dial_tx,
+            listen_tx,
+            listen_status: RwLock::new(ListenStatus::Stopped),
             name_tx,
             name_conflict: RwLock::new(NameConflict::Inactive),
             dial_target: RwLock::new(None),
@@ -357,6 +385,53 @@ impl AppState {
     /// (the manager hasn't started yet or has exited), so the caller can surface it.
     pub fn send_dial(&self, cmd: DialCommand) -> bool {
         self.dial_tx.send(cmd).is_ok()
+    }
+
+    /// Subscribe to serve-half commands. The listen supervisor subscribes once at startup.
+    pub fn subscribe_listen(&self) -> broadcast::Receiver<ListenCommand> {
+        self.listen_tx.subscribe()
+    }
+
+    /// Current serve-half status.
+    pub fn listen_status(&self) -> ListenStatus {
+        *self.listen_status.read()
+    }
+
+    /// Whether the serve half is currently up (drives node-id / PIN / token display).
+    pub fn listening(&self) -> bool {
+        matches!(self.listen_status(), ListenStatus::Listening)
+    }
+
+    /// Set the serve-half status (listen supervisor -> TUI).
+    pub fn set_listen_status(&self, status: ListenStatus) {
+        *self.listen_status.write() = status;
+    }
+
+    /// Toggle the serve half from the TUI (Shift+L): start it when stopped, stop it when
+    /// listening. The supervisor guards against redundant Start/Stop, so a stale read here
+    /// is harmless.
+    pub fn toggle_listen(&self) {
+        let cmd = match self.listen_status() {
+            ListenStatus::Stopped => ListenCommand::Start,
+            ListenStatus::Listening => ListenCommand::Stop,
+        };
+        let _ = self.listen_tx.send(cmd);
+    }
+
+    /// Tear down the serve half's surfaced state once it has stopped: back to `Stopped`,
+    /// drop the displayed node id, and clear any rotating PIN (a fresh start mints new
+    /// ones). Also drops the inbound peer rows (added only by the listener side) and any
+    /// nostr name-conflict prompt/warning (raised only by the serve half's publisher):
+    /// their owning tasks are aborted on stop and don't run their own cleanup, so without
+    /// this the TUI would show stale peers/conflicts after the serve half is down. The auth
+    /// token value is left seeded — the UI gates its display on `listening()` instead.
+    pub fn clear_listen(&self) {
+        *self.listen_status.write() = ListenStatus::Stopped;
+        *self.endpoint_id.write() = None;
+        *self.current_pin.write() = None;
+        *self.pin_deadline.write() = None;
+        self.peers.write().clear();
+        *self.name_conflict.write() = NameConflict::Inactive;
     }
 
     /// Subscribe to name-conflict decisions. The node-id publisher subscribes once.
@@ -526,6 +601,7 @@ impl AppState {
         AppSnapshot {
             role: self.role,
             hostname: self.hostname.clone(),
+            listening: self.listening(),
             token_generated: self.token_generated,
             nostr_discovery: self.nostr_discovery,
             pin_mode: self.pin_mode,
@@ -550,6 +626,9 @@ impl AppState {
 pub struct AppSnapshot {
     pub role: Role,
     pub hostname: String,
+    /// Whether the serve half is currently up. `false` until the user presses Shift+L;
+    /// gates the node-id / PIN / auth-token display.
+    pub listening: bool,
     pub token_generated: bool,
     pub nostr_discovery: bool,
     pub pin_mode: bool,

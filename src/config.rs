@@ -51,12 +51,12 @@ pub struct PeerConfig {
     /// another pairing's token. Case-insensitive.
     pub auth_token_fingerprint: Option<String>,
     /// This peer's short, memorable identifier for nostr discovery. Required in
-    /// connect mode: a listener publishes its node id under this name, and a dialer
+    /// config mode: a listener publishes its node id under this name, and a dialer
     /// types it to look the peer up — so several peers can share one auth token and
     /// still be reached individually. Must be ASCII letters, digits, and underscores
     /// only (see [`validate_name`]); it is used verbatim in the local state-file path.
     pub name: Option<String>,
-    /// Nostr relay URLs used for node-id discovery (connect mode only). Absent ⇒ a
+    /// Nostr relay URLs used for node-id discovery (config mode only). Absent ⇒ a
     /// built-in set of public relays (see `nostr_discovery::DEFAULT_NOSTR_RELAYS`).
     pub nostr_relay_urls: Option<Vec<String>>,
     /// Transport layer tuning (congestion control, buffer sizes).
@@ -77,7 +77,7 @@ pub struct TunnelEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
-    /// TOML config file on disk (connect mode).
+    /// TOML config file on disk (config mode).
     File,
     /// No config, defaults only
     None,
@@ -396,7 +396,7 @@ impl PeerConfig {
             validate_tunnel_spec(tunnel)?;
         }
         validate_transport_tuning(&self.transport, "transport")?;
-        // A name is only required in connect mode (checked at startup), but if one is
+        // A name is only required in config mode (checked at startup), but if one is
         // set it must be a valid identifier — it is used verbatim in the state path.
         if let Some(name) = &self.name {
             validate_name(name)?;

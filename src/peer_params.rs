@@ -12,7 +12,7 @@ use crate::app_state::Role;
 ///
 /// Invariants (enforced where constructed):
 /// - `Dial` ⇒ `auth_token` passed `validate_token`, and exactly one target is set:
-///   `peer_node_id` (quick mode, entered directly) or `peer_identifier` (connect mode,
+///   `peer_node_id` (quick mode, entered directly) or `peer_identifier` (config mode,
 ///   the target peer's name, resolved to a node id at runtime via `auth_token`).
 /// - `Listen` ⇒ `peer_node_id` and `peer_identifier` are `None`; `auth_token` is a
 ///   valid supplied token or a freshly generated one.
@@ -23,7 +23,7 @@ use crate::app_state::Role;
 #[derive(Clone)]
 pub struct ResolvedPeer {
     pub role: Role,
-    /// Target node id (quick-mode dial), or `None` in connect mode where the target is
+    /// Target node id (quick-mode dial), or `None` in config mode where the target is
     /// named by `peer_identifier`.
     pub peer_node_id: Option<EndpointId>,
     /// Target peer's nostr identifier (nostr-mode dial), looked up at runtime. `None`
@@ -35,7 +35,7 @@ pub struct ResolvedPeer {
     pub token_generated: bool,
     /// Quick mode only. When true, nostr PIN signaling is used: the listener shares its node
     /// id and token via a rotating PIN and the dialer types a PIN. When false, the manual
-    /// copy-paste flow is used (node id entered by hand). Always false in connect mode and in
+    /// copy-paste flow is used (node id entered by hand). Always false in config mode and in
     /// headless test mode.
     pub quick_pin: bool,
 }

@@ -50,7 +50,7 @@ pub struct TuiLaunch {
     /// A valid auth token from config/env (pre-seeds the dial flow; used directly
     /// for listen). Pre-validated in main.
     pub config_auth_token: Option<String>,
-    /// Expected token fingerprint declared by a connect-mode config (`auth_token_fingerprint`),
+    /// Expected token fingerprint declared by a config-mode config (`auth_token_fingerprint`),
     /// already validated in main. When set, a token pasted at the setup screen must match
     /// it. `None` in quick mode.
     pub expected_token_fingerprint: Option<String>,
@@ -60,9 +60,9 @@ pub struct TuiLaunch {
     /// looks up). The iroh identity is always ephemeral regardless.
     pub nostr_discovery: bool,
     /// This peer's own short identifier (config `name`), published under when
-    /// listening in connect mode. `None` in quick mode.
+    /// listening in config mode. `None` in quick mode.
     pub peer_name: Option<String>,
-    /// Path to the loaded peer config file (connect mode), for the name-conflict rename
+    /// Path to the loaded peer config file (config mode), for the name-conflict rename
     /// nudge. `None` in quick mode.
     pub config_path: Option<std::path::PathBuf>,
 }
@@ -327,8 +327,9 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     false
 }
 
-/// Home-screen keys. `Shift` is reserved for the dial-session lifecycle
-/// (`Shift-C` connect / `Shift-D` disconnect); tunnel actions are plain keys.
+/// Home-screen keys. `Shift` is reserved for session lifecycle (`Shift-L` start/stop the
+/// serve half, `Shift-C` connect / `Shift-D` disconnect the dial session); tunnel actions
+/// are plain keys.
 ///
 /// The tunnel belongs to the combined node's outbound dial session; a pure listen-only
 /// half shows only its connected peers. `e` opens the set-tunnel modal (set or replace
@@ -338,6 +339,12 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
 /// `Enter`/`Space` are intentionally inert here.
 fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     match key.code {
+        // Start / stop the serve half (Shift+L). It does not auto-start: this is the only
+        // way to bring up the node id, PIN, and auth-token display. Toggling stop tears the
+        // endpoint down; a later start mints a fresh ephemeral id.
+        KeyCode::Char('L') if state.role == Role::Both => {
+            state.toggle_listen();
+        }
         // Connect / re-point the on-demand dial session (interactive serve+dial mode).
         KeyCode::Char('C') if state.role == Role::Both => {
             ui.connect_form = Some(ConnectForm::default());
@@ -546,7 +553,7 @@ fn handle_connect_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
 }
 
 /// Validate the connect modal's target and, on success, set the display target and
-/// dispatch `DialCommand::Connect` (replacing any current session). In connect mode the
+/// dispatch `DialCommand::Connect` (replacing any current session). In config mode the
 /// entry is a peer name (rejecting our own); in quick mode a node id (rejecting our own
 /// published id).
 fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
@@ -583,7 +590,7 @@ fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
             Some(canonical) => DialTarget::Pin(canonical),
             None => {
                 form.error = Some(format!(
-                    "That is not a valid {}-character PIN",
+                    "That is not a valid {}-character PIN (check for a typo)",
                     crate::pin::PIN_LEN
                 ));
                 return;
@@ -733,11 +740,13 @@ mod tests {
 
         // A dashed, lowercase PIN passes normalization+validation; with no dial manager
         // running the only remaining error is the dial-manager one (i.e. it got that far).
+        // Generate a real PIN so it carries a valid check digit, then group + lowercase it.
+        let valid_pin = crate::pin::format_pin(&crate::pin::generate_pin()).to_ascii_lowercase();
         let mut ui = UiState {
             connect_form: Some(ConnectForm::default()),
             ..Default::default()
         };
-        type_connect_target(&mut ui, &st, "k7p2-9qxm");
+        type_connect_target(&mut ui, &st, &valid_pin);
         handle_connect_form(key(KeyCode::Enter), &mut ui, &st);
         let form = ui.connect_form.as_ref().expect("form stays open");
         assert_eq!(
@@ -1102,7 +1111,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("dump contents");
         let _ = std::fs::remove_file(&path);
 
-        assert!(text.contains("mode:      connect"));
+        assert!(text.contains("mode:      config"));
         assert!(text.contains("name:      web1"));
         assert!(text.contains("outbound:  not connected"));
         assert!(!text.contains("role:"));
