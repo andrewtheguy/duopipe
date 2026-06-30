@@ -301,7 +301,9 @@ fn render_header(
     } else {
         vec![Span::styled(
             "not listening — press Shift+L to start",
-            Style::default().fg(Color::DarkGray),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )]
     };
 
