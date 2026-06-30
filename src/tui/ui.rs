@@ -181,8 +181,15 @@ fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &Ui
     let text = if ui.quit_armed {
         "press Esc again to quit".to_string()
     } else {
-        let secret = if snap.pin_mode { "PIN" } else { "token" };
-        format!("l logs · w dump · h show/hide {secret} · Esc Esc quit")
+        // The show/hide-secret hint only makes sense while listening — there is no node
+        // id / PIN / token banner to toggle before the serve half is up.
+        let (listen, secret_hint) = if snap.listening {
+            let secret = if snap.pin_mode { "PIN" } else { "token" };
+            ("Shift+L stop listening", format!(" · h show/hide {secret}"))
+        } else {
+            ("Shift+L start listening", String::new())
+        };
+        format!("{listen} · l logs · w dump{secret_hint} · Esc Esc quit")
     };
     let para = Paragraph::new(Line::from(Span::styled(
         text,
@@ -193,7 +200,9 @@ fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &Ui
 
 fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
     // In quick PIN mode the rotating-PIN banner replaces the raw token banner entirely.
-    matches!(snap.role, Role::Listen | Role::Both)
+    // Hidden until the serve half is up, since there is nothing to pair with before then.
+    snap.listening
+        && matches!(snap.role, Role::Listen | Role::Both)
         && snap.token_generated
         && !snap.pin_mode
         && !ui.token_banner_hidden
@@ -203,7 +212,8 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
 /// shown once the publisher has minted the first PIN. Like the token banner it auto-hides
 /// after a few minutes and is toggled with `h`.
 fn show_pin_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
-    matches!(snap.role, Role::Listen | Role::Both)
+    snap.listening
+        && matches!(snap.role, Role::Listen | Role::Both)
         && snap.pin_mode
         && snap.current_pin.is_some()
         && !ui.token_banner_hidden
@@ -274,7 +284,8 @@ fn render_header(
         Span::raw("streams: "),
         Span::raw(format!("{}/{}", snap.streams_used, snap.streams_max)),
     ];
-    if let Some(token) = snap.auth_token.as_deref() {
+    // Only meaningful once the serve half is up and there is a live endpoint to pair with.
+    if snap.listening && let Some(token) = snap.auth_token.as_deref() {
         status_line.push(Span::raw("  token fp: "));
         status_line.push(Span::styled(
             crate::auth::token_fingerprint(token),
@@ -282,11 +293,23 @@ fn render_header(
         ));
     }
 
+    // The serve half is started on-demand: before it is up there is no node id to show, so
+    // point the user at Shift+L. `(pending)` covers the brief window after start before the
+    // endpoint reports its id.
+    let node_id_line = if snap.listening {
+        vec![Span::raw("node id: "), Span::raw(endpoint)]
+    } else {
+        vec![Span::styled(
+            "not listening — press Shift+L to start",
+            Style::default().fg(Color::DarkGray),
+        )]
+    };
+
     let mut lines = vec![
         Line::from(app_line),
         Line::from(id_line),
         Line::from(status_line),
-        Line::from(vec![Span::raw("node id: "), Span::raw(endpoint)]),
+        Line::from(node_id_line),
         dial_header_line(snap, show_dial_hint),
     ];
 
@@ -891,6 +914,9 @@ mod tests {
         AppSnapshot {
             role: Role::Both,
             hostname: "test-host".to_string(),
+            // Most existing assertions expect the node id / banners to render, which now
+            // requires the serve half to be up.
+            listening: true,
             token_generated: false,
             nostr_discovery,
             pin_mode: false,

@@ -327,8 +327,9 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     false
 }
 
-/// Home-screen keys. `Shift` is reserved for the dial-session lifecycle
-/// (`Shift-C` connect / `Shift-D` disconnect); tunnel actions are plain keys.
+/// Home-screen keys. `Shift` is reserved for session lifecycle (`Shift-L` start/stop the
+/// serve half, `Shift-C` connect / `Shift-D` disconnect the dial session); tunnel actions
+/// are plain keys.
 ///
 /// The tunnel belongs to the combined node's outbound dial session; a pure listen-only
 /// half shows only its connected peers. `e` opens the set-tunnel modal (set or replace
@@ -338,6 +339,12 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
 /// `Enter`/`Space` are intentionally inert here.
 fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     match key.code {
+        // Start / stop the serve half (Shift+L). It does not auto-start: this is the only
+        // way to bring up the node id, PIN, and auth-token display. Toggling stop tears the
+        // endpoint down; a later start mints a fresh ephemeral id.
+        KeyCode::Char('L') if state.role == Role::Both => {
+            state.toggle_listen();
+        }
         // Connect / re-point the on-demand dial session (interactive serve+dial mode).
         KeyCode::Char('C') if state.role == Role::Both => {
             ui.connect_form = Some(ConnectForm::default());

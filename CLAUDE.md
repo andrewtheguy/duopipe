@@ -13,10 +13,11 @@ duopipe is for a **single user connecting their own devices** (laptop ↔ homela
 ↔ VPS, …) to reach services across them — the same auth token lives on each of the
 user's machines. It is not a public service or a multi-tenant gateway.
 
-It is interactive: every run is **always listening** and holds **one** on-demand
+It is interactive: the serve (listen) half starts **on-demand** when the user presses
+**Shift+L** (a toggle; it does not auto-start), and each run holds **one** on-demand
 outbound dial session. Two interactive subcommands — `duopipe quick` (configless,
 dial by node id) and `duopipe connect` (config-driven, dial by `name`). Headless test
-mode is gated by `DUOPIPE_TEST_MODE=1`.
+mode is gated by `DUOPIPE_TEST_MODE=1` and still auto-listens.
 
 **Scope (v1):** a dial session forwards exactly **one TCP** stream — the single
 `[tunnel]` (`remote_source` / `local_listen`, both bare `host:port`). This is the

@@ -31,15 +31,15 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 
 ## Overview
 
-duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe connect` (config-driven) — each of which opens an interactive terminal UI. Every instance is **always listening**: it accepts **many inbound peers at once** over one iroh endpoint and serves their tunnel request. Alongside that, each instance can hold **one outbound dial session** that *it* drives — SSH `-L`–style local forwarding: it binds a local listener and asks the connected peer to connect out to a remote source. Each individual connection is one-directional (one requester, one server); your process is just both at once.
+duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe connect` (config-driven) — each of which opens an interactive terminal UI. The dashboard opens **idle**: press **`Shift-L`** to start listening, and it then accepts **many inbound peers at once** over one iroh endpoint and serves their tunnel request (press `Shift-L` again to stop). Alongside that, each instance can hold **one outbound dial session** that *it* drives — SSH `-L`–style local forwarding: it binds a local listener and asks the connected peer to connect out to a remote source. Dialing is available immediately, even before listening is started. Each individual connection is one-directional (one requester, one server); your process is just both at once.
 
 > **Note:** v1 forwards a **single TCP stream** per dial session — one `remote_source` reached through one `local_listen`. A single SOCKS5 listener (so one tunnel can reach many destinations) is the planned future direction, modeled on [flextunnel](https://github.com/andrewtheguy/flextunnel). UDP is intentionally out of scope; that role belongs to [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs).
 
-There is **no listen/dial choice at startup**. Quick mode always generates a fresh ephemeral token and at setup you pick how to share this device: **PIN** (the dashboard shows a short code that refreshes every 60s and carries this peer's node id + token over nostr — the dialer just types the PIN) or **Manual** (no nostr/internet — the node id + token are shown to copy by hand). Connect mode uses a pre-shared token you generated with `duopipe generate-auth-token`, supplied via config/env or pasted at setup. Then the dashboard opens, already listening. To dial a peer, press **`Shift-C`** and type the target — its `name` in connect mode, a **PIN** in quick PIN mode, or its **node id** in quick manual mode; press **`Shift-D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time.
+There is **no listen/dial choice at startup**. Quick mode always generates a fresh ephemeral token and at setup you pick how to share this device: **PIN** (once listening, the dashboard shows a short code that refreshes every 60s and carries this peer's node id + token over nostr — the dialer just types the PIN) or **Manual** (no nostr/internet — the node id + token are shown to copy by hand). Connect mode uses a pre-shared token you generated with `duopipe generate-auth-token`, supplied via config/env or pasted at setup. Then the dashboard opens **idle** — press **`Shift-L`** to start listening (which brings up the node id, the PIN/token, and the nostr/PIN publishers), and `Shift-L` again to stop. Because the iroh identity is ephemeral, a stop→start cycle mints a **new** node id and a **new** PIN. To dial a peer, press **`Shift-C`** and type the target — its `name` in connect mode, a **PIN** in quick PIN mode, or its **node id** in quick manual mode; press **`Shift-D`** to disconnect. Dialing works even before you start listening. You can disconnect and dial a different peer at any time — one outbound session at a time.
 
-- The TUI header shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256, shown in every mode so you can confirm both devices match). In quick **PIN** mode it shows the **current PIN** (which refreshes every 60s, with a small countdown to the next refresh); in quick **manual** mode it shows the full **auth token** to copy. Either secret **auto-hides after 10 minutes** — the line also shows the absolute clock time it will hide at — and **`h` toggles it off/on at any time** (re-showing re-arms the 10-minute timer).
+- Press **`Shift-L`** to start listening; until you do, the node-id line reads *not listening — press Shift+L to start* and no PIN or token banner is shown. Once listening, the TUI header shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256, shown in every mode so you can confirm both devices match). In quick **PIN** mode it then shows the **current PIN** (which refreshes every 60s, with a small countdown to the next refresh); in quick **manual** mode it shows the full **auth token** to copy. Either secret **auto-hides after 10 minutes** — the line also shows the absolute clock time it will hide at — and **`h` toggles it off/on at any time** (re-showing re-arms the 10-minute timer). Pressing `Shift-L` again stops listening (and, because the identity is ephemeral, a later restart mints a new node id and PIN).
 - The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated/entered at setup.
-- The dashboard shows a **single tunnel row** (there is no list to navigate). Press **`s`** to start the listener and **`x`** to stop it — starting is its own deliberate key, never `Enter`, so a stray press can't begin forwarding; press **`e`** to open the **set-tunnel** form — two fields only, the remote source (`host:port`) and the local listen (`host:port`), with no protocol picker and no name field (saving only *sets* the spec — it does not start it); press **`d`** (or **`Del`**) to clear the tunnel. (`Shift` is reserved for the dial session: **`Shift-C`** connect, **`Shift-D`** disconnect.)
+- The dashboard shows a **single tunnel row** (there is no list to navigate). Press **`s`** to start the listener and **`x`** to stop it — starting is its own deliberate key, never `Enter`, so a stray press can't begin forwarding; press **`e`** to open the **set-tunnel** form — two fields only, the remote source (`host:port`) and the local listen (`host:port`), with no protocol picker and no name field (saving only *sets* the spec — it does not start it); press **`d`** (or **`Del`**) to clear the tunnel. (`Shift` drives the serve half and the dial session: **`Shift-L`** start/stop listening, **`Shift-C`** connect, **`Shift-D`** disconnect.)
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In connect mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
 
@@ -143,7 +143,7 @@ Intel macOS is supported when building from source.
 
 ## Peer Identity
 
-The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **connect mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, each listener publishes its current node id under its `name`, and a dialer looks it up by typing the target peer's `name` (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe quick`) you pick at setup between two ways to share the node id: a rotating **PIN** over nostr (which also carries the token; see [Quick-mode PIN](#quick-mode-pin)) or **manual** copy-paste with nostr off. The node id is always shown in the TUI header.
+The iroh identity is **ephemeral** — duopipe generates a fresh identity on every run, so there is no key file to create or manage. The **listening** peer's **node id therefore changes every run**. In **connect mode** (when a config file is loaded), duopipe avoids copying it by hand each time by using **nostr** as a side channel: both peers derive a shared nostr key from the auth token, each listener publishes its current node id under its `name`, and a dialer looks it up by typing the target peer's `name` (see [Node-id discovery](#node-id-discovery)). In **configless mode** (`duopipe quick`) you pick at setup between two ways to share the node id: a rotating **PIN** over nostr (which also carries the token; see [Quick-mode PIN](#quick-mode-pin)) or **manual** copy-paste with nostr off. The node id is shown in the TUI header once you start listening (`Shift-L`).
 
 ## Authentication
 
@@ -166,7 +166,7 @@ Generate auth tokens with: `duopipe generate-auth-token`
 
 ### Token Management
 
-In configless quick mode, when the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. You can also mint tokens ahead of time:
+In configless quick mode, when the listening peer starts without a configured auth token, it **generates one automatically** and — once you start listening (`Shift-L`) — displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token
@@ -193,7 +193,7 @@ remote_source = "127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 ```
 
-The instance always listens; the dial target is chosen **interactively** at runtime (press `Shift-C`), not in the config file. The `[tunnel]` entry is the template for that dial session, started/stopped from the TUI — nothing forwards automatically.
+Listening is started on demand from the TUI (press `Shift-L`); the dial target is chosen **interactively** at runtime (press `Shift-C`), not in the config file. The `[tunnel]` entry is the template for that dial session, started/stopped from the TUI — nothing forwards automatically.
 
 ---
 
@@ -217,7 +217,7 @@ For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe connect` (config-driven, with node-id discovery) on both machines. Each instance is always listening; you dial the other on demand from the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); the dial target is chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
+duopipe is **interactive-first**: you run `duopipe connect` (config-driven, with node-id discovery) on both machines. On each, press `Shift-L` to start listening; you dial the other on demand from the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); the dial target is chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
 
 ### 1. Start both instances
 
@@ -227,7 +227,7 @@ On each machine, point at a config that declares its requests (see [Configuratio
 duopipe connect -c ./peer.toml
 ```
 
-There is no role prompt — setup just confirms the token and the dashboard opens, already listening. Each config must set a `name`. The auth token may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to **paste it** — so `auth_token_file` is optional. The token is a pre-shared secret: generate it once with `duopipe generate-auth-token` and use the same value on every peer (connect setup does not generate one for you). Each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token even after the full token is hidden.
+There is no role prompt — setup just confirms the token and the dashboard opens **idle**; press `Shift-L` to start listening. Each config must set a `name`. The auth token may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to **paste it** — so `auth_token_file` is optional. The token is a pre-shared secret: generate it once with `duopipe generate-auth-token` and use the same value on every peer (connect setup does not generate one for you). Once listening, each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header then shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token even after the full token is hidden.
 
 > **Important:** The node id is regenerated on every run (the identity is ephemeral), but in connect mode you don't copy it by hand — peers find each other by `name`.
 
@@ -295,14 +295,14 @@ In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **
 
 ## CLI Options
 
-Both interactive subcommands launch the same always-listening TUI; they differ only in how the connect prompt names a target. In `quick`, press `Shift-C` and enter the peer's **PIN** (PIN signaling) or its **node id** (manual signaling). In `connect`, press `Shift-C` and enter the peer's `name`. Headless test mode is the only path with a fixed listen/dial role (see [Test mode (testing only)](#test-mode-testing-only)).
+Both interactive subcommands launch the same TUI — idle at startup, with listening started on demand by `Shift-L`; they differ only in how the connect prompt names a target. In `quick`, press `Shift-C` and enter the peer's **PIN** (PIN signaling) or its **node id** (manual signaling). In `connect`, press `Shift-C` and enter the peer's `name`. Headless test mode is the only path with a fixed listen/dial role (see [Test mode (testing only)](#test-mode-testing-only)).
 
 ### quick (configless mode)
 
 `duopipe quick` runs everything ephemeral with **no config file**: the node id and auth token are generated fresh on every run, and there is no way to supply an existing token. (`DUOPIPE_AUTH_TOKEN` is honored only under `DUOPIPE_TEST_MODE=1`; see [Test mode](#test-mode-testing-only).) It takes **no options** — instead, the setup screen offers two ways to share this device with the dialer:
 
-- **Start with PIN** — uses **nostr** (needs internet). The dashboard shows a short, easy-to-type code that **refreshes every 60s with a countdown**; it carries this peer's node id *and* token, so to connect the other device just presses `Shift-C` and types the **PIN**. See [Quick-mode PIN](#quick-mode-pin).
-- **Start manual** — **no nostr/internet**. The node id and auth token are shown in the dashboard header to copy by hand; to connect, the other device presses `Shift-C` and enters the **node id** (the token must be moved out of band).
+- **Start with PIN** — uses **nostr** (needs internet). Once you start listening (`Shift-L`), the dashboard shows a short, easy-to-type code that **refreshes every 60s with a countdown**; it carries this peer's node id *and* token, so to connect the other device just presses `Shift-C` and types the **PIN**. See [Quick-mode PIN](#quick-mode-pin).
+- **Start manual** — **no nostr/internet**. Once you start listening (`Shift-L`), the node id and auth token are shown in the dashboard header to copy by hand; to connect, the other device presses `Shift-C` and enters the **node id** (the token must be moved out of band).
 
 <a name="quick-mode-pin"></a>
 #### Quick-mode PIN
@@ -340,7 +340,7 @@ Config files are used by `duopipe connect`: run it with no flag to load the defa
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-`duopipe connect` requires a `name` and an `auth_token_fingerprint`; the auth token itself is optional in the config (supply it via `auth_token_file`/`DUOPIPE_AUTH_TOKEN`, or paste it at setup — generate it first with `duopipe generate-auth-token` and pre-share it). The resolved token must match `auth_token_fingerprint`, which pins the config to one pairing. The config holds the tunnel request, the token fingerprint, the optional path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The instance always listens; the **dial target** is chosen interactively at runtime (press `Shift-C`), not in the config.
+`duopipe connect` requires a `name` and an `auth_token_fingerprint`; the auth token itself is optional in the config (supply it via `auth_token_file`/`DUOPIPE_AUTH_TOKEN`, or paste it at setup — generate it first with `duopipe generate-auth-token` and pre-share it). The resolved token must match `auth_token_fingerprint`, which pins the config to one pairing. The config holds the tunnel request, the token fingerprint, the optional path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. Listening is started on demand from the TUI (press `Shift-L`); the **dial target** is chosen interactively at runtime (press `Shift-C`), not in the config.
 
 ### Node-id discovery
 
@@ -369,7 +369,7 @@ The connection-level receive window uses iroh's default. If `send_window` is omi
 
 ### Peer Config Example
 
-The same config shape is used by both peers. Every interactive run serves from launch; the outbound dial target is chosen later from the dashboard.
+The same config shape is used by both peers. Each interactive run starts listening on demand (`Shift-L`); the outbound dial target is chosen later from the dashboard.
 
 ```toml
 # Example peer configuration.
@@ -436,7 +436,7 @@ duopipe generate-auth-token -c 5 --json
 
 Auth token format: `d` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 47 characters total. The 8-hex-digit `fingerprint` (the prefix of the token's SHA-256) is what goes in a connect-mode config's `auth_token_fingerprint`.
 
-> **Note:** A listening instance that starts without a configured token generates one automatically and shows it in the TUI header, so generating one ahead of time is optional.
+> **Note:** A quick-mode instance that starts without a configured token generates one automatically and shows it in the TUI header once you start listening (`Shift-L`), so generating one ahead of time is optional.
 
 ---
 
@@ -465,8 +465,8 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 ## How It Works
 
 ### iroh Mode
-1. On startup the instance begins listening immediately (no role prompt); the identity is freshly generated. A dial session is started later from the TUI (`c`)
-2. The instance creates an iroh endpoint with discovery services and publishes its address via Pkarr/DNS; its node id is shown in the TUI header
+1. On startup the dashboard opens idle (no role prompt); the user presses `Shift-L` to start listening, and a fresh identity is generated then. A dial session is started independently from the TUI (`Shift-C`) and is available even before listening begins
+2. On `Shift-L`, the instance creates an iroh endpoint with discovery services and publishes its address via Pkarr/DNS; its node id is then shown in the TUI header
 3. When dialing, the dial session (given the target's node id, directly or resolved via nostr) reaches the target via discovery
 4. **QUIC handshake:** the connection uses the fixed ALPN constant (`mf/2`); there is no token in the ALPN
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token

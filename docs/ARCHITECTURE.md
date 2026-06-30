@@ -26,11 +26,11 @@ Binary: `duopipe`
 
 > **Design Goal:** The project's primary goal is to let a **single user link their own devices** (laptop, homelab box, VPS, …) to reach services across them — for development or homelab purposes — without the hassle and security risk of opening a port. Both ends are expected to be machines the same person owns (or otherwise fully trusts). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe connect` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
-duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe connect` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, every instance is **always listening** and also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** its single TCP tunnel and the **server side serves** it; an instance serves many inbound peers at once while dialing out itself. Within a tunnel, traffic flows in both directions.
+duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe connect` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, the dashboard opens **idle**; the user presses **`Shift-L`** to start the **on-demand serve half** (and `Shift-L` again to stop it), and the instance also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** its single TCP tunnel and the **server side serves** it; once listening, an instance serves many inbound peers at once while dialing out itself. Within a tunnel, traffic flows in both directions.
 
-There is **no role prompt at startup**: the instance begins listening immediately, and the dial session is started later from the TUI (`c` to connect, `D` to disconnect, re-pointable on demand). For tests, the role is single and derived from environment variables (see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated on every run, so the node id changes each run.
+There is **no role prompt at startup**: the dashboard opens idle and the serve half is started on demand with `Shift-L` (a toggle — `Shift-L` again stops it), while the dial session is driven independently from the TUI (`Shift-C` to connect, `Shift-D` to disconnect, re-pointable on demand) and works even before listening begins. For tests, the role is single and derived from environment variables (see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated each time the serve half starts, so a stop→start cycle (and every run) mints a new node id.
 
-Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that joins an always-on `run_listen` half with a `run_dial_manager` (the dial session manager) over a shared `AppState` and stream semaphore. The serve half and the dial session use separate iroh endpoints; the listen endpoint owns the displayed/published node id. Single-role `Role::Listen`/`Role::Dial` exist only for the headless test path.
+Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that joins a `run_listen_supervisor` (the serve half, started on-demand when the user presses Shift+L — it idles until then) with a `run_dial_manager` (the dial session manager) over a shared `AppState` and stream semaphore. The supervisor brings up `run_listen` under a child cancellation token on a `ListenCommand::Start` and tears it down on `Stop`. The serve half and the dial session use separate iroh endpoints; the listen endpoint owns the displayed/published node id. Single-role `Role::Listen`/`Role::Dial` exist only for the headless test path (and still auto-listen).
 
 Config declares the single **tunnel request** (the dial target is chosen interactively at runtime, not here):
 
@@ -157,12 +157,12 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe connect`): an always-on serve half plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** its single tunnel (`[tunnel]`), running the request listener; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
+Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe connect`): an on-demand serve half (started with `Shift-L`) plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** its single tunnel (`[tunnel]`), running the request listener; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
 
 ```mermaid
 graph TB
     subgraph "Server Side of One Connection"
-        A[always-on serve half]
+        A[on-demand serve half]
         B[iroh Endpoint<br/>ephemeral node id]
         C[Accept Loop]
         D[Discovery<br/>Pkarr/DNS]
@@ -208,14 +208,14 @@ sequenceDiagram
     participant D as Dial Peer
     participant RS as Relay Server
 
-    Note over L: Always-on serve half creates ephemeral identity
+    Note over L: User presses Shift-L; serve half creates ephemeral identity
     L->>L: Create iroh Endpoint
     L->>SD: Publish node id + Addresses
     Note over L: Display node id + token banner/hint in TUI
     L->>RS: Connect to relay
     L->>L: endpoint.accept() loop
 
-    Note over D: User presses c and enters node id or peer name
+    Note over D: User presses Shift-C and enters node id or peer name
     D->>D: Create iroh Endpoint (ephemeral identity)
     D->>SD: Resolve node id or current name record
     SD-->>D: Return addresses
@@ -398,7 +398,7 @@ graph TB
     style S fill:#FFF9C4
 ```
 
-The outbound dial target is not a config field. In interactive mode it is entered at runtime from the connect prompt (`c`): a node id in quick mode or a peer `name` in connect mode. In headless test mode only, `DUOPIPE_PEER_NODE_ID` under `DUOPIPE_TEST_MODE=1` selects the single role (set ⇒ dial, unset ⇒ listen).
+The outbound dial target is not a config field. In interactive mode it is entered at runtime from the connect prompt (`Shift-C`): a node id in quick mode or a peer `name` in connect mode. In headless test mode only, `DUOPIPE_PEER_NODE_ID` under `DUOPIPE_TEST_MODE=1` selects the single role (set ⇒ dial, unset ⇒ listen).
 
 ### iroh Credential Mapping
 
@@ -408,7 +408,7 @@ The outbound dial target is not a config field. In interactive mode it is entere
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** always generates a fresh ephemeral token in the interactive setup screen — there is no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it). The generated token is surfaced in the dashboard header for copying. **Connect mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
+Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** always generates a fresh ephemeral token in the interactive setup screen — there is no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it). The generated token is surfaced in the dashboard header for copying once the user starts listening (`Shift-L`). **Connect mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
 
 The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, the first 4 bytes of the token string's SHA-256 rendered as 8 lowercase hex digits — persistently in the header (all modes/roles) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret. The same canonical form also namespaces the per-name local state/lock file (`peer_state`): its path is `state-<fingerprint>-<name>.json`, with the `name` used verbatim (safe because `config::validate_name` restricts it to ASCII letters, digits, and `_`), so different pairings (tokens) that share a `name` get distinct, human-readable state files.
 
@@ -456,7 +456,7 @@ sequenceDiagram
         Main->>Main: Apply env overrides (DUOPIPE_AUTH_TOKEN wins)
     end
 
-    Main->>Main: Launch always-listening TUI; dial target is entered later
+    Main->>Main: Launch idle TUI; listen starts on Shift-L, dial target entered later
 ```
 
 ### Config Validation
@@ -628,7 +628,7 @@ graph TB
 
 ### Identity Management
 
-The iroh identity is **ephemeral**: iroh generates a fresh Ed25519 keypair on every run, so there is no key file to store or protect. The consequence is that the **listen peer's node id changes every run** (the TUI displays the current node id). This avoids same-machine locking that could otherwise produce duplicate node ids. Instead of re-copying the node id by hand, peers discover it via nostr (below).
+The iroh identity is **ephemeral**: iroh generates a fresh Ed25519 keypair each time the serve half starts (the user presses `Shift-L`), so there is no key file to store or protect. The consequence is that the **listen peer's node id changes on every run — and on every stop→start cycle** (the TUI displays the current node id once listening). This avoids same-machine locking that could otherwise produce duplicate node ids. Instead of re-copying the node id by hand, peers discover it via nostr (below).
 
 ```mermaid
 sequenceDiagram
@@ -636,8 +636,8 @@ sequenceDiagram
     participant TUI as TUI
     participant EP as iroh Endpoint
 
-    Note over EP: No key file — fresh identity each run
-    User->>TUI: duopipe quick/nostr
+    Note over EP: No key file — fresh identity each time listening starts
+    User->>TUI: duopipe quick/connect, then press Shift-L to listen
     TUI->>EP: Create endpoint (ephemeral identity)
     EP->>EP: Derive node id from fresh keypair
     EP-->>TUI: node id

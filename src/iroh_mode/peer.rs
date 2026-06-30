@@ -1,8 +1,8 @@
-//! iroh peer runtime: always-on serving plus on-demand dial sessions.
+//! iroh peer runtime: on-demand serving plus on-demand dial sessions.
 //!
-//! Interactive peers run as `Role::Both`: an always-on `Role::Listen` half that
-//! serves inbound peers, plus a dial manager that owns at most one outbound
-//! `Role::Dial` session. Within any one connection, only the dialer opens its
+//! Interactive peers run as `Role::Both`: a `Role::Listen` half that serves inbound
+//! peers (started on-demand via Shift+L; idle until then), plus a dial manager that
+//! owns at most one outbound `Role::Dial` session. Within any one connection, only the dialer opens its
 //! single tunnel: the tunnel binds a local listener and, per accepted connection,
 //! asks the connected peer to connect out over TCP to a bare `host:port` source,
 //! bridging the two. The tunnel is activated on demand (the TUI sends start/stop
@@ -29,8 +29,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::{
-    AppState, ConnStatus, DialCommand, DialTarget, NameCommand, NameConflict, Role, TunnelCommand,
-    TunnelStatus,
+    AppState, ConnStatus, DialCommand, DialTarget, ListenCommand, ListenStatus, NameCommand,
+    NameConflict, Role, TunnelCommand, TunnelStatus,
 };
 use crate::auth::is_token_valid;
 use crate::config::{TransportTuning, TunnelEntry};
@@ -176,14 +176,19 @@ pub async fn run_peer(config: PeerConfig) -> Result<()> {
     let semaphore = new_stream_semaphore(&config)?;
 
     match config.role {
-        Role::Listen => run_listen(config, semaphore).await,
+        // Headless test mode listens immediately; its child token simply mirrors the
+        // global shutdown (there is no interactive Shift+L toggle here).
+        Role::Listen => {
+            let listen_shutdown = config.status.shutdown.child_token();
+            run_listen(config, semaphore, listen_shutdown).await
+        }
         Role::Dial => run_dial(config, semaphore).await,
         Role::Both => run_serve_and_dial(config, semaphore).await,
     }
 }
 
-/// Split the interactive `Role::Both` config into a listen sub-config (always serving)
-/// and a dial sub-config (used by the dial manager). Both share the same `Arc<AppState>`
+/// Split the interactive `Role::Both` config into a listen sub-config (run on-demand by
+/// the listen supervisor) and a dial sub-config (used by the dial manager). Both share the same `Arc<AppState>`
 /// and the one stream semaphore; the dial target itself is supplied at runtime via
 /// [`DialCommand`], not by config.
 fn split_serve_dial_config(config: &PeerConfig) -> (PeerConfig, PeerConfig) {
@@ -205,19 +210,22 @@ fn split_serve_dial_config(config: &PeerConfig) -> (PeerConfig, PeerConfig) {
     (listen, dial)
 }
 
-/// Interactive runtime: serve inbound peers from launch (listen half, always on) while a
-/// dial manager maintains at most one user-initiated outbound session. The two halves
-/// share `AppState` and the stream semaphore but never interact at the connection layer.
-/// If either half returns, the shared shutdown is cancelled so the other unwinds.
+/// Interactive runtime: a listen supervisor (the serve half, started on-demand via
+/// Shift+L) alongside a dial manager that maintains at most one user-initiated outbound
+/// session. The two halves share `AppState` and the stream semaphore but never interact at
+/// the connection layer. If either half returns, the shared shutdown is cancelled so the
+/// other unwinds.
 async fn run_serve_and_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
     let (listen_cfg, dial_cfg) = split_serve_dial_config(&config);
     let shutdown = config.status.shutdown.clone();
 
     let listen_sem = semaphore.clone();
     // Tag every record from each half so the single combined log pane is attributable.
+    // The serve half no longer auto-starts: the supervisor idles until the TUI sends a
+    // Shift+L `ListenCommand::Start`.
     let mut listen_task = tokio::spawn(crate::logging::scoped(
         "serve",
-        run_listen(listen_cfg, listen_sem),
+        run_listen_supervisor(listen_cfg, listen_sem),
     ));
     let mut dial_task = tokio::spawn(crate::logging::scoped(
         "dial",
@@ -492,7 +500,80 @@ fn new_stream_semaphore(config: &PeerConfig) -> Result<Arc<Semaphore>> {
     Ok(semaphore)
 }
 
-async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
+/// Supervise the serve half for interactive `Role::Both`. The serve half does not
+/// auto-start: this idles with the endpoint down (no node id / PIN / token shown) until
+/// the TUI sends [`ListenCommand::Start`] (Shift+L). `Start` brings up one [`run_listen`]
+/// under a child cancellation token; `Stop` cancels it and returns to idle (a later
+/// `Start` mints a fresh ephemeral id). At most one serve endpoint lives at a time.
+async fn run_listen_supervisor(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
+    let shutdown = config.status.shutdown.clone();
+    let mut listen_rx = config.status.subscribe_listen();
+    config.status.set_listen_status(ListenStatus::Stopped);
+
+    // The single active serve endpoint, if any: its cancel token + task handle.
+    let mut current: Option<(CancellationToken, tokio::task::JoinHandle<Result<()>>)> = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            cmd = listen_rx.recv() => match cmd {
+                Ok(ListenCommand::Start) => {
+                    if current.is_none() {
+                        let tok = shutdown.child_token();
+                        config.status.set_listen_status(ListenStatus::Listening);
+                        let cfg = config.clone();
+                        let sem = semaphore.clone();
+                        let listen_tok = tok.clone();
+                        let h = tokio::spawn(crate::logging::scoped(
+                            "serve",
+                            run_listen(cfg, sem, listen_tok),
+                        ));
+                        current = Some((tok, h));
+                    }
+                }
+                Ok(ListenCommand::Stop) => {
+                    if let Some((tok, h)) = current.take() {
+                        tok.cancel();
+                        let _ = h.await;
+                        config.status.clear_listen();
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("Listen command channel lagged by {n}");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            // The serve half ended on its own (e.g. a fatal endpoint error): reflect that
+            // in the UI and propagate the error so the process unwinds.
+            res = async { (&mut current.as_mut().unwrap().1).await }, if current.is_some() => {
+                current = None;
+                config.status.clear_listen();
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e.context("serve half failed")),
+                    Err(e) => anyhow::bail!("serve half panicked: {e}"),
+                }
+            }
+        }
+    }
+
+    if let Some((tok, h)) = current.take() {
+        tok.cancel();
+        let _ = h.await;
+    }
+    Ok(())
+}
+
+/// Run the serve half: create the public endpoint, publish/display the node id and auth
+/// token, start the nostr/PIN publishers, and accept inbound peers until `listen_shutdown`
+/// fires. `listen_shutdown` is a child of the global shutdown (so process shutdown still
+/// stops it) but can also be cancelled on its own (Shift+L stop) to tear down just this
+/// half without ending the process.
+async fn run_listen(
+    config: PeerConfig,
+    semaphore: Arc<Semaphore>,
+    listen_shutdown: CancellationToken,
+) -> Result<()> {
     log::info!("duopipe serve half — listening for inbound peers");
     log::info!("=================================================");
 
@@ -529,7 +610,7 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
             identifier,
             node_id: endpoint_id,
             relays: config.nostr_relays.clone(),
-            shutdown: config.status.shutdown.clone(),
+            shutdown: listen_shutdown.clone(),
             state: config.status.clone(),
             // The interactive TUI can prompt; headless test mode (announce_endpoint)
             // cannot, so it degrades silently instead of blocking.
@@ -549,14 +630,14 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
                 config.auth_token.clone(),
                 config.nostr_relays.clone(),
                 config.status.clone(),
-                config.status.shutdown.clone(),
+                listen_shutdown.clone(),
             ),
         ))))
     } else {
         None
     };
 
-    let shutdown = config.status.shutdown.clone();
+    let shutdown = listen_shutdown;
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1554,9 +1635,9 @@ mod tests {
         })
     }
 
-    /// `split_serve_dial_config` keeps the own name on an always-on listen half (which
-    /// owns the reported node id), gives the dial half no fixed target, and shares one
-    /// `AppState`.
+    /// `split_serve_dial_config` keeps the own name on the listen half (which owns the
+    /// reported node id and is started on-demand via Shift+L), gives the dial half no
+    /// fixed target, and shares one `AppState`.
     #[test]
     fn split_serve_dial_config_shapes_both_halves() {
         let status = AppState::new(
