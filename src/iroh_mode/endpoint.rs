@@ -54,7 +54,7 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// are considered dead and closed. With QUIC_KEEP_ALIVE_INTERVAL enabled,
 /// this timeout only triggers for truly unresponsive connections.
 ///
-/// 5 minutes is generous for tunnels where the underlying TCP/UDP connection
+/// 5 minutes is generous for a tunnel where the underlying TCP connection
 /// may have long idle periods between bursts of activity.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 

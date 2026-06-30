@@ -7,7 +7,6 @@
 //! live [`Semaphore`] so it can never drift from the real limiter.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use iroh::EndpointId;
@@ -24,25 +23,12 @@ const TUNNEL_COMMAND_CAPACITY: usize = 64;
 const DIAL_COMMAND_CAPACITY: usize = 16;
 const NAME_COMMAND_CAPACITY: usize = 8;
 
-/// Stable identity for a tunnel, allocated once when the tunnel is added
-/// (config-seeded or runtime) and unchanged for the life of the session, including
-/// across reconnect reseeds. Identity is decoupled from the vec position so tunnels
-/// can be removed without disturbing the rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TunnelId(u64);
-
-impl std::fmt::Display for TunnelId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// A request to start or stop a configured tunnel, addressed by its stable
-/// [`TunnelId`]. Sent by the TUI, consumed by the connection supervisor.
+/// A request to start or stop this peer's single tunnel. Sent by the TUI,
+/// consumed by the connection supervisor.
 #[derive(Debug, Clone, Copy)]
 pub enum TunnelCommand {
-    Start(TunnelId),
-    Stop(TunnelId),
+    Start,
+    Stop,
 }
 
 /// A runtime request to the dial manager to (re)point or tear down the single
@@ -223,15 +209,9 @@ impl TunnelStatus {
     }
 }
 
-/// A configured tunnel and its current status. Carries the tunnel's stable
-/// [`TunnelId`]; rows are kept in display order, but the id (not the position) is the
-/// identity used to start/stop/delete it.
+/// The single configured tunnel and its current status, as rendered by the TUI.
 #[derive(Clone)]
 pub struct TunnelRow {
-    /// Stable identity of the underlying tunnel.
-    pub id: TunnelId,
-    /// Display label from the tunnel's `name`.
-    pub name: String,
     /// Human-readable "LISTEN <- SOURCE" description.
     pub spec: String,
     pub status: TunnelStatus,
@@ -239,23 +219,9 @@ pub struct TunnelRow {
     pub detail: String,
 }
 
-/// A configured tunnel paired with its stable id. The authoritative spec
-/// list (`AppState::specs`) is seeded from config and appended to at runtime.
-struct TunnelSpec {
-    id: TunnelId,
-    entry: TunnelEntry,
-}
-
-/// Build the `Idle` tunnel row for a tunnel (centralizes the spec format used by
-/// both seeding and runtime additions).
-fn tunnel_row_for(id: TunnelId, entry: &TunnelEntry) -> TunnelRow {
-    TunnelRow {
-        id,
-        name: entry.name.clone(),
-        spec: format!("{} <- {}", entry.local_listen, entry.remote_source),
-        status: TunnelStatus::Idle,
-        detail: String::new(),
-    }
+/// Human-readable "LISTEN <- SOURCE" description for a tunnel.
+fn tunnel_spec_label(entry: &TunnelEntry) -> String {
+    format!("{} <- {}", entry.local_listen, entry.remote_source)
 }
 
 /// A currently-connected, authenticated inbound peer. The serve half handles
@@ -284,13 +250,13 @@ pub struct AppState {
     /// Currently-connected inbound peers (the serve half handles many at once; the
     /// dial session tracks its own outbound path separately via `path`).
     peers: RwLock<Vec<PeerRow>>,
-    /// Monotonic allocator for [`TunnelId`]s. Never reused within a session.
-    next_id: AtomicU64,
-    /// Authoritative tunnel list: seeded from config and appended to at runtime via
-    /// [`AppState::add_tunnel`]. `tunnels` is kept 1:1 with this (same order), but
-    /// identity is the [`TunnelId`], not the vec position.
-    specs: RwLock<Vec<TunnelSpec>>,
-    tunnels: RwLock<Vec<TunnelRow>>,
+    /// The single configured tunnel spec (`None` until set from config or the TUI).
+    /// The supervisor reads it on `Start`; the TUI sets/clears it.
+    tunnel: RwLock<Option<TunnelEntry>>,
+    /// Current status of the single tunnel.
+    tunnel_status: RwLock<TunnelStatus>,
+    /// Bound address or rejection/error reason for the single tunnel.
+    tunnel_detail: RwLock<String>,
     /// Live stream limiter; `used = max - available_permits()`. One global cap on
     /// concurrent forwarded streams across all tunnels and all connected peers.
     semaphore: RwLock<Option<Arc<Semaphore>>>,
@@ -321,32 +287,13 @@ impl AppState {
         role: Role,
         token_generated: bool,
         logs: Arc<LogBuffer>,
-        tunnels: Vec<TunnelEntry>,
+        tunnel: Option<TunnelEntry>,
         nostr_discovery: bool,
         own_name: Option<String>,
     ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
         let (name_tx, _) = broadcast::channel(NAME_COMMAND_CAPACITY);
-        // Assign a stable id to each config-seeded tunnel; runtime adds continue
-        // from the same counter via `alloc_id`.
-        let specs: Vec<TunnelSpec> = tunnels
-            .into_iter()
-            .enumerate()
-            .map(|(i, entry)| TunnelSpec {
-                id: TunnelId(i as u64),
-                entry,
-            })
-            .collect();
-        let next_id = AtomicU64::new(specs.len() as u64);
-        // Seed the display rows from config at startup so the configured tunnels are
-        // visible (Idle) in the dashboard from launch — not only after the dial
-        // session connects. The dial manager calls `seed_tunnels` on each
-        // (re)connection to rebuild this list, carrying the same stable ids.
-        let tunnel_rows: Vec<TunnelRow> = specs
-            .iter()
-            .map(|s| tunnel_row_for(s.id, &s.entry))
-            .collect();
         Arc::new(Self {
             role,
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -356,9 +303,9 @@ impl AppState {
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
             peers: RwLock::new(Vec::new()),
-            next_id,
-            specs: RwLock::new(specs),
-            tunnels: RwLock::new(tunnel_rows),
+            tunnel: RwLock::new(tunnel),
+            tunnel_status: RwLock::new(TunnelStatus::Idle),
+            tunnel_detail: RwLock::new(String::new()),
             semaphore: RwLock::new(None),
             streams_max: RwLock::new(0),
             tunnel_tx,
@@ -427,23 +374,16 @@ impl AppState {
         *self.dial_target.write() = target;
     }
 
-    /// Allocate a fresh, never-reused tunnel id.
-    fn alloc_id(&self) -> TunnelId {
-        TunnelId(self.next_id.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Toggle the tunnel `id`: stop it if running, otherwise (re)start it.
-    pub fn toggle_tunnel(&self, id: TunnelId) {
-        let running = self
-            .tunnels
-            .read()
-            .iter()
-            .find(|t| t.id == id)
-            .is_some_and(|t| t.status.is_running());
-        let cmd = if running {
-            TunnelCommand::Stop(id)
+    /// Toggle the single tunnel: stop it if running, otherwise start it. A no-op
+    /// when no tunnel is configured.
+    pub fn toggle_tunnel(&self) {
+        if self.tunnel.read().is_none() {
+            return;
+        }
+        let cmd = if self.tunnel_running() {
+            TunnelCommand::Stop
         } else {
-            TunnelCommand::Start(id)
+            TunnelCommand::Start
         };
         self.send_command(cmd);
     }
@@ -496,119 +436,50 @@ impl AppState {
         self.peers.write().retain(|p| p.remote_id != remote_id);
     }
 
-    /// Rebuild the tunnel table from the current spec list (all `Idle`), carrying
-    /// each tunnel's stable id. Called once per (re)connection; runtime additions
-    /// and deletions persist because they live in `specs`.
-    pub fn seed_tunnels(&self) {
-        // Hold the specs read lock across the tunnels write-back so a concurrent
-        // add/edit/delete (which locks specs-then-tunnels) can't change specs between
-        // the rebuild and the assignment, leaving the two lists out of sync. Same
-        // specs-then-tunnels lock order as those writers, so this can't deadlock.
-        let specs = self.specs.read();
-        let rows = specs
-            .iter()
-            .map(|s| tunnel_row_for(s.id, &s.entry))
-            .collect();
-        *self.tunnels.write() = rows;
+    /// Reset the tunnel's status to `Idle` (clearing any detail) on each
+    /// (re)connection. The spec itself persists across reconnects.
+    pub fn reset_tunnel_status(&self) {
+        *self.tunnel_status.write() = TunnelStatus::Idle;
+        self.tunnel_detail.write().clear();
     }
 
-    /// The tunnel with `id`, cloned (used by the connection supervisor on `Start`).
-    pub fn get_tunnel(&self, id: TunnelId) -> Option<TunnelEntry> {
-        self.specs
-            .read()
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.entry.clone())
+    /// The single tunnel spec, cloned (used by the connection supervisor on `Start`).
+    pub fn tunnel(&self) -> Option<TunnelEntry> {
+        self.tunnel.read().clone()
     }
 
-    /// Ids of all configured tunnels, in display order (used by the autostart
-    /// path to start each one).
-    pub fn tunnel_ids(&self) -> Vec<TunnelId> {
-        self.specs.read().iter().map(|s| s.id).collect()
+    /// Whether a tunnel is configured.
+    pub fn has_tunnel(&self) -> bool {
+        self.tunnel.read().is_some()
     }
 
-    /// Whether the tunnel `id` is currently running (used to gate the edit action).
-    pub fn tunnel_running(&self, id: TunnelId) -> bool {
-        self.tunnels
-            .read()
-            .iter()
-            .find(|t| t.id == id)
-            .is_some_and(|t| t.status.is_running())
+    /// Whether the tunnel is currently running (used to gate the set/clear actions).
+    pub fn tunnel_running(&self) -> bool {
+        self.tunnel_status.read().is_running()
     }
 
-    /// Whether `name` is already used by a tunnel, optionally ignoring `except` (the
-    /// row being edited). Used to keep tunnel names unique.
-    pub fn tunnel_name_taken(&self, name: &str, except: Option<TunnelId>) -> bool {
-        self.specs
-            .read()
-            .iter()
-            .any(|s| Some(s.id) != except && s.entry.name == name)
+    /// Set (or replace) the single tunnel, resetting its status to `Idle`. The caller
+    /// guarantees it is not running. No `Start` is sent here.
+    pub fn set_tunnel(&self, entry: TunnelEntry) {
+        *self.tunnel.write() = Some(entry);
+        *self.tunnel_status.write() = TunnelStatus::Idle;
+        self.tunnel_detail.write().clear();
     }
 
-    /// Append a new tunnel at runtime and its matching `Idle` row. Returns
-    /// its freshly allocated id.
-    pub fn add_tunnel(&self, entry: TunnelEntry) -> TunnelId {
-        let id = self.alloc_id();
-        let row = tunnel_row_for(id, &entry);
-        // Hold both locks for the duration so `specs` and `tunnels` are never
-        // observed out of sync. Lock order is specs-then-tunnels, matching
-        // `seed_tunnels`; no site takes them the other way, so this can't deadlock.
-        let mut specs = self.specs.write();
-        let mut tunnels = self.tunnels.write();
-        specs.push(TunnelSpec { id, entry });
-        tunnels.push(row);
-        id
-    }
-
-    /// Replace the spec of tunnel `id` in place, rebuilding its row to `Idle` (caller
-    /// guarantees it is not running). No `Start` is sent; the tunnel keeps its id and
-    /// position. A no-op if `id` is unknown.
-    pub fn edit_tunnel(&self, id: TunnelId, entry: TunnelEntry) {
-        // Same specs-then-tunnels lock order as `add_tunnel`.
-        let mut specs = self.specs.write();
-        let mut tunnels = self.tunnels.write();
-        if let Some(spec) = specs.iter_mut().find(|s| s.id == id) {
-            spec.entry = entry.clone();
-        } else {
-            return;
-        }
-        if let Some(row) = tunnels.iter_mut().find(|t| t.id == id) {
-            *row = tunnel_row_for(id, &entry);
-        }
-    }
-
-    /// Remove the tunnel `id` from the session (config is never touched). If it is
+    /// Remove the tunnel from the session (config is never touched). If it is
     /// running, a `Stop` is broadcast first so the supervisor cancels its task and
-    /// frees the bound local port; the row is then dropped from both lists.
-    pub fn delete_tunnel(&self, id: TunnelId) {
-        // Free the port if running. `Stop` for a non-running id is a harmless no-op in
-        // the supervisor, so we send unconditionally.
-        self.send_command(TunnelCommand::Stop(id));
-        let mut specs = self.specs.write();
-        let mut tunnels = self.tunnels.write();
-        specs.retain(|s| s.id != id);
-        tunnels.retain(|t| t.id != id);
+    /// frees the bound local port.
+    pub fn clear_tunnel(&self) {
+        self.send_command(TunnelCommand::Stop);
+        *self.tunnel.write() = None;
+        *self.tunnel_status.write() = TunnelStatus::Idle;
+        self.tunnel_detail.write().clear();
     }
 
-    /// Number of configured tunnel rows (used to clamp the TUI selection cursor).
-    pub fn tunnel_count(&self) -> usize {
-        self.tunnels.read().len()
-    }
-
-    /// The id of the tunnel at display position `pos`, if any. Resolves the TUI's
-    /// transient cursor position to a stable id at action time.
-    pub fn tunnel_id_at(&self, pos: usize) -> Option<TunnelId> {
-        self.tunnels.read().get(pos).map(|t| t.id)
-    }
-
-    /// Update the status/detail of the tunnel `id` (no-op if it has been deleted, so a
-    /// late update from a just-stopped task is harmless).
-    pub fn update_tunnel(&self, id: TunnelId, status: TunnelStatus, detail: impl Into<String>) {
-        let mut tunnels = self.tunnels.write();
-        if let Some(row) = tunnels.iter_mut().find(|t| t.id == id) {
-            row.status = status;
-            row.detail = detail.into();
-        }
+    /// Update the tunnel's status/detail.
+    pub fn update_tunnel(&self, status: TunnelStatus, detail: impl Into<String>) {
+        *self.tunnel_status.write() = status;
+        *self.tunnel_detail.write() = detail.into();
     }
 
     /// Take an owned snapshot for rendering (releases all locks before returning).
@@ -620,6 +491,11 @@ impl AppState {
             .as_ref()
             .map(|s| streams_max.saturating_sub(s.available_permits()))
             .unwrap_or(0);
+        let tunnel = self.tunnel.read().as_ref().map(|entry| TunnelRow {
+            spec: tunnel_spec_label(entry),
+            status: *self.tunnel_status.read(),
+            detail: self.tunnel_detail.read().clone(),
+        });
         AppSnapshot {
             role: self.role,
             hostname: self.hostname.clone(),
@@ -633,7 +509,7 @@ impl AppState {
             dial_target: self.dial_target.read().clone(),
             name_conflict: self.name_conflict.read().clone(),
             peers: self.peers.read().clone(),
-            tunnels: self.tunnels.read().clone(),
+            tunnel,
             streams_used,
             streams_max,
         }
@@ -656,7 +532,8 @@ pub struct AppSnapshot {
     /// Current nostr name-conflict state (drives the conflict modal / warning).
     pub name_conflict: NameConflict,
     pub peers: Vec<PeerRow>,
-    pub tunnels: Vec<TunnelRow>,
+    /// The single configured tunnel's row, or `None` when none is set.
+    pub tunnel: Option<TunnelRow>,
     pub streams_used: usize,
     pub streams_max: usize,
 }
@@ -666,123 +543,70 @@ mod tests {
     use super::*;
     use crate::logging::LogBuffer;
 
-    fn req(name: &str, src: &str, listen: &str) -> TunnelEntry {
+    fn req(src: &str, listen: &str) -> TunnelEntry {
         TunnelEntry {
-            name: name.into(),
             remote_source: src.into(),
             local_listen: listen.into(),
         }
     }
 
     #[test]
-    fn add_tunnel_appends_tunnel_and_idle_row() {
-        let seed = vec![req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678")];
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), seed, false, None);
-        // Rows mirror the config specs from construction (seed_tunnels rebuilds the
-        // same list per (re)connection; calling it here is idempotent).
-        state.seed_tunnels();
-        assert_eq!(state.tunnel_ids().len(), 1);
-        assert_eq!(state.tunnel_count(), 1);
-        let db_id = state.tunnel_id_at(0).expect("seeded id");
-
-        let id = state.add_tunnel(req("ssh", "tcp://127.0.0.1:22", "127.0.0.1:2222"));
-        assert_ne!(id, db_id, "append allocates a fresh id");
-        assert_eq!(state.tunnel_ids().len(), 2);
-        assert_eq!(state.tunnel_count(), 2);
-
-        // The tunnel round-trips and the row is Idle with the right spec.
-        let got = state.get_tunnel(id).expect("tunnel present");
-        assert_eq!(got.remote_source, "tcp://127.0.0.1:22");
-        let row = state.snapshot().tunnels[1].clone();
-        assert_eq!(row.id, id);
-        assert_eq!(row.name, "ssh");
-        assert_eq!(row.spec, "127.0.0.1:2222 <- tcp://127.0.0.1:22");
-        assert_eq!(row.status, TunnelStatus::Idle);
-
-        // A second append keeps allocating distinct ids.
-        let id2 = state.add_tunnel(req("c", "udp://127.0.0.1:53", "127.0.0.1:5353"));
-        assert_ne!(id2, id);
-        assert_eq!(state.get_tunnel(db_id).unwrap().name, "db");
-    }
-
-    #[test]
-    fn seed_tunnels_loaded_into_rows_at_construction() {
-        // Configured tunnels must be visible in the dashboard from launch, before any
-        // dial session connects — not only after the dial manager calls seed_tunnels.
-        let seed = vec![
-            req("db", "tcp://127.0.0.1:5678", "127.0.0.1:15678"),
-            req("cache", "tcp://127.0.0.1:5679", "127.0.0.1:15679"),
-        ];
+    fn config_tunnel_seeded_into_snapshot_at_construction() {
+        // A configured tunnel must be visible (Idle) in the dashboard from launch.
+        let seed = Some(req("127.0.0.1:5678", "127.0.0.1:15678"));
         let state = AppState::new(Role::Both, false, LogBuffer::new(16), seed, false, None);
-        let rows = state.snapshot().tunnels;
-        assert_eq!(rows.len(), 2, "rows seeded at construction");
-        assert_eq!(rows[0].name, "db");
-        assert_eq!(rows[1].name, "cache");
-        assert!(rows.iter().all(|r| r.status == TunnelStatus::Idle));
-    }
-
-    #[test]
-    fn delete_tunnel_drops_row_and_preserves_other_ids() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
-        let a = state.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        let b = state.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
-        let c = state.add_tunnel(req("c", "tcp://127.0.0.1:3", "127.0.0.1:13"));
-        assert_eq!(state.tunnel_count(), 3);
-
-        // Delete the middle tunnel.
-        state.delete_tunnel(b);
-        assert_eq!(state.tunnel_count(), 2);
-        assert!(state.get_tunnel(b).is_none(), "deleted tunnel is gone");
-
-        // The survivors keep their ids and shift up by one position.
-        assert_eq!(state.get_tunnel(a).unwrap().name, "a");
-        assert_eq!(state.get_tunnel(c).unwrap().name, "c");
-        assert_eq!(state.tunnel_id_at(0), Some(a));
-        assert_eq!(state.tunnel_id_at(1), Some(c));
-
-        // Deleting an unknown id is a no-op.
-        state.delete_tunnel(b);
-        assert_eq!(state.tunnel_count(), 2);
-    }
-
-    #[test]
-    fn update_tunnel_replaces_spec_and_row_in_place() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
-        let a = state.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        let b = state.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
-
-        state.edit_tunnel(a, req("a2", "udp://127.0.0.1:9", "127.0.0.1:99"));
-        // Same id and position; spec and row reflect the edit.
-        assert_eq!(state.tunnel_id_at(0), Some(a));
-        let got = state.get_tunnel(a).expect("tunnel present");
-        assert_eq!(got.name, "a2");
-        assert_eq!(got.remote_source, "udp://127.0.0.1:9");
-        let row = state.snapshot().tunnels[0].clone();
-        assert_eq!(row.id, a);
-        assert_eq!(row.name, "a2");
-        assert_eq!(row.spec, "127.0.0.1:99 <- udp://127.0.0.1:9");
+        assert!(state.has_tunnel());
+        let row = state.snapshot().tunnel.expect("tunnel row present");
+        assert_eq!(row.spec, "127.0.0.1:15678 <- 127.0.0.1:5678");
         assert_eq!(row.status, TunnelStatus::Idle);
-        // The other tunnel is untouched.
-        assert_eq!(state.get_tunnel(b).unwrap().name, "b");
     }
 
     #[test]
-    fn tunnel_name_taken_honors_except() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
-        let a = state.add_tunnel(req("a", "tcp://127.0.0.1:1", "127.0.0.1:11"));
-        state.add_tunnel(req("b", "tcp://127.0.0.1:2", "127.0.0.1:12"));
+    fn set_and_clear_tunnel() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None);
+        assert!(!state.has_tunnel());
+        assert!(state.snapshot().tunnel.is_none());
 
-        assert!(state.tunnel_name_taken("b", None));
-        assert!(!state.tunnel_name_taken("c", None));
-        // "a" excluding its own row is free (lets an edit keep its name).
-        assert!(!state.tunnel_name_taken("a", Some(a)));
-        // But "b" still collides even when editing "a".
-        assert!(state.tunnel_name_taken("b", Some(a)));
+        state.set_tunnel(req("127.0.0.1:22", "127.0.0.1:2222"));
+        assert!(state.has_tunnel());
+        let got = state.tunnel().expect("tunnel present");
+        assert_eq!(got.remote_source, "127.0.0.1:22");
+        let row = state.snapshot().tunnel.expect("row present");
+        assert_eq!(row.spec, "127.0.0.1:2222 <- 127.0.0.1:22");
+        assert_eq!(row.status, TunnelStatus::Idle);
+
+        // Replacing in place keeps a single tunnel.
+        state.set_tunnel(req("127.0.0.1:80", "127.0.0.1:8080"));
+        assert_eq!(state.tunnel().unwrap().remote_source, "127.0.0.1:80");
+
+        state.clear_tunnel();
+        assert!(!state.has_tunnel());
+        assert!(state.snapshot().tunnel.is_none());
+    }
+
+    #[test]
+    fn update_tunnel_reflects_in_snapshot() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None);
+        state.set_tunnel(req("127.0.0.1:22", "127.0.0.1:2222"));
+
+        state.update_tunnel(TunnelStatus::Listening, "127.0.0.1:2222");
+        assert!(state.tunnel_running());
+        let row = state.snapshot().tunnel.expect("row present");
+        assert_eq!(row.status, TunnelStatus::Listening);
+        assert_eq!(row.detail, "127.0.0.1:2222");
+
+        // A (re)connection resets the status back to Idle.
+        state.reset_tunnel_status();
+        assert!(!state.tunnel_running());
+        assert_eq!(
+            state.snapshot().tunnel.expect("row present").status,
+            TunnelStatus::Idle
+        );
     }
 
     #[test]
     fn listener_tracks_multiple_peers() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), vec![], false, None);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None);
 
         // Many distinct peers connect at once — all are tracked.
         state.add_peer("peer-a".into());
@@ -806,7 +630,7 @@ mod tests {
             Role::Both,
             false,
             LogBuffer::new(16),
-            vec![],
+            None,
             true,
             Some("web1".to_string()),
         );
@@ -819,7 +643,7 @@ mod tests {
 
     #[test]
     fn name_conflict_state_transitions_in_snapshot() {
-        let state = AppState::new(Role::Both, false, LogBuffer::new(16), vec![], true, None);
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), None, true, None);
         assert_eq!(state.snapshot().name_conflict, NameConflict::Inactive);
 
         state.set_name_conflict(NameConflict::Prompt {

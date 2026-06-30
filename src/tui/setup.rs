@@ -1,14 +1,13 @@
-//! Interactive in-TUI setup: collect the serving allowlist and confirm token
-//! generation before the runtime starts.
+//! Interactive in-TUI setup: confirm token generation before the runtime starts.
 //!
 //! There is no role question: every interactive run is always listening, and the
 //! single outbound dial session is started on demand from the dashboard (see
-//! `super::handle_key`). Setup therefore only resolves the serving `[allowed_sources]`
-//! (when config supplies none) and the auth token (supplied, or freshly generated).
+//! `super::handle_key`). Setup therefore only resolves the auth token (supplied, or
+//! freshly generated).
 //!
 //! Pure state machine ([`SetupState`] + [`handle_key`]) plus a pure [`render`]. The
-//! driver lives in [`super::run_setup`]. Validation (CRC16 on a supplied token, CIDR
-//! parse on the allowlist) happens here.
+//! driver lives in [`super::run_setup`]. Validation (CRC16 on a supplied token)
+//! happens here.
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,14 +20,12 @@ use tui_input::Input;
 use super::textinput::{INPUT_FIELD_HEIGHT, handle_edit, render_input_field};
 use crate::app_state::Role;
 use crate::auth;
-use crate::config::{AllowedSources, validate_cidr};
 use crate::peer_params::ResolvedPeer;
 
 /// Which question the setup screen is currently asking.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SetupPhase {
-    /// Start screen: a summary plus — when config supplies no `[allowed_sources]` — the
-    /// TCP/UDP CIDR allowlists gating what inbound peers may request. Enter proceeds.
+    /// Start screen: a summary and Start/Exit buttons. Enter proceeds.
     Start,
     /// No token from config/env: set one up. Quick mode shows a "Generate new" button
     /// alongside an inline entry field (the token is ephemeral); nostr mode shows only
@@ -48,44 +45,12 @@ enum TokenFocus {
     Input,
 }
 
-/// Which element of the [`SetupPhase::Start`] screen has focus. The two CIDR fields
-/// only appear (and so are only focusable) when config supplies no `[allowed_sources]`;
-/// the `Start`/`Exit` buttons are always present. Arrow keys move focus; Enter
-/// activates it.
+/// Which button of the [`SetupPhase::Start`] screen has focus. Left/Right pick between
+/// `Start` and `Exit`; Enter activates the focused one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StartFocus {
-    AllowedTcp,
-    AllowedUdp,
     Start,
     Exit,
-}
-
-impl StartFocus {
-    fn is_button(self) -> bool {
-        matches!(self, StartFocus::Start | StartFocus::Exit)
-    }
-}
-
-/// Up/Down move between vertical rows, top to bottom as rendered: the Start/Exit
-/// button row (the two buttons share one row; Left/Right pick between them), then the
-/// first CIDR field, then the second. The CIDR rows only exist when shown.
-fn move_focus(state: &mut SetupState, down: bool) {
-    // One representative per row; the button row stays on whichever button is focused
-    // while moving within it, and is entered (from a field) on the primary Start button.
-    let button_row = if state.focus.is_button() {
-        state.focus
-    } else {
-        StartFocus::Start
-    };
-    let rows: &[StartFocus] = if allowlist_fields_shown(state) {
-        &[button_row, StartFocus::AllowedTcp, StartFocus::AllowedUdp]
-    } else {
-        &[button_row]
-    };
-    let i = rows.iter().position(|f| *f == state.focus).unwrap_or(0) as isize;
-    let n = rows.len() as isize;
-    let delta = if down { 1 } else { -1 };
-    state.focus = rows[(((i + delta) % n + n) % n) as usize];
 }
 
 /// Result of running the setup screen to completion.
@@ -110,17 +75,8 @@ pub struct SetupState {
     /// set, a token pasted here must match it — guarding against a token meant for a
     /// different pairing. `None` in quick mode.
     expected_token_fingerprint: Option<String>,
-    /// Allowlist supplied by config. When non-empty the interactive allowlist fields
-    /// are hidden (config wins); when empty they are shown on the start screen.
-    config_allowed_sources: AllowedSources,
-    /// Currently focused element of the start screen.
+    /// Currently focused button of the start screen.
     focus: StartFocus,
-    /// TCP/UDP CIDR text entered on the start screen (only used when
-    /// `config_allowed_sources` is empty).
-    allowed_tcp: Input,
-    allowed_udp: Input,
-    /// Allowlist resolved once the start screen is submitted, carried to `Done`.
-    allowed_sources: AllowedSources,
     /// Whether nostr discovery is active (nostr mode) — display only, for the summary.
     nostr_discovery: bool,
     /// This machine's own nostr name (config `name`) — display only, for the summary.
@@ -140,7 +96,6 @@ impl SetupState {
     pub fn new(
         config_auth_token: Option<String>,
         expected_token_fingerprint: Option<String>,
-        config_allowed_sources: AllowedSources,
         nostr_discovery: bool,
         own_name: Option<String>,
     ) -> Self {
@@ -148,13 +103,8 @@ impl SetupState {
             phase: SetupPhase::Start,
             config_auth_token,
             expected_token_fingerprint,
-            config_allowed_sources,
-            // The Start button is the primary action and focused first; the optional
-            // CIDR fields are reached by arrowing down.
+            // The Start button is the primary action and focused first.
             focus: StartFocus::Start,
-            allowed_tcp: Input::default(),
-            allowed_udp: Input::default(),
-            allowed_sources: AllowedSources::default(),
             nostr_discovery,
             own_name,
             token_focus: TokenFocus::Generate,
@@ -214,43 +164,12 @@ fn build_resolved(state: &SetupState) -> ResolvedPeer {
         peer_identifier: None,
         auth_token: state.auth_token.clone().unwrap_or_default(),
         token_generated: state.token_generated,
-        allowed_sources: state.allowed_sources.clone(),
     }
 }
 
-/// Whether the interactive allowlist fields are shown (config supplies none).
-fn allowlist_fields_shown(state: &SetupState) -> bool {
-    state.config_allowed_sources.is_empty()
-}
-
-/// Submit the start screen: resolve the allowlist (from config or the entered CIDRs),
-/// then finish (a config/env token is present), offer generate-or-enter (quick mode),
-/// or go straight to token entry (nostr mode). A bad CIDR keeps the screen open with
-/// an error.
+/// Submit the start screen: finish (a config/env token is present), offer
+/// generate-or-enter (quick mode), or go straight to token entry (nostr mode).
 fn submit_start(state: &mut SetupState) -> Step {
-    let allowed = if !allowlist_fields_shown(state) {
-        state.config_allowed_sources.clone()
-    } else {
-        let tcp = match parse_cidr_list(state.allowed_tcp.value()) {
-            Ok(list) => list,
-            Err(e) => {
-                state.focus = StartFocus::AllowedTcp;
-                state.error = Some(format!("Invalid TCP CIDR: {e}"));
-                return Step::Continue;
-            }
-        };
-        let udp = match parse_cidr_list(state.allowed_udp.value()) {
-            Ok(list) => list,
-            Err(e) => {
-                state.focus = StartFocus::AllowedUdp;
-                state.error = Some(format!("Invalid UDP CIDR: {e}"));
-                return Step::Continue;
-            }
-        };
-        AllowedSources { tcp, udp }
-    };
-    state.allowed_sources = allowed;
-
     if let Some(token) = state.config_auth_token.clone() {
         // A config/env token is used as-is, no further prompt.
         finalize(state, token, false)
@@ -268,17 +187,6 @@ fn submit_start(state: &mut SetupState) -> Step {
     }
 }
 
-/// Parse a line of space/comma-separated CIDRs, validating each. Empty input yields an
-/// empty list; `run_peer` later applies the localhost default.
-fn parse_cidr_list(buffer: &str) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    for tok in buffer.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
-        validate_cidr(tok).map_err(|e| e.to_string())?;
-        out.push(tok.to_string());
-    }
-    Ok(out)
-}
-
 /// Handle a key press, advancing the state machine.
 pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
     // Ctrl-C quits from any phase.
@@ -292,44 +200,20 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
     match state.phase {
         SetupPhase::Start => match key.code {
             KeyCode::Esc => Step::Quit,
-            // Enter activates the focused element: the Exit button quits, anything
-            // else (Start button or a CIDR field) submits and starts.
+            // Enter activates the focused button: Exit quits, Start submits and starts.
             KeyCode::Enter => match state.focus {
                 StartFocus::Exit => Step::Quit,
-                _ => submit_start(state),
+                StartFocus::Start => submit_start(state),
             },
-            // Up/Down (or Tab/BackTab) move between rows: the Start/Exit button group,
-            // then the first CIDR field, then the second.
-            KeyCode::Down | KeyCode::Tab => {
-                move_focus(state, true);
-                Step::Continue
-            }
-            KeyCode::Up | KeyCode::BackTab => {
-                move_focus(state, false);
-                Step::Continue
-            }
-            // On the buttons, Left/Right move between Start and Exit. On a CIDR field
-            // they fall through to the text input (cursor movement).
-            KeyCode::Left | KeyCode::Right if state.focus.is_button() => {
+            // Left/Right (or Tab) move between the Start and Exit buttons.
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 state.focus = match state.focus {
                     StartFocus::Exit => StartFocus::Start,
-                    _ => StartFocus::Exit,
+                    StartFocus::Start => StartFocus::Exit,
                 };
                 Step::Continue
             }
-            _ => {
-                match state.focus {
-                    StartFocus::AllowedTcp => {
-                        handle_edit(&mut state.allowed_tcp, key, is_cidr_char)
-                    }
-                    StartFocus::AllowedUdp => {
-                        handle_edit(&mut state.allowed_udp, key, is_cidr_char)
-                    }
-                    // Buttons ignore text keystrokes.
-                    StartFocus::Start | StartFocus::Exit => {}
-                }
-                Step::Continue
-            }
+            _ => Step::Continue,
         },
         SetupPhase::TokenSetup => match key.code {
             KeyCode::Esc => {
@@ -362,11 +246,6 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
             }
         },
     }
-}
-
-/// CIDR entry accepts printable ASCII plus spaces/commas as separators between entries.
-fn is_cidr_char(c: char) -> bool {
-    c.is_ascii_graphic() || c == ' '
 }
 
 /// Token entry accepts printable ASCII with no spaces (tokens are `d` + base64url).
@@ -412,15 +291,7 @@ pub fn render(frame: &mut Frame, state: &SetupState) {
 
 fn setup_panel_height(state: &SetupState) -> u16 {
     let body = match state.phase {
-        SetupPhase::Start => {
-            let fields = if allowlist_fields_shown(state) {
-                // Spacer, section label, two 3-row fields, and one help row per field.
-                1 + 1 + INPUT_FIELD_HEIGHT + 1 + INPUT_FIELD_HEIGHT + 1
-            } else {
-                0
-            };
-            start_summary_lines(state).len() as u16 + fields + error_height(state)
-        }
+        SetupPhase::Start => start_summary_lines(state).len() as u16 + error_height(state),
         SetupPhase::TokenSetup => {
             token_intro_lines(state).len() as u16
                 + 1
@@ -460,74 +331,15 @@ fn render_setup_title(frame: &mut Frame, area: Rect, state: &SetupState) {
 fn render_start_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
     let summary = start_summary_lines(state);
     let mut constraints = vec![Constraint::Length(summary.len() as u16)];
-    if allowlist_fields_shown(state) {
-        constraints.extend([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(INPUT_FIELD_HEIGHT),
-            Constraint::Length(1),
-            Constraint::Length(INPUT_FIELD_HEIGHT),
-            Constraint::Length(1),
-        ]);
-    }
     if state.error.is_some() {
         constraints.extend([Constraint::Length(1), Constraint::Length(1)]);
     }
     constraints.push(Constraint::Min(0));
 
     let chunks = Layout::vertical(constraints).split(area);
-    let mut i = 0;
-    render_lines(frame, chunks[i], summary);
-    i += 1;
+    render_lines(frame, chunks[0], summary);
 
-    if allowlist_fields_shown(state) {
-        i += 1; // spacer after the primary buttons
-        render_line(
-            frame,
-            chunks[i],
-            Line::from(Span::styled(
-                "Optional — leave blank to allow localhost only:",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-        );
-        i += 1;
-        render_input_field(
-            frame,
-            chunks[i],
-            "Allowed TCP sources (CIDR)",
-            &state.allowed_tcp,
-            state.focus == StartFocus::AllowedTcp,
-        );
-        i += 1;
-        render_line(
-            frame,
-            chunks[i],
-            Line::from(Span::styled(
-                "space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
-        i += 1;
-        render_input_field(
-            frame,
-            chunks[i],
-            "Allowed UDP sources (CIDR)",
-            &state.allowed_udp,
-            state.focus == StartFocus::AllowedUdp,
-        );
-        i += 1;
-        render_line(
-            frame,
-            chunks[i],
-            Line::from(Span::styled(
-                "space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
-        i += 1;
-    }
-
-    render_error_if_any(frame, &chunks, i, state.error.as_deref());
+    render_error_if_any(frame, &chunks, 1, state.error.as_deref());
 }
 
 fn render_token_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
@@ -601,7 +413,6 @@ fn start_summary_lines(state: &SetupState) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray),
         )));
     }
-    // Primary actions stay above optional allowlist fields so Start is never buried.
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         button_span("Start", state.focus == StartFocus::Start),
@@ -769,18 +580,10 @@ mod tests {
         }
     }
 
-    /// A non-empty config allowlist so the start screen shows no editable fields.
-    fn from_config() -> AllowedSources {
-        AllowedSources {
-            tcp: vec!["127.0.0.0/8".into()],
-            udp: vec![],
-        }
-    }
-
     #[test]
     fn start_with_config_token_finishes_as_both() {
         let token = auth::generate_token();
-        let mut s = SetupState::new(Some(token.clone()), None, from_config(), true, Some("hl".into()));
+        let mut s = SetupState::new(Some(token.clone()), None, true, Some("hl".into()));
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
@@ -788,7 +591,6 @@ mod tests {
                 assert!(r.peer_identifier.is_none());
                 assert!(!r.token_generated);
                 assert_eq!(r.auth_token, token);
-                assert_eq!(r.allowed_sources.tcp, vec!["127.0.0.0/8".to_string()]);
             }
             _ => panic!("expected Done(Both)"),
         }
@@ -797,7 +599,7 @@ mod tests {
     #[test]
     fn quick_without_token_focuses_generate_and_generates() {
         // Quick mode: no config token -> the token-setup screen, focused on Generate.
-        let mut s = SetupState::new(None, None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, false, None);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::TokenSetup);
         assert_eq!(s.token_focus, TokenFocus::Generate);
@@ -816,7 +618,7 @@ mod tests {
         // Tab moves from the Generate button to the inline entry field; typing there
         // and pressing Enter accepts the pasted token (not "generated").
         let token = auth::generate_token();
-        let mut s = SetupState::new(None, None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, false, None);
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (focus Generate)
         handle_key(key(KeyCode::Tab), &mut s);
         assert_eq!(s.token_focus, TokenFocus::Input);
@@ -835,7 +637,7 @@ mod tests {
         // Nostr mode has no Generate button (its token is a pre-shared secret), so the
         // entry field is focused immediately on the same screen.
         let token = auth::generate_token();
-        let mut s = SetupState::new(None, None, from_config(), true, Some("hl".into()));
+        let mut s = SetupState::new(None, None, true, Some("hl".into()));
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
         assert_eq!(s.phase, SetupPhase::TokenSetup);
         assert_eq!(s.token_focus, TokenFocus::Input);
@@ -857,7 +659,7 @@ mod tests {
         let intended = auth::generate_token();
         let other = auth::generate_token();
         let expected = auth::token_fingerprint(&intended);
-        let mut s = SetupState::new(None, Some(expected.clone()), from_config(), true, Some("hl".into()));
+        let mut s = SetupState::new(None, Some(expected.clone()), true, Some("hl".into()));
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
         type_str(&mut s, &other);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
@@ -869,7 +671,7 @@ mod tests {
     fn nostr_accepts_token_matching_fingerprint() {
         let token = auth::generate_token();
         let expected = auth::token_fingerprint(&token);
-        let mut s = SetupState::new(None, Some(expected), from_config(), true, Some("hl".into()));
+        let mut s = SetupState::new(None, Some(expected), true, Some("hl".into()));
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
         type_str(&mut s, &token);
         match handle_key(key(KeyCode::Enter), &mut s) {
@@ -899,13 +701,7 @@ mod tests {
     fn nostr_token_screen_shows_expected_fingerprint_and_match_state() {
         let token = auth::generate_token();
         let expected = auth::token_fingerprint(&token);
-        let mut s = SetupState::new(
-            None,
-            Some(expected.clone()),
-            from_config(),
-            true,
-            Some("hl".into()),
-        );
+        let mut s = SetupState::new(None, Some(expected.clone()), true, Some("hl".into()));
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
 
         // Before typing: the expected fingerprint is shown up front.
@@ -918,7 +714,7 @@ mod tests {
         assert!(render_text(&s).contains('✓'));
 
         let other = auth::generate_token();
-        let mut mismatch = SetupState::new(None, Some(expected), from_config(), true, Some("hl".into()));
+        let mut mismatch = SetupState::new(None, Some(expected), true, Some("hl".into()));
         handle_key(key(KeyCode::Enter), &mut mismatch);
         type_str(&mut mismatch, &other);
         assert!(render_text(&mismatch).contains('✗'));
@@ -926,7 +722,7 @@ mod tests {
 
     #[test]
     fn token_setup_esc_returns_to_start() {
-        let mut s = SetupState::new(None, None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, false, None);
         handle_key(key(KeyCode::Enter), &mut s);
         assert_eq!(s.phase, SetupPhase::TokenSetup);
         handle_key(key(KeyCode::Esc), &mut s);
@@ -935,7 +731,7 @@ mod tests {
 
     #[test]
     fn enter_token_rejects_invalid_and_stays_open() {
-        let mut s = SetupState::new(None, None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, false, None);
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (focus Generate)
         handle_key(key(KeyCode::Tab), &mut s); // focus the inline field
         type_str(&mut s, "not-a-real-token");
@@ -945,80 +741,16 @@ mod tests {
     }
 
     #[test]
-    fn start_screen_collects_tcp_then_udp_allowlist() {
-        // Empty config allowlist -> the two CIDR fields appear below the Start/Exit
-        // buttons. Focus starts on Start, so arrow down into the TCP field first.
-        let mut s = SetupState::new(
-            Some(auth::generate_token()),
-            None,
-            AllowedSources::default(),
-            false,
-            None,
-        );
-        handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
-        assert_eq!(s.focus, StartFocus::AllowedTcp);
-        type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
-        handle_key(key(KeyCode::Down), &mut s); // -> AllowedUdp
-        type_str(&mut s, "10.0.0.0/8");
-        match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => {
-                assert_eq!(r.role, Role::Both);
-                assert_eq!(
-                    r.allowed_sources.tcp,
-                    vec!["127.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
-                );
-                assert_eq!(r.allowed_sources.udp, vec!["10.0.0.0/8".to_string()]);
-            }
-            _ => panic!("expected Done(Both) with the entered allowlist"),
-        }
-    }
-
-    #[test]
-    fn bad_cidr_keeps_screen_open_with_error() {
-        let mut s = SetupState::new(
-            Some(auth::generate_token()),
-            None,
-            AllowedSources::default(),
-            false,
-            None,
-        );
-        handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
-        type_str(&mut s, "not-a-cidr");
-        assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
-        assert!(s.error.is_some());
-        assert_eq!(s.phase, SetupPhase::Start);
-    }
-
-    #[test]
-    fn allowlist_field_supports_cursor_editing() {
-        let mut s = SetupState::new(
-            Some(auth::generate_token()),
-            None,
-            AllowedSources::default(),
-            false,
-            None,
-        );
-        handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
-        type_str(&mut s, "abcd");
-        // On a CIDR field, Left/Right move the text cursor (they only switch buttons
-        // when a button is focused).
-        handle_key(key(KeyCode::Left), &mut s);
-        handle_key(key(KeyCode::Left), &mut s);
-        type_str(&mut s, "XY");
-        assert_eq!(s.allowed_tcp.value(), "abXYcd");
-    }
-
-    #[test]
     fn start_button_focused_first_and_enter_starts() {
-        let mut s = SetupState::new(Some(auth::generate_token()), None, from_config(), false, None);
+        let mut s = SetupState::new(Some(auth::generate_token()), None, false, None);
         assert_eq!(s.focus, StartFocus::Start);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Done(_)));
     }
 
     #[test]
     fn exit_button_is_focusable_and_enter_quits() {
-        let mut s = SetupState::new(Some(auth::generate_token()), None, from_config(), false, None);
-        // No fields shown -> focus order is just [Start, Exit]; Right reaches Exit.
+        let mut s = SetupState::new(Some(auth::generate_token()), None, false, None);
+        // Focus order is just [Start, Exit]; Right reaches Exit.
         handle_key(key(KeyCode::Right), &mut s);
         assert_eq!(s.focus, StartFocus::Exit);
         // Left toggles back, Right again to Exit, then Enter quits.
@@ -1029,37 +761,8 @@ mod tests {
     }
 
     #[test]
-    fn up_down_move_between_button_row_and_fields() {
-        let mut s = SetupState::new(
-            Some(auth::generate_token()),
-            None,
-            AllowedSources::default(),
-            false,
-            None,
-        );
-        // Down steps row-by-row: button group -> first field -> second field -> wrap.
-        assert_eq!(s.focus, StartFocus::Start);
-        handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.focus, StartFocus::AllowedTcp);
-        handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.focus, StartFocus::AllowedUdp);
-        handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.focus, StartFocus::Start, "wraps back to the button row");
-
-        // The button row is one vertical stop: Left/Right pick between Start and Exit,
-        // and Down leaves the whole row for the first field (no Start->Exit step).
-        handle_key(key(KeyCode::Right), &mut s);
-        assert_eq!(s.focus, StartFocus::Exit);
-        handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.focus, StartFocus::AllowedTcp);
-        // Coming back up lands on the primary Start button.
-        handle_key(key(KeyCode::Up), &mut s);
-        assert_eq!(s.focus, StartFocus::Start);
-    }
-
-    #[test]
     fn ctrl_c_quits() {
-        let mut s = SetupState::new(None, None, from_config(), false, None);
+        let mut s = SetupState::new(None, None, false, None);
         let k = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(handle_key(k, &mut s), Step::Quit));
     }

@@ -2,19 +2,19 @@
 //!
 //! Interactive peers run as `Role::Both`: an always-on `Role::Listen` half that
 //! serves inbound peers, plus a dial manager that owns at most one outbound
-//! `Role::Dial` session. Within any one connection, only the dialer opens
-//! tunnels: a tunnel binds a local listener and asks the connected peer to
-//! connect out to a remote `source`, bridging the two. Tunnels are activated on
-//! demand (the TUI sends start/stop commands); nothing starts automatically
-//! unless `DUOPIPE_AUTOSTART_TUNNELS` is set (test mode only).
+//! `Role::Dial` session. Within any one connection, only the dialer opens its
+//! single tunnel: the tunnel binds a local listener and, per accepted connection,
+//! asks the connected peer to connect out over TCP to a bare `host:port` source,
+//! bridging the two. The tunnel is activated on demand (the TUI sends start/stop
+//! commands); nothing starts automatically unless `DUOPIPE_AUTOSTART_TUNNELS` is
+//! set (test mode only).
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
-//! peer is trusted, but the *acceptor* still gates each requested `source`
-//! against its `allowed_sources` CIDR allowlist before connecting. Empty TCP
-//! allowlists are defaulted to localhost at startup.
+//! peer is fully trusted — the acceptor connects out to any `host:port` it
+//! requests (there is no source allowlist).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,31 +23,27 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use iroh::endpoint::ConnectionError;
 use iroh::{Endpoint, EndpointId};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::{
     AppState, ConnStatus, DialCommand, DialTarget, NameCommand, NameConflict, Role, TunnelCommand,
-    TunnelId, TunnelStatus,
+    TunnelStatus,
 };
 use crate::auth::is_token_valid;
-use crate::config::{AllowedSources, TransportTuning, TunnelEntry};
+use crate::config::{TransportTuning, TunnelEntry};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::net::{
-    check_source_allowed, extract_addr_from_source, resolve_all_target_addrs, resolve_listen_addrs,
-    try_connect_tcp, tune_tcp_stream,
+    resolve_all_target_addrs, resolve_listen_addrs, try_connect_tcp, tune_tcp_stream,
 };
 
 use crate::iroh_mode::endpoint::{
     ALPN, connect_to_server, create_client_endpoint, create_server_endpoint, validate_relay_only,
     watch_connection_paths,
 };
-use crate::iroh_mode::helpers::{
-    bridge_streams, forward_stream_to_udp_client, forward_stream_to_udp_server,
-    forward_udp_to_stream, open_bi_with_retry,
-};
+use crate::iroh_mode::helpers::{bridge_streams, open_bi_with_retry};
 use crate::signaling::{
     AuthRequest, AuthResponse, StreamAck, StreamHello, decode_auth_request, decode_auth_response,
     decode_stream_ack, decode_stream_hello, encode_auth_request, encode_auth_response,
@@ -96,9 +92,6 @@ pub struct PeerConfig {
     /// EndpointId of the peer to dial (required for `Dial`; the dial half's target
     /// for `Both` in quick mode).
     pub peer_node_id: Option<EndpointId>,
-    /// CIDR allowlist gating which of our sources the peer may request.
-    /// Empty protocol allowlists are defaulted to localhost in `run_peer`.
-    pub allowed_sources: AllowedSources,
     /// When true, start every configured tunnel as soon as a connection is up
     /// (set from `DUOPIPE_AUTOSTART_TUNNELS` in test mode; see `DUOPIPE_TEST_MODE`).
     pub autostart_tunnels: bool,
@@ -149,7 +142,6 @@ impl std::fmt::Debug for PeerConfig {
         f.debug_struct("PeerConfig")
             .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
-            .field("allowed_sources", &self.allowed_sources)
             .field("autostart_tunnels", &self.autostart_tunnels)
             .field("auth_token", &"[REDACTED]")
             .field("nostr_relays", &self.nostr_relays)
@@ -169,12 +161,8 @@ impl std::fmt::Debug for PeerConfig {
 }
 
 /// Run a symmetric peer: dial or listen, then serve tunnels in both directions.
-pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
+pub async fn run_peer(config: PeerConfig) -> Result<()> {
     validate_relay_only(config.relay_only, &config.relay_urls)?;
-
-    // Empty allowlists default to dual-stack localhost; an empty list would
-    // otherwise reject the common loopback-tunnel case.
-    config.allowed_sources = config.allowed_sources.with_localhost_defaults();
 
     // One global stream limiter for the whole process, created up front so the
     // combined process shares a single cap across its serve and dial halves.
@@ -1013,15 +1001,14 @@ async fn handle_connection(
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
-    // Acceptor side (both roles): accept incoming tunnel requests from the peer, gate
-    // each requested source against our allowed_sources allowlist, then connect out.
+    // Acceptor side (both roles): accept incoming tunnel requests from the peer and
+    // connect out (the peer is trusted once auth passed — no source allowlist).
     // Streams are capped by the global semaphore shared across all peers.
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
-        let allowed_sources = Arc::new(config.allowed_sources.clone());
         tasks.spawn(crate::logging::inherit_source(async move {
-            if let Err(e) = accept_loop(conn, semaphore, allowed_sources).await {
+            if let Err(e) = accept_loop(conn, semaphore).await {
                 log::debug!("Accept loop ended: {}", e);
             }
         }));
@@ -1032,7 +1019,7 @@ async fn handle_connection(
     // half handles many peers at once and initiates no tunnels — there is no single
     // connection a tunnel could be bound to — so it only runs the acceptor above.
     if is_dialer {
-        config.status.seed_tunnels();
+        config.status.reset_tunnel_status();
         // Subscribe before spawning so an autostart burst cannot race the subscription.
         let command_rx = config.status.subscribe_commands();
         {
@@ -1043,11 +1030,9 @@ async fn handle_connection(
                 tunnel_supervisor(conn, semaphore, status, command_rx).await;
             }));
         }
-        // Optionally autostart every configured tunnel (non-interactive/test mode).
-        if config.autostart_tunnels {
-            for id in config.status.tunnel_ids() {
-                config.status.send_command(TunnelCommand::Start(id));
-            }
+        // Optionally autostart the configured tunnel (non-interactive/test mode).
+        if config.autostart_tunnels && config.status.has_tunnel() {
+            config.status.send_command(TunnelCommand::Start);
         }
     }
 
@@ -1073,32 +1058,32 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Supervise this peer's tunnels over one connection. Listens for
-/// [`TunnelCommand`]s and starts/stops each tunnel, tracking a cancellation
-/// token per running tunnel so a `Stop` (or the connection closing) frees the
-/// bound local port. Tunnels are read live from [`AppState`] so runtime-added
-/// ones are visible without restarting the supervisor.
+/// Supervise this peer's single tunnel over one connection. Listens for
+/// [`TunnelCommand`]s and starts/stops the tunnel, tracking a cancellation token
+/// while it runs so a `Stop` (or the connection closing) frees the bound local
+/// port. The tunnel spec is read live from [`AppState`] so a runtime change is
+/// visible without restarting the supervisor.
 async fn tunnel_supervisor(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
     mut command_rx: broadcast::Receiver<TunnelCommand>,
 ) {
-    let mut running: HashMap<TunnelId, CancellationToken> = HashMap::new();
-    // Tasks report their own id here when they end on their own (error/EOF), so the
-    // supervisor can drop the stale token and allow a restart.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<TunnelId>();
+    let mut running: Option<CancellationToken> = None;
+    // The task signals here when it ends on its own (error/EOF), so the supervisor
+    // can drop the stale token and allow a restart.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
     loop {
         tokio::select! {
             cmd = command_rx.recv() => match cmd {
-                Ok(TunnelCommand::Start(id)) => {
-                    if running.contains_key(&id) {
+                Ok(TunnelCommand::Start) => {
+                    if running.is_some() {
                         continue; // already running
                     }
-                    let Some(req) = status.get_tunnel(id) else { continue };
+                    let Some(req) = status.tunnel() else { continue };
                     let token = CancellationToken::new();
-                    running.insert(id, token.clone());
+                    running = Some(token.clone());
 
                     let conn = conn.clone();
                     let semaphore = semaphore.clone();
@@ -1106,7 +1091,7 @@ async fn tunnel_supervisor(
                     let done_tx = done_tx.clone();
                     tokio::spawn(crate::logging::inherit_source(async move {
                         let outcome = tokio::select! {
-                            r = run_tunnel(conn.clone(), req, semaphore, status.clone(), id) => Some(r),
+                            r = run_tunnel(conn.clone(), req, semaphore, status.clone()) => Some(r),
                             _ = token.cancelled() => None,
                             // Tie the listener's lifetime to the connection so it
                             // never outlives it (which would leak the bound port).
@@ -1114,19 +1099,19 @@ async fn tunnel_supervisor(
                         };
                         match outcome {
                             Some(Err(e)) => {
-                                status.update_tunnel(id, TunnelStatus::Error, e.to_string());
-                                log::warn!("Tunnel {} ended: {}", id, e);
+                                status.update_tunnel(TunnelStatus::Error, e.to_string());
+                                log::warn!("Tunnel ended: {}", e);
                             }
                             // Stopped, connection closed, or the listen loop ended cleanly.
                             Some(Ok(())) | None => {
-                                status.update_tunnel(id, TunnelStatus::Idle, String::new());
+                                status.update_tunnel(TunnelStatus::Idle, String::new());
                             }
                         }
-                        let _ = done_tx.send(id);
+                        let _ = done_tx.send(());
                     }));
                 }
-                Ok(TunnelCommand::Stop(id)) => {
-                    if let Some(token) = running.remove(&id) {
+                Ok(TunnelCommand::Stop) => {
+                    if let Some(token) = running.take() {
                         token.cancel();
                     }
                 }
@@ -1135,8 +1120,8 @@ async fn tunnel_supervisor(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
-            Some(id) = done_rx.recv() => {
-                running.remove(&id);
+            Some(()) = done_rx.recv() => {
+                running = None;
             }
         }
     }
@@ -1225,7 +1210,6 @@ async fn auth_as_listener(
 async fn accept_loop(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
-    allowed_sources: Arc<AllowedSources>,
 ) -> Result<()> {
     let mut stream_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1236,9 +1220,8 @@ async fn accept_loop(
             .context("accept_bi failed (connection closed)")?;
 
         let semaphore = semaphore.clone();
-        let allowed_sources = allowed_sources.clone();
         stream_tasks.spawn(crate::logging::inherit_source(async move {
-            if let Err(e) = handle_incoming_stream(send, recv, semaphore, allowed_sources).await {
+            if let Err(e) = handle_incoming_stream(send, recv, semaphore).await {
                 log::warn!("Stream error: {}", e);
             }
         }));
@@ -1251,7 +1234,6 @@ async fn handle_incoming_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     semaphore: Arc<Semaphore>,
-    allowed_sources: Arc<AllowedSources>,
 ) -> Result<()> {
     let hello_bytes = tokio::time::timeout(HELLO_TIMEOUT, read_length_prefixed(&mut recv))
         .await
@@ -1261,20 +1243,9 @@ async fn handle_incoming_stream(
 
     match hello {
         StreamHello::LocalForward { source, .. } => {
-            // Gate the requested source against our allowlist (fail-closed) before
-            // committing a session permit or connecting out.
-            let networks = if source.starts_with("udp://") {
-                &allowed_sources.udp
-            } else {
-                &allowed_sources.tcp
-            };
-            if let Err(e) = check_source_allowed(&source, networks).await {
-                log::warn!("Rejecting requested source: {}", e);
-                let ack = StreamAck::rejected(e.to_string());
-                let _ = send.write_all(&encode_stream_ack(&ack)?).await;
-                let _ = send.finish();
-                return Ok(());
-            }
+            // The peer is trusted once auth passed, so we connect out to whatever
+            // source it requests — no allowlist check. Streams are still capped by
+            // the global session permit.
             let Some(permit) = acquire_or_reject(&semaphore, &mut send).await? else {
                 return Ok(());
             };
@@ -1301,51 +1272,28 @@ async fn acquire_or_reject(
     }
 }
 
-/// Connect out to `dest` and bridge it with the stream (acceptor / connect side).
+/// Connect out over TCP to `dest` (a bare `host:port`) and bridge it with the
+/// stream (acceptor / connect side).
 async fn connect_side(
     mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     dest: &str,
 ) -> Result<()> {
-    let is_tcp = dest.starts_with("tcp://");
-    let is_udp = dest.starts_with("udp://");
-    if !is_tcp && !is_udp {
-        let ack = StreamAck::rejected("Invalid destination protocol (must be tcp:// or udp://)");
-        send.write_all(&encode_stream_ack(&ack)?).await?;
-        let _ = send.finish();
-        anyhow::bail!("Invalid destination protocol: {}", dest);
-    }
-
-    let addr = extract_addr_from_source(dest)
-        .ok_or_else(|| anyhow::anyhow!("Invalid destination URL: {}", dest))?;
-
-    if is_tcp {
-        let target_addrs = resolve_all_target_addrs(&addr).await?;
-        match try_connect_tcp(&target_addrs).await {
-            Ok(tcp_stream) => {
-                send.write_all(&encode_stream_ack(&StreamAck::accepted())?)
-                    .await?;
-                log::info!("-> Connected to TCP {}", addr);
-                bridge_streams(recv, send, tcp_stream).await?;
-                log::info!("<- TCP connection to {} closed", addr);
-            }
-            Err(e) => {
-                let ack = StreamAck::rejected(format!("connect failed: {}", e));
-                send.write_all(&encode_stream_ack(&ack)?).await?;
-                let _ = send.finish();
-                anyhow::bail!("Failed to connect to TCP {}: {}", addr, e);
-            }
+    let target_addrs = resolve_all_target_addrs(dest).await?;
+    match try_connect_tcp(&target_addrs).await {
+        Ok(tcp_stream) => {
+            send.write_all(&encode_stream_ack(&StreamAck::accepted())?)
+                .await?;
+            log::info!("-> Connected to TCP {}", dest);
+            bridge_streams(recv, send, tcp_stream).await?;
+            log::info!("<- TCP connection to {} closed", dest);
         }
-    } else {
-        let target_addrs = Arc::new(resolve_all_target_addrs(&addr).await?);
-        if target_addrs.is_empty() {
-            anyhow::bail!("No target addresses resolved for '{}'", addr);
+        Err(e) => {
+            let ack = StreamAck::rejected(format!("connect failed: {}", e));
+            send.write_all(&encode_stream_ack(&ack)?).await?;
+            let _ = send.finish();
+            anyhow::bail!("Failed to connect to TCP {}: {}", dest, e);
         }
-        send.write_all(&encode_stream_ack(&StreamAck::accepted())?)
-            .await?;
-        log::info!("-> Forwarding UDP to {}", addr);
-        forward_stream_to_udp_server(recv, send, target_addrs).await?;
-        log::info!("<- UDP forwarding to {} closed", addr);
     }
 
     Ok(())
@@ -1364,30 +1312,15 @@ async fn run_tunnel(
     req: TunnelEntry,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
-    id: TunnelId,
 ) -> Result<()> {
     let hello = StreamHello::local_forward(&req.remote_source);
     let listen_addrs = resolve_listen_addrs(&req.local_listen)
         .await
         .with_context(|| format!("Invalid tunnel listen address '{}'", req.local_listen))?;
 
-    if req.remote_source.starts_with("udp://") {
-        let listen_addr = *listen_addrs
-            .first()
-            .context("No listen address resolved for tunnel")?;
-        let udp_socket = Arc::new(
-            UdpSocket::bind(listen_addr)
-                .await
-                .with_context(|| format!("Failed to bind UDP listener on {}", listen_addr))?,
-        );
-        log::info!("Listening on UDP {} <- {}", listen_addr, req.remote_source);
-        status.update_tunnel(id, TunnelStatus::Listening, listen_addr.to_string());
-        udp_listen_side(&conn, hello, udp_socket).await
-    } else {
-        let listeners = bind_tcp_listeners(&listen_addrs, &req.remote_source).await?;
-        status.update_tunnel(id, TunnelStatus::Listening, req.local_listen.clone());
-        tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
-    }
+    let listeners = bind_tcp_listeners(&listen_addrs, &req.remote_source).await?;
+    status.update_tunnel(TunnelStatus::Listening, req.local_listen.clone());
+    tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
 }
 
 // ============================================================================
@@ -1478,33 +1411,6 @@ async fn open_tcp_data_stream(
     bridge_streams(recv, send, tcp_stream).await
 }
 
-/// Run the UDP listen side over a single stream: open it, send the hello, await
-/// the ack, then forward packets both ways. `udp_socket` is a bound local socket.
-async fn udp_listen_side(
-    conn: &iroh::endpoint::Connection,
-    hello: StreamHello,
-    udp_socket: Arc<UdpSocket>,
-) -> Result<()> {
-    let (mut send, mut recv) = open_bi_with_retry(conn).await?;
-    send.write_all(&encode_stream_hello(&hello)?).await?;
-    expect_ack(&mut recv).await?;
-
-    let peer_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-    tokio::select! {
-        r = forward_udp_to_stream(udp_socket.clone(), send, peer_addr.clone()) => {
-            if let Err(e) = r {
-                log::warn!("UDP -> stream error: {}", e);
-            }
-        }
-        r = forward_stream_to_udp_client(recv, udp_socket, peer_addr) => {
-            if let Err(e) = r {
-                log::warn!("stream -> UDP error: {}", e);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Read a [`StreamAck`] from the stream and fail if it was rejected.
 async fn expect_ack(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
     let ack_bytes = tokio::time::timeout(ACK_TIMEOUT, read_length_prefixed(recv))
@@ -1534,11 +1440,10 @@ mod tests {
     }
 
     fn test_peer_config(role: Role, token: &str) -> Arc<PeerConfig> {
-        let status = AppState::new(role, false, LogBuffer::new(16), vec![], false, None);
+        let status = AppState::new(role, false, LogBuffer::new(16), None, false, None);
         Arc::new(PeerConfig {
             role,
             peer_node_id: None,
-            allowed_sources: AllowedSources::default(),
             autostart_tunnels: false,
             auth_token: token.to_string(),
             nostr_relays: vec![],
@@ -1556,26 +1461,22 @@ mod tests {
         })
     }
 
-    /// `split_serve_dial_config` keeps the serving allowlist + own name on an always-on
-    /// listen half (which owns the reported node id), gives the dial half no fixed
-    /// target, and shares one `AppState`.
+    /// `split_serve_dial_config` keeps the own name on an always-on listen half (which
+    /// owns the reported node id), gives the dial half no fixed target, and shares one
+    /// `AppState`.
     #[test]
     fn split_serve_dial_config_shapes_both_halves() {
         let status = AppState::new(
             Role::Both,
             false,
             LogBuffer::new(16),
-            vec![],
+            None,
             true,
             Some("homelab".to_string()),
         );
         let both = PeerConfig {
             role: Role::Both,
             peer_node_id: None,
-            allowed_sources: AllowedSources {
-                tcp: vec!["10.0.0.0/8".to_string()],
-                udp: vec![],
-            },
             autostart_tunnels: true,
             auth_token: "tok".to_string(),
             nostr_relays: vec![],
@@ -1601,7 +1502,6 @@ mod tests {
         assert_eq!(listen.nostr_identifier.as_deref(), Some("homelab"));
         assert!(listen.report_endpoint_id);
         assert!(!listen.autostart_tunnels);
-        assert_eq!(listen.allowed_sources.tcp, vec!["10.0.0.0/8".to_string()]);
 
         // The dial half carries no fixed target (it dials runtime requests) and its
         // endpoint id is internal.
@@ -1618,7 +1518,7 @@ mod tests {
     /// surfaces in the snapshot.
     #[test]
     fn dial_command_roundtrip_and_target_in_snapshot() {
-        let status = AppState::new(Role::Both, false, LogBuffer::new(16), vec![], true, None);
+        let status = AppState::new(Role::Both, false, LogBuffer::new(16), None, true, None);
         let mut rx = status.subscribe_dial();
         status.set_dial_target(Some("laptop".to_string()));
         assert_eq!(status.snapshot().dial_target.as_deref(), Some("laptop"));

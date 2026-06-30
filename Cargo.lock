@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "duopipe"
-version = "0.0.20"
+version = "0.0.21"
 dependencies = [
  "anyhow",
  "base64",
@@ -1096,7 +1096,6 @@ dependencies = [
  "env_logger",
  "futures",
  "gethostname",
- "ipnet",
  "iroh",
  "iroh-mdns-address-lookup",
  "jiff",

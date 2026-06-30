@@ -1,10 +1,9 @@
 //! duopipe
 //!
-//! Forwards TCP or UDP traffic through iroh P2P connections.
+//! Forwards a single TCP stream through iroh P2P connections.
 
 mod app_state;
 mod auth;
-mod buffer;
 mod config;
 mod error;
 mod iroh_mode;
@@ -29,15 +28,13 @@ use std::path::{Path, PathBuf};
 /// Capacity of the in-memory log ring buffer shown in the TUI.
 const LOG_CAPACITY: usize = 2000;
 
-use crate::config::{
-    AllowedSources, ConfigSource, PeerConfig, expand_tilde, load_peer_config,
-};
+use crate::config::{ConfigSource, PeerConfig, expand_tilde, load_peer_config};
 use crate::iroh_mode::endpoint::validate_relay_only;
 
 #[derive(Parser)]
 #[command(name = "duopipe")]
 #[command(version)]
-#[command(about = "Forward TCP/UDP traffic through iroh P2P connections")]
+#[command(about = "Forward a single TCP stream through iroh P2P connections")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -202,11 +199,7 @@ impl TestEnv {
     /// token comes from `config_auth_token` (already resolved/validated), or is
     /// generated for Listen. Evaluated before the peer starts so failures print
     /// plainly and exit.
-    fn resolve_preset(
-        &self,
-        config_auth_token: Option<String>,
-        allowed_sources: AllowedSources,
-    ) -> Result<ResolvedPeer> {
+    fn resolve_preset(&self, config_auth_token: Option<String>) -> Result<ResolvedPeer> {
         match &self.peer_node_id {
             Some(node) => {
                 let id: EndpointId = node
@@ -221,7 +214,6 @@ impl TestEnv {
                     peer_identifier: None,
                     auth_token,
                     token_generated: false,
-                    allowed_sources,
                 })
             }
             None => {
@@ -240,7 +232,6 @@ impl TestEnv {
                     peer_identifier: None,
                     auth_token,
                     token_generated,
-                    allowed_sources,
                 })
             }
         }
@@ -277,7 +268,6 @@ async fn run_peer_headless(
     let peer_cfg = iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        allowed_sources: resolved.allowed_sources.clone(),
         autostart_tunnels,
         auth_token: resolved.auth_token,
         // Headless test mode never uses nostr: the node id is wired directly via
@@ -433,8 +423,8 @@ async fn run_start_peer(
     test_env: &Option<TestEnv>,
     log_buffer: Option<std::sync::Arc<logging::LogBuffer>>,
 ) -> Result<()> {
-    // Validate config structure and address formats (requests, allowlist,
-    // transport). In configless mode this runs on defaults, which are trivially valid.
+    // Validate config structure and address formats (tunnel addresses, transport).
+    // In configless mode this runs on defaults, which are trivially valid.
     cfg.validate().map_err(TunnelError::config)?;
 
     let relay_urls = cfg.relay_urls.clone().unwrap_or_default();
@@ -462,7 +452,7 @@ async fn run_start_peer(
     // nostr-mode token requirement below does not apply here.
     if let Some(test_env) = test_env {
         let resolved = test_env
-            .resolve_preset(config_auth_token, cfg.allowed_sources.clone())
+            .resolve_preset(config_auth_token)
             .map_err(TunnelError::config)?;
         return run_peer_headless(
             resolved,
@@ -535,8 +525,7 @@ async fn run_start_peer(
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
         logs: log_buffer,
-        tunnels: cfg.tunnel.clone(),
-        allowed_sources: cfg.allowed_sources.clone(),
+        tunnel: cfg.tunnel.clone(),
         relay_urls,
         relay_only,
         dns_server: cfg.dns_server.clone(),

@@ -11,7 +11,7 @@ use tui_input::Input;
 
 use super::textinput::{INPUT_FIELD_HEIGHT, render_input_field};
 use crate::app_state::{
-    AppSnapshot, ConnStatus, NameConflict, PeerRow, Role, TunnelId, TunnelRow, TunnelStatus,
+    AppSnapshot, ConnStatus, NameConflict, PeerRow, Role, TunnelRow, TunnelStatus,
 };
 use crate::config::TunnelEntry;
 use crate::logging::LogLine;
@@ -39,9 +39,7 @@ pub struct UiState {
     /// `Warn` churn flagged `verbose_only`); otherwise only the concise view. Toggled
     /// with `v` on the logs screen.
     pub verbose: bool,
-    /// Index of the highlighted tunnel row (toggled with Enter).
-    pub selected: usize,
-    /// When `Some`, the add/edit-tunnel modal is open and captures all keystrokes.
+    /// When `Some`, the set-tunnel modal is open and captures all keystrokes.
     pub add_form: Option<AddTunnelForm>,
     /// When `Some`, the "connect to peer" modal is open and captures all keystrokes.
     pub connect_form: Option<ConnectForm>,
@@ -57,74 +55,21 @@ pub struct UiState {
     pub quit_armed: bool,
 }
 
-/// Which field the "add request" modal is currently editing.
+/// Which field the set-tunnel modal is currently editing. Both fields are bare
+/// `host:port` text inputs.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AddField {
     #[default]
-    Name,
-    /// Protocol selector (tcp/udp) for `remote_source`; not a text field.
-    Protocol,
     RemoteSource,
     LocalListen,
 }
 
-/// Transport protocol chosen on the add-request form. Becomes the `remote_source`
-/// URL scheme, so the user types only `host:port`.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Protocol {
-    #[default]
-    Tcp,
-    Udp,
-}
-
-impl Protocol {
-    /// URL scheme for this protocol (`tcp` / `udp`).
-    pub fn scheme(self) -> &'static str {
-        match self {
-            Protocol::Tcp => "tcp",
-            Protocol::Udp => "udp",
-        }
-    }
-
-    /// Toggle between the two protocols.
-    pub fn toggled(self) -> Self {
-        match self {
-            Protocol::Tcp => Protocol::Udp,
-            Protocol::Udp => Protocol::Tcp,
-        }
-    }
-
-    /// The protocol named by a `remote_source` URL scheme. Anything that is not
-    /// `udp://` is treated as TCP (the default), matching `scheme()`.
-    pub fn from_remote_source(remote_source: &str) -> Self {
-        if remote_source.starts_with("udp://") {
-            Protocol::Udp
-        } else {
-            Protocol::Tcp
-        }
-    }
-}
-
-/// Strip the `tcp://` / `udp://` scheme from a `remote_source`, leaving the
-/// `host:port` the add/edit form edits (the scheme is chosen via [`Protocol`]).
-fn strip_scheme(remote_source: &str) -> &str {
-    remote_source
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(remote_source)
-}
-
-/// In-progress entry for the add/edit-tunnel modal (modal state). `editing` is
-/// `None` when adding a new tunnel and `Some(id)` when editing an existing one
-/// (only allowed while that tunnel is not running).
+/// In-progress entry for the set-tunnel modal (modal state). Used both to set a
+/// fresh tunnel and to replace the current one (only allowed while it is not
+/// running). Both fields hold a bare `host:port`.
 #[derive(Default)]
 pub struct AddTunnelForm {
-    /// `Some(id)` ⇒ editing that tunnel in place; `None` ⇒ adding a new one.
-    pub editing: Option<TunnelId>,
     pub field: AddField,
-    pub name: Input,
-    /// Protocol for `remote_source`; defaults to TCP.
-    pub protocol: Protocol,
     pub remote_source: Input,
     pub local_listen: Input,
     /// Inline validation error from the last failed submit; cleared on next keypress.
@@ -132,28 +77,21 @@ pub struct AddTunnelForm {
 }
 
 impl AddTunnelForm {
-    /// Build a form pre-filled to edit `id`'s current spec. The `remote_source`
-    /// scheme is split into the protocol selector + the `host:port` text field.
-    pub fn edit(id: TunnelId, entry: &TunnelEntry) -> Self {
+    /// Build a form pre-filled from `entry`'s current spec (replace in place).
+    pub fn edit(entry: &TunnelEntry) -> Self {
         Self {
-            editing: Some(id),
-            field: AddField::Name,
-            name: Input::new(entry.name.clone()),
-            protocol: Protocol::from_remote_source(&entry.remote_source),
-            remote_source: Input::new(strip_scheme(&entry.remote_source).to_string()),
+            field: AddField::RemoteSource,
+            remote_source: Input::new(entry.remote_source.clone()),
             local_listen: Input::new(entry.local_listen.clone()),
             error: None,
         }
     }
 
-    /// The text input for the field currently being edited, or `None` for the
-    /// non-text [`AddField::Protocol`] selector.
+    /// The text input for the field currently being edited.
     pub fn active_mut(&mut self) -> Option<&mut Input> {
         match self.field {
-            AddField::Name => Some(&mut self.name),
             AddField::RemoteSource => Some(&mut self.remote_source),
             AddField::LocalListen => Some(&mut self.local_listen),
-            AddField::Protocol => None,
         }
     }
 }
@@ -181,7 +119,7 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // user dismisses it (both captured by `token_banner_hidden`).
     let show_token_banner = show_generated_token_banner(snap, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
-    let tunnel_rows = snap.tunnels.len().max(1) as u16 + 2; // header + border
+    let tunnel_rows = 1u16 + 2; // single tunnel row + header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
     let [header_area, tunnels_area, peers_area, _filler, footer_area] = Layout::vertical([
         Constraint::Length(header_height(show_token_banner, show_conflict_warning)),
@@ -435,46 +373,19 @@ fn dial_header_line(snap: &AppSnapshot, show_hint: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Modal for adding a tunnel request at runtime. Three text fields are rendered
+/// Modal for setting the single tunnel at runtime. Two text fields are rendered
 /// as standard bordered input boxes; the active one owns the terminal cursor.
 pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
-    let editing = form.editing.is_some();
-    let protocol_active = form.field == AddField::Protocol;
-    let protocol_line = || {
-        let mut spans = vec![Span::raw(format!("{:<14}", "protocol:"))];
-        for p in [Protocol::Tcp, Protocol::Udp] {
-            let selected = form.protocol == p;
-            let mut style = Style::default();
-            if selected {
-                style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
-                if protocol_active {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
-            } else {
-                style = style.fg(Color::DarkGray);
-            }
-            spans.push(Span::styled(format!(" {} ", p.scheme()), style));
-            spans.push(Span::raw(" "));
-        }
-        if protocol_active {
-            spans.push(Span::styled(
-                "←/→ to switch",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        Line::from(spans)
-    };
-
     let error_rows = if form.error.is_some() { 2 } else { 0 };
     let area = centered(
         frame.area(),
         92,
-        2 + 2 + INPUT_FIELD_HEIGHT * 3 + 1 + 1 + 2 + error_rows + 1,
+        2 + 2 + INPUT_FIELD_HEIGHT * 2 + 1 + 2 + error_rows + 1,
     );
     frame.render_widget(Clear, area);
     let panel = Block::default()
         .borders(Borders::ALL)
-        .title(if editing { " edit tunnel " } else { " add tunnel " });
+        .title(" set tunnel ");
     frame.render_widget(panel, area);
 
     let inner = area.inner(Margin {
@@ -483,8 +394,6 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
     });
     let mut constraints = vec![
         Constraint::Length(2),
-        Constraint::Length(INPUT_FIELD_HEIGHT),
-        Constraint::Length(1),
         Constraint::Length(INPUT_FIELD_HEIGHT),
         Constraint::Length(INPUT_FIELD_HEIGHT),
         Constraint::Length(1),
@@ -502,7 +411,7 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         chunks[i],
         vec![
             Line::from(Span::styled(
-                if editing { "Edit tunnel" } else { "Add tunnel" },
+                "Set tunnel",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -510,16 +419,6 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
             Line::raw(""),
         ],
     );
-    i += 1;
-    render_input_field(
-        frame,
-        chunks[i],
-        "Name",
-        &form.name,
-        form.field == AddField::Name,
-    );
-    i += 1;
-    render_modal_line(frame, chunks[i], protocol_line());
     i += 1;
     render_input_field(
         frame,
@@ -541,7 +440,7 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         frame,
         chunks[i],
         Line::from(Span::styled(
-            "remote_source: host:port (protocol prepended)   local_listen: host:port   (name optional)",
+            "remote_source: host:port (TCP, on the peer)   local_listen: host:port (here)",
             Style::default().fg(Color::DarkGray),
         )),
     );
@@ -550,11 +449,7 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         frame,
         chunks[i],
         Line::from(Span::styled(
-            if editing {
-                "↑/↓ move field · ←/→ switch protocol · Enter on local_listen saves · Esc cancel"
-            } else {
-                "↑/↓ move field · ←/→ switch protocol · Enter on local_listen adds & starts · Esc cancel"
-            },
+            "↑/↓ move field · Enter on local_listen sets & starts · Esc cancel",
             Style::default().fg(Color::DarkGray),
         )),
     );
@@ -681,30 +576,24 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     v
 }
 
-fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
-    let header = Row::new(["", "NAME", "SPEC", "STATUS", "DETAIL"])
+fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, _ui: &UiState) {
+    let header = Row::new(["", "SPEC", "STATUS", "DETAIL"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    // A pure listen-only half initiates no tunnels of its own, so its table stays
-    // empty; the combined node's dial half drives the seeded tunnel list.
+    // A pure listen-only half initiates no tunnel of its own, so its table stays
+    // empty; the combined node's dial half drives the single tunnel.
     let empty_msg = match snap.role {
-        Role::Listen => "(serving peers — this side initiates no tunnels)",
-        Role::Dial | Role::Both => "(no tunnels configured)",
+        Role::Listen => "(serving peers — this side initiates no tunnel)",
+        Role::Dial | Role::Both => "(no tunnel set — press a)",
     };
-    let rows: Vec<Row> = if snap.tunnels.is_empty() {
-        vec![Row::new(["", "", empty_msg, "", ""])]
-    } else {
-        snap.tunnels
-            .iter()
-            .enumerate()
-            .map(|(i, t)| tunnel_row(t, i == ui.selected))
-            .collect()
+    let rows: Vec<Row> = match &snap.tunnel {
+        None => vec![Row::new(["", empty_msg, "", ""])],
+        Some(t) => vec![tunnel_row(t)],
     };
     let widths = [
         Constraint::Length(3),
-        Constraint::Length(14),
-        Constraint::Percentage(45),
+        Constraint::Percentage(55),
         Constraint::Length(10),
-        Constraint::Percentage(25),
+        Constraint::Percentage(30),
     ];
     let title = tunnel_title(snap);
     let table = Table::new(rows, widths)
@@ -715,13 +604,13 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiStat
 
 fn tunnel_title(snap: &AppSnapshot) -> &'static str {
     match snap.role {
-        Role::Listen => " Tunnels ",
+        Role::Listen => " Tunnel ",
         Role::Dial | Role::Both if has_connected_dial(snap) => {
-            " Outbound Tunnels  [↑/↓ select · Enter start/stop · a add · e edit · d/Del delete] "
+            " Outbound Tunnel  [Enter start/stop · a set · d/Del clear] "
         }
-        // Without a dial session tunnels can be edited but not started; the connect
+        // Without a dial session the tunnel can be set but not started; the connect
         // hint lives on the dial header line above, not here.
-        Role::Dial | Role::Both => " Outbound Tunnels  [a add · e edit · d/Del delete] ",
+        Role::Dial | Role::Both => " Outbound Tunnel  [a set · d/Del clear] ",
     }
 }
 
@@ -729,24 +618,17 @@ fn has_connected_dial(snap: &AppSnapshot) -> bool {
     snap.dial_target.is_some() && snap.conn_status == ConnStatus::Connected
 }
 
-fn tunnel_row(t: &TunnelRow, selected: bool) -> Row<'static> {
+fn tunnel_row(t: &TunnelRow) -> Row<'static> {
     let marker = if t.status.is_running() { "▶" } else { " " };
-    let cursor = if selected { "›" } else { " " };
-    let row = Row::new(vec![
-        Cell::from(format!("{cursor}{marker}")),
-        Cell::from(t.name.clone()),
+    Row::new(vec![
+        Cell::from(format!(" {marker}")),
         Cell::from(t.spec.clone()),
         Cell::from(Span::styled(
             t.status.label(),
             Style::default().fg(tunnel_color(t.status)),
         )),
         Cell::from(t.detail.clone()),
-    ]);
-    if selected {
-        row.style(Style::default().add_modifier(Modifier::REVERSED))
-    } else {
-        row
-    }
+    ])
 }
 
 fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
@@ -911,7 +793,7 @@ mod tests {
             dial_target: None,
             name_conflict: crate::app_state::NameConflict::Inactive,
             peers: Vec::new(),
-            tunnels: Vec::new(),
+            tunnel: None,
             streams_used: 0,
             streams_max: 64,
         }
@@ -1103,10 +985,10 @@ mod tests {
     fn tunnel_title_matches_dial_state() {
         let snap = base_snapshot(false, None);
         let idle_text = render_text(&snap, &UiState::default());
-        // Idle: no start/stop hint, and the Tunnels box carries only tunnel actions
+        // Idle: no start/stop hint, and the Tunnel box carries only set/clear actions
         // (the connect hint moved to the dial header line).
         assert!(!idle_text.contains("Enter start/stop"));
-        assert!(idle_text.contains("[a add · e edit · d/Del delete]"));
+        assert!(idle_text.contains("[a set · d/Del clear]"));
 
         let mut connected = base_snapshot(false, None);
         connected.dial_target = Some("peer".to_string());

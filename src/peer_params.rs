@@ -7,7 +7,6 @@
 use iroh::EndpointId;
 
 use crate::app_state::Role;
-use crate::config::AllowedSources;
 
 /// Role + target + credential, fully validated.
 ///
@@ -17,10 +16,10 @@ use crate::config::AllowedSources;
 ///   the target peer's name, resolved to a node id at runtime via `auth_token`).
 /// - `Listen` ⇒ `peer_node_id` and `peer_identifier` are `None`; `auth_token` is a
 ///   valid supplied token or a freshly generated one.
-/// - `Both` ⇒ the interactive mode: always serving (gated by `allowed_sources`) with an
-///   on-demand dial session. No target is set here (`peer_node_id`/`peer_identifier` are
-///   `None`) — the user supplies the dial target at runtime via the connect prompt.
-///   `auth_token` is valid (supplied or generated).
+/// - `Both` ⇒ the interactive mode: always serving with an on-demand dial session. No
+///   target is set here (`peer_node_id`/`peer_identifier` are `None`) — the user
+///   supplies the dial target at runtime via the connect prompt. `auth_token` is valid
+///   (supplied or generated).
 #[derive(Clone)]
 pub struct ResolvedPeer {
     pub role: Role,
@@ -34,7 +33,4 @@ pub struct ResolvedPeer {
     /// `true` when `auth_token` was freshly generated (no token in config/env), so
     /// the TUI must surface it for the user to copy. `false` when supplied.
     pub token_generated: bool,
-    /// CIDR allowlist gating which of our sources the peer may request. Supplied by
-    /// config, or entered interactively in setup when config provides none.
-    pub allowed_sources: AllowedSources,
 }
