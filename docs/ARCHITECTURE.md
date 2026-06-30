@@ -20,22 +20,22 @@ This document provides a comprehensive overview of the duopipe architecture, inc
 
 ## System Overview
 
-duopipe is a P2P TCP/UDP port forwarding tool using iroh for peer discovery, relay fallback, and encrypted QUIC transport.
+duopipe is a P2P single-TCP-forward tool using iroh for peer discovery, relay fallback, and encrypted QUIC transport. Each dial session carries one TCP forward — groundwork for a future single SOCKS5 listener (modeled on flextunnel). UDP is intentionally out of scope and lives in a separate project (`../tunnel-rs`).
 
 Binary: `duopipe`
 
 > **Design Goal:** The project's primary goal is to let a **single user link their own devices** (laptop, homelab box, VPS, …) to reach services across them — for development or homelab purposes — without the hassle and security risk of opening a port. Both ends are expected to be machines the same person owns (or otherwise fully trusts). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe nostr` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
-duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, every instance is **always listening** and also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** tunnels and the **server side serves** them; an instance serves many inbound peers at once while dialing out itself. Within a tunnel, traffic flows in both directions.
+duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe nostr` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, every instance is **always listening** and also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** its single TCP tunnel and the **server side serves** it; an instance serves many inbound peers at once while dialing out itself. Within a tunnel, traffic flows in both directions.
 
 There is **no role prompt at startup**: the instance begins listening immediately, and the dial session is started later from the TUI (`c` to connect, `D` to disconnect, re-pointable on demand). For tests, the role is single and derived from environment variables (see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated on every run, so the node id changes each run.
 
 Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that joins an always-on `run_listen` half with a `run_dial_manager` (the dial session manager) over a shared `AppState` and stream semaphore. The serve half and the dial session use separate iroh endpoints; the listen endpoint owns the displayed/published node id. Single-role `Role::Listen`/`Role::Dial` exist only for the headless test path.
 
-Config declares **tunnel requests** and the **serving allowlist** (the dial target is chosen interactively at runtime, not here):
+Config declares the single **tunnel request** and the **serving allowlist** (the dial target is chosen interactively at runtime, not here):
 
-- **`[[tunnel]]`** (`name`, `remote_source`, `local_listen`): templates for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source`, then bridges the two. Activated on demand (TUI `Enter`/`a`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
-- **`[allowed_sources]`** (`tcp` / `udp` CIDR lists): the **serve** half uses these to gate which `remote_source` addresses it will connect out to when a connected peer requests one. Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`).
+- **`[tunnel]`** (`remote_source`, `local_listen`): the template for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source` (a bare `host:port`), then bridges the two. Activated on demand (TUI `Enter`/`a`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
+- **`[allowed_sources]`** (`tcp` CIDR list): the **serve** half uses this to gate which `remote_source` addresses it will connect out to when a connected peer requests one. An empty or absent TCP list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`).
 
 #### Non-interactive mode (testing)
 
@@ -43,7 +43,7 @@ The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_
 
 - `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
-- `DUOPIPE_AUTOSTART_TUNNELS=1` — start every configured `[[tunnel]]` (dial side) on connect.
+- `DUOPIPE_AUTOSTART_TUNNELS=1` — start the configured `[tunnel]` (dial side) on connect.
 - `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
@@ -80,7 +80,7 @@ graph LR
         B[config.rs<br/>Config loading & validation]
         C[iroh_mode/peer.rs<br/>Symmetric peer runtime]
         C2[net.rs<br/>Address parsing & resolution]
-        C3[iroh_mode/helpers.rs<br/>TCP/UDP bridging]
+        C3[iroh_mode/helpers.rs<br/>TCP bridging]
         D[iroh_mode/endpoint.rs<br/>iroh endpoint setup]
         E2[auth.rs<br/>Auth token]
         F[signaling/codec.rs<br/>Stream framing & messages]
@@ -158,7 +158,7 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe nostr`): an always-on serve half plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** tunnels (`[[tunnel]]`), running its own request listeners; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
+Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe nostr`): an always-on serve half plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** its single tunnel (`[tunnel]`), running the request listener; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
 
 ```mermaid
 graph TB
@@ -173,7 +173,7 @@ graph TB
     subgraph "Requester Side of One Connection"
         F[on-demand dial session]
         G[iroh Endpoint<br/>ephemeral node id]
-        H[Request Listeners<br/>for active tunnels]
+        H[Request Listener<br/>for the active tunnel]
         I[Discovery<br/>Pkarr/DNS]
         J[Relay Server]
     end
@@ -200,7 +200,7 @@ graph TB
 
 ### Connection Establishment Flow
 
-Connection setup is asymmetric (dialer + acceptor), and the tunnel model remains asymmetric for that connection: after auth, the dialer opens request streams and the listener accepts, allowlists, and bridges them. An interactive process gets bidirectional use by also having its own independent dial session.
+Connection setup is asymmetric (dialer + acceptor), and the tunnel model remains asymmetric for that connection: after auth, the dialer opens request streams for its single tunnel and the listener accepts, allowlists, and bridges them. An interactive process gets bidirectional use by also having its own independent dial session.
 
 ```mermaid
 sequenceDiagram
@@ -245,7 +245,7 @@ sequenceDiagram
         L->>L: Close connection (error code 2)
     end
 
-    Note over D,L: After auth, the dialer requests tunnels
+    Note over D,L: After auth, the dialer requests its single tunnel
     D->>L: open_bi() + StreamHello::LocalForward{source}
     L->>L: Check source against allowed_sources
     L-->>D: StreamAck + bridged traffic, or rejection
@@ -263,7 +263,7 @@ graph TB
     C --> S{source in allowed_sources?<br/>default localhost}
     S -->|no| R[Reply StreamAck rejected]
     S -->|yes| D[Acquire session permit]
-    D --> E[Connect out to source<br/>tcp:// or udp://]
+    D --> E[Connect out to source over TCP<br/>bare host:port]
     E --> F[Reply StreamAck, bridge]
 
     style B fill:#FFF9C4
@@ -275,7 +275,7 @@ A single global `Semaphore` (default `max_streams = 100`), shared across all con
 
 ### Request Data Flow
 
-A peer activates a request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` against its `[allowed_sources]` allowlist, connects out (`tcp://host:port` or `udp://host:port`), replies `StreamAck`, then bridges. Requests start/stop on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping one cancels its task and frees the bound port.
+A peer activates its request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor checks `source` (a bare `host:port`) against its `[allowed_sources]` allowlist, connects out over TCP, replies `StreamAck`, then bridges. The request starts/stops on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping it cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
@@ -296,7 +296,7 @@ sequenceDiagram
     end
 ```
 
-A request's listener is owned by a task with its own `CancellationToken`; a `Stop` command (or the connection closing) cancels it, dropping the `TcpListener`/`UdpSocket` and aborting in-flight bridged connections, which frees the bound port.
+The request's listener is owned by a task with its own `CancellationToken`; a `Stop` command (or the connection closing) cancels it, dropping the `TcpListener` and aborting in-flight bridged connections, which frees the bound port.
 
 ### TCP Tunnel Data Flow
 
@@ -331,46 +331,6 @@ graph LR
     style F fill:#BBDEFB
     style K fill:#BBDEFB
     style L fill:#BBDEFB
-```
-
-### UDP Tunnel Data Flow
-
-UDP forwarding reuses `forward_stream_to_udp_server` / `forward_stream_to_udp_client` / `forward_udp_to_stream` (`iroh_mode/helpers.rs`) and works in both directions. Each UDP forward uses a single bidirectional stream; packets are length-prefixed (see [UDP Packet Framing](#udp-packet-framing)). On the connect side, UDP sockets are connected to the active target address so only datagrams from that target are returned over the stream; loopback targets also bind their local UDP socket to loopback.
-
-> **Note:** A UDP request inherits a single-peer-address reply limitation — the connect side tracks one external peer address per stream for return packets.
-
-```mermaid
-graph TB
-    subgraph "Opener Side"
-        A[UDP Client] -->|sendto| B[UDP Socket]
-        B -->|recvfrom| C[Track Peer Address]
-        C -->|encode length + data| D[iroh SendStream]
-    end
-
-    subgraph "QUIC Transport"
-        D <-->|encrypted| E[iroh RecvStream]
-    end
-
-    subgraph "Connect Side"
-        E -->|decode| F[Packet Buffer]
-        F -->|sendto| G[UDP Socket]
-        G -->|forward| H[Target Service]
-        H -->|response| G
-        G -->|recvfrom| I[Response Buffer]
-        I -->|encode| J[iroh SendStream]
-    end
-
-    subgraph "Return Path"
-        J <-->|encrypted| K[iroh RecvStream]
-        K -->|decode| L[Packet Buffer]
-        L -->|sendto| B
-        B -->|deliver| A
-    end
-
-    style D fill:#BBDEFB
-    style E fill:#BBDEFB
-    style J fill:#BBDEFB
-    style K fill:#BBDEFB
 ```
 
 ### Endpoint Management
@@ -426,7 +386,7 @@ graph TB
 
     subgraph "Options"
         E[auth_token_file — path to the single shared token<br/>auth_token_fingerprint — required in nostr mode]
-        G[tunnel[] {name, remote_source, local_listen}<br/>allowed_sources {tcp[], udp[]}]
+        G[tunnel {remote_source, local_listen}<br/>allowed_sources {tcp[]}]
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
@@ -465,9 +425,8 @@ The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, th
 auth_token_file = "/etc/duopipe/auth_token.txt"
 auth_token_fingerprint = "a1b2c3d4"   # required in nostr mode; must match the token above
 
-[[tunnel]]
-name = "ssh"
-remote_source = "tcp://127.0.0.1:22"
+[tunnel]
+remote_source = "127.0.0.1:22"
 local_listen = "127.0.0.1:2222"
 ```
 
@@ -530,7 +489,7 @@ graph TB
 ```mermaid
 graph TB
     subgraph "Application Data"
-        A[TCP/UDP Payload]
+        A[TCP Payload]
     end
     
     subgraph "QUIC Layer"
@@ -584,12 +543,12 @@ graph TB
 **Your own devices, coordinated out-of-band.** duopipe is built for **one person linking devices they own** (laptop ↔ homelab box ↔ VPS) — not a public service or multi-tenant gateway. (Two parties who fully trust each other can use it too, but that is not the primary design point.) Several design choices follow directly from this assumption:
 
 - **Out-of-band credential exchange.** The shared auth token is the same value placed on each of your devices, moved over a side channel you already have (a password manager, an existing SSH session, a synced secrets store). The ephemeral node id changes every run, but it no longer needs hand-copying: it is published to and looked up from nostr, keyed off that same shared token (see [Node-id discovery](#node-id-discovery-nostr)).
-- **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, connected peers, and per-tunnel health — and start/stop tunnels manually. Coordination of *what* to expose and *when* is done by you (one person across your screens), not automatically.
-- **Trust assumed between your devices.** Because the dialer can *request* tunnels of the listener once authenticated, the token should only ever live on endpoints you control; the listener's `[allowed_sources]` allowlist then bounds what a dialer can actually reach.
+- **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, connected peers, and tunnel health — and starts/stops its tunnel manually. Coordination of *what* to expose and *when* is done by you (one person across your screens), not automatically.
+- **Trust assumed between your devices.** Because the dialer can *request* a tunnel of the listener once authenticated, the token should only ever live on endpoints you control; the listener's `[allowed_sources]` allowlist then bounds what a dialer can actually reach.
 
 **Multiple peers, no session binding (serve half).** The serve half accepts **many concurrent dialers** over its one iroh endpoint; authentication is the only gate. Each authenticated connection is served independently and shown as a row in the TUI peer list (`AppState::add_peer` / `remove_peer`). There is no sticky single-peer binding and no fatal "wrong peer" rejection — different node ids are all admitted. Because each dialer is a separate process binding its own local ports, N dialers can request the same listener source at once with no conflict; the listener simply makes N independent outbound connects. A brief duplicate connection from the same node id (a reconnect overlap) is de-duplicated in the peer list rather than rejected.
 
-**Dialer requests, listener serves.** Connection setup is asymmetric, and so is the tunnel model: the **dialer** initiates tunnels (it owns the tunnel table and a `tunnel_supervisor`), while the **listener is a pure server** — it runs only the acceptor loop and initiates none of its own (with many peers there would be no single connection a request could bind to). A request asks the listener to connect out to a `source`; before connecting, the listener checks that source against its `[allowed_sources]` CIDR lists (separate for TCP and UDP). Empty or absent TCP or UDP lists default to dual-stack localhost (`127.0.0.0/8`, `::1/128`). Tunnels are activated on demand from the dialer's TUI; nothing forwards until started. To reach a service that lives near the *other* box, dial *from* the box that wants to reach it — every node can dial on demand. Only grant a peer the token if you trust it to reach the networks in your allowlist.
+**Dialer requests, listener serves.** Connection setup is asymmetric, and so is the tunnel model: the **dialer** initiates its single tunnel, while the **listener is a pure server** — it runs only the acceptor loop and initiates none of its own (with many peers there would be no single connection a request could bind to). A request asks the listener to connect out to a `source`; before connecting, the listener checks that source against its `[allowed_sources]` TCP CIDR list. An empty or absent TCP list defaults to dual-stack localhost (`127.0.0.0/8`, `::1/128`). The tunnel is activated on demand from the dialer's TUI; nothing forwards until started. To reach a service that lives near the *other* box, dial *from* the box that wants to reach it — every node can dial on demand. Only grant a peer the token if you trust it to reach the networks in your allowlist.
 
 ### Token Authentication (iroh Mode)
 
@@ -711,12 +670,12 @@ Hermetic tests bypass nostr entirely: when `DUOPIPE_PEER_NODE_ID` is set the dia
 
 ### Signaling Protocol (signaling/codec.rs)
 
-The signaling protocol is `IROH_MULTI_VERSION = 5`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
+The signaling protocol is `IROH_MULTI_VERSION = 6`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
 
 | Message | Direction | Carried On | Purpose |
 |---------|-----------|------------|---------|
 | `AuthRequest` / `AuthResponse` | dialer → listener / reply | first bi-stream (positional, no hello) | Connection-level token auth. |
-| `StreamHello::LocalForward { source }` | requester → acceptor | first frame of a request data stream | Asks the acceptor to connect out to `source` (after the acceptor's `allowed_sources` check) and bridge. |
+| `StreamHello::LocalForward { source }` | requester → acceptor | first frame of a request data stream | Asks the acceptor to connect out over TCP to `source` (a bare `host:port`, after the acceptor's `allowed_sources` check) and bridge. |
 | `StreamAck { accepted, reason }` | acceptor → requester | per data stream | Acceptance reply once the acceptor passes the allowlist and connects out (or rejects/fails). |
 
 ### TCP Tunneling Architecture
@@ -755,86 +714,6 @@ graph TB
     style G fill:#BBDEFB
 ```
 
-### UDP Tunneling Architecture
-
-```mermaid
-graph TB
-    subgraph "Opener Side"
-        A[UDP Socket] --> B[Receive Packet]
-        B --> C[Track Peer Address]
-        C --> D[Encode: u16 len + data]
-    end
-
-    subgraph "QUIC Tunnel"
-        E[Single Bidirectional Stream]
-        F[Send Stream]
-        G[Recv Stream]
-    end
-
-    subgraph "Connect Side"
-        H[Decode Packet]
-        I[Send to Target]
-        J[Receive Response]
-        K[Encode Response]
-    end
-    
-    subgraph "Return Path"
-        L[Send via QUIC]
-        M[Decode at Opener]
-        N[Send to Peer Address]
-    end
-    
-    D --> E
-    E --> F
-    F --> H
-    H --> I
-    I --> J
-    J --> K
-    K --> L
-    L --> G
-    G --> M
-    M --> N
-    N --> C
-    
-    style E fill:#BBDEFB
-    style F fill:#BBDEFB
-    style G fill:#BBDEFB
-    style L fill:#BBDEFB
-```
-
-### UDP Packet Framing
-
-```mermaid
-graph LR
-    subgraph "UDP Packet"
-        A[Payload<br/>variable length]
-    end
-    
-    subgraph "QUIC Stream Frame"
-        B[Length<br/>u16 BE]
-        C[Payload<br/>bytes]
-    end
-    
-    subgraph "Decoding"
-        D[Read 2 bytes]
-        E[Parse length]
-        F[Read N bytes]
-        G[Reconstruct packet]
-    end
-    
-    A --> B
-    A --> C
-    
-    B --> D
-    D --> E
-    E --> F
-    C --> F
-    F --> G
-    
-    style B fill:#FFF9C4
-    style C fill:#C8E6C9
-```
-
 ---
 
 ## Component Details
@@ -856,7 +735,7 @@ The `iroh::Endpoint` provides:
 - `run_dial_manager` — interactive-only manager for the single outbound session. It reuses one client endpoint, idles until a `DialCommand::Connect`, and replaces or disconnects the active session on dashboard commands.
 - `run_dial` — headless test path for a fixed target: `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out, capped by the global semaphore). The **dialer** additionally runs a `tunnel_supervisor` that starts/stops its own tunnels (`run_tunnel`) on `TunnelCommand`s from the TUI, one `CancellationToken` per running tunnel; the **listener** runs only the acceptor (it is a pure server). In test mode, `DUOPIPE_AUTOSTART_TUNNELS=1` starts every dial-side tunnel on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs an `accept_loop` (incoming requests from the peer, each gated by `check_source_allowed` against `allowed_sources` before connecting out over TCP, capped by the global semaphore). The **dialer** additionally drives its single tunnel (`run_tunnel`), starting/stopping it on `TunnelCommand`s from the TUI under a `CancellationToken`; the **listener** runs only the acceptor (it is a pure server). In test mode, `DUOPIPE_AUTOSTART_TUNNELS=1` starts the dial-side tunnel on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
 
 ---
 
@@ -880,7 +759,6 @@ graph LR
 ### Throughput Characteristics
 
 - **TCP Tunneling**: Limited by QUIC stream flow control and congestion control
-- **UDP Tunneling**: Additional framing overhead (2 bytes per packet)
 - **Relay Mode**: Higher latency, potentially lower throughput
 - **Direct Mode**: Near-native performance with encryption overhead
 - **Concurrency**: A single global semaphore caps concurrent forwarded data streams (`max_streams`, default 100) across both directions and all connected peers.
@@ -932,8 +810,7 @@ Retry guidance:
 ### Stream Errors
 
 - **TCP**: Connection reset, timeout → close QUIC stream
-- **UDP**: Packet loss → no retry (UDP semantics preserved)
-- **QUIC**: Stream reset → close local TCP connection or stop UDP forwarding
+- **QUIC**: Stream reset → close local TCP connection
 - **Session limit reached**: acceptor replies with a rejecting `StreamAck`; opener-side TCP connections are dropped.
 
 ---
@@ -942,9 +819,10 @@ Retry guidance:
 
 | Feature | Support |
 |---------|---------|
-| Bidirectional tunnels | **Yes** — the dialer requests tunnels; the listener serves them, and each tunnel carries traffic both ways |
+| Bidirectional tunnel | **Yes** — the dialer requests its single TCP tunnel; the listener serves it, and the tunnel carries traffic both ways |
 | Multi-Stream | **Yes** — many concurrent forwarded data streams per connection (`max_streams`) |
-| Per-tunnel addresses | **Yes** — each `[[tunnel]]` names its own `remote_source` / `local_listen` |
+| Single TCP forward | **Yes** — one `[tunnel]` (`remote_source` / `local_listen`) per dial session; groundwork for a future single SOCKS5 listener |
+| UDP forwarding | **No** — intentionally out of scope; lives in a separate project (`../tunnel-rs`) |
 | Encryption | QUIC/TLS 1.3 |
 | Platform | Linux, macOS, Windows |
 

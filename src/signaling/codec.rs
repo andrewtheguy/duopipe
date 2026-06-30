@@ -3,8 +3,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Version 5: request-based protocol (single LocalForward stream kind, no remote forwards)
-pub const IROH_MULTI_VERSION: u16 = 5;
+/// Version 6: single TCP LocalForward stream kind; `source` is a bare `host:port`
+/// (no scheme), UDP support removed.
+pub const IROH_MULTI_VERSION: u16 = 6;
 
 /// Maximum length for rejection reason to prevent excessively large messages.
 pub const MAX_REJECT_REASON_LENGTH: usize = 512;
@@ -74,9 +75,9 @@ impl std::ops::Deref for AuthToken {
 #[serde(tag = "kind")]
 pub enum StreamHello {
     /// Request data stream. The opener listens locally and wants the acceptor to
-    /// connect out to `source` (e.g. "tcp://127.0.0.1:22"). The acceptor checks
-    /// `source` against its `allowed_sources` allowlist, replies with a
-    /// [`StreamAck`], and (if accepted) bridges traffic.
+    /// connect out over TCP to `source` (a bare `host:port`, e.g. "127.0.0.1:22").
+    /// The acceptor checks `source` against its `allowed_sources` allowlist,
+    /// replies with a [`StreamAck`], and (if accepted) bridges traffic.
     LocalForward { version: u16, source: String },
 }
 
@@ -362,13 +363,13 @@ mod tests {
 
     #[test]
     fn test_stream_hello_local_forward_roundtrip() {
-        let hello = StreamHello::local_forward("tcp://127.0.0.1:22");
+        let hello = StreamHello::local_forward("127.0.0.1:22");
         let encoded = encode_stream_hello(&hello).unwrap();
         let decoded = decode_stream_hello(&encoded).unwrap();
         match decoded {
             StreamHello::LocalForward { version, source } => {
                 assert_eq!(version, IROH_MULTI_VERSION);
-                assert_eq!(source, "tcp://127.0.0.1:22");
+                assert_eq!(source, "127.0.0.1:22");
             }
         }
     }
@@ -505,7 +506,7 @@ mod tests {
     fn test_decode_stream_hello_wrong_version() {
         let bad = StreamHello::LocalForward {
             version: IROH_MULTI_VERSION + 1,
-            source: "tcp://127.0.0.1:22".into(),
+            source: "127.0.0.1:22".into(),
         };
         let json = serde_json::to_vec(&bad).unwrap();
         let len = (json.len() as u32).to_be_bytes();
@@ -519,7 +520,7 @@ mod tests {
     fn test_decode_rejects_trailing_bytes() {
         // A valid frame with extra bytes appended must be rejected, not silently
         // truncated to the framed length.
-        let mut buf = encode_stream_hello(&StreamHello::local_forward("tcp://127.0.0.1:22")).unwrap();
+        let mut buf = encode_stream_hello(&StreamHello::local_forward("127.0.0.1:22")).unwrap();
         // Sanity: the clean frame decodes.
         assert!(decode_stream_hello(&buf).is_ok());
         buf.extend_from_slice(b"trailing");

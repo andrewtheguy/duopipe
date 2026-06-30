@@ -17,20 +17,19 @@
 # no startup listen/dial role choice and no dial target in this file: press `c` on
 # the dashboard and type the target peer's `name` to start the single outbound dial
 # session. This file supplies the shared auth token, this peer's own `name`, the
-# seed tunnel list, the allowlist, relays, tuning, and the nostr relay override.
+# single tunnel, the allowlist, relays, tuning, and the nostr relay override.
 #
-# Tunnel model: every node always serves inbound peers AND can open outbound tunnels
-# on demand over its dial session. The [[tunnel]] entries are a seed list of tunnels
-# this node can dial: each binds a local listener and asks the connected peer to
-# connect out to a remote 'source', bridging the two. Tunnels do NOT start
-# automatically — the TUI lists them and you start/stop each one with Enter (in test
-# mode only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start
-# all on connect). Inbound, this peer serves any number of dialers at once.
+# Tunnel model: every node always serves inbound peers AND can open one outbound TCP
+# tunnel on demand over its dial session. The [tunnel] table is that single tunnel:
+# it binds a local listener and asks the connected peer to connect out to a remote
+# 'remote_source' (a bare host:port, TCP), bridging the two. It does NOT start
+# automatically — the TUI shows it and you start/stop it with Enter (in test mode
+# only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start on
+# connect). Inbound, this peer serves any number of dialers at once.
 #
 # Trust model: once token auth succeeds the dialer is trusted to *ask*, but when it
 # requests one of OUR sources we only honor addresses inside [allowed_sources]
-# (separate CIDR lists per protocol). Empty/absent TCP or UDP defaults to
-# dual-stack localhost.
+# (a TCP CIDR list). An empty/absent list defaults to dual-stack localhost.
 #
 # Node id: the iroh identity key is always ephemeral (regenerated every run), so a
 # listening instance's node id changes between runs. nostr is used as a side
@@ -95,37 +94,27 @@ auth_token_fingerprint = "a1b2c3d4"
 # dns_server = "none"
 
 # ============================================================================
-# Seed tunnels this node can open over its outbound dial session: ask the connected
-# peer to connect out to 'remote_source'; deliver traffic to a local listener bound
-# at 'local_listen'. The 'remote_source' scheme (tcp:// or udp://) selects the
-# protocol. 'name' is the label shown in the TUI and must be unique. Nothing starts
-# until you connect to a peer and activate it (Enter in the TUI, or
-# DUOPIPE_AUTOSTART_TUNNELS=1 in test mode). Tunnels can also be added (a) or edited
-# (e, while not running) from the dashboard at runtime.
+# The single TCP tunnel this node can open over its outbound dial session: ask the
+# connected peer to connect out to 'remote_source' (a bare host:port, TCP); deliver
+# traffic to a local listener bound at 'local_listen'. Optional — in quick mode it is
+# set from the TUI instead. Nothing starts until you connect to a peer and activate it
+# (Enter in the TUI, or DUOPIPE_AUTOSTART_TUNNELS=1 in test mode). The tunnel can also
+# be set (a) or cleared (d) from the dashboard at runtime (while not running).
 # ============================================================================
-[[tunnel]]
-name = "db"
-remote_source = "tcp://127.0.0.1:5678"
+[tunnel]
+remote_source = "127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 
-[[tunnel]]
-name = "cache"
-remote_source = "tcp://127.0.0.1:5679"
-local_listen = "127.0.0.1:15679"
-
 # ============================================================================
-# Allowed source networks the peer may request of US (CIDR notation).
-# Separate lists for TCP and UDP. Supports IPv4 and IPv6.
-# Empty/omitted lists default to dual-stack localhost (127.0.0.0/8, ::1/128).
+# Allowed source networks the peer may request of US (CIDR notation), over TCP.
+# Supports IPv4 and IPv6. An empty/omitted list defaults to dual-stack localhost
+# (127.0.0.0/8, ::1/128).
 # ============================================================================
 [allowed_sources]
 tcp = [
     "127.0.0.0/8",      # localhost
     "192.168.0.0/16",   # private network
     "::1/128",          # IPv6 localhost
-]
-udp = [
-    "10.0.0.0/8",       # private network
 ]
 
 # ============================================================================

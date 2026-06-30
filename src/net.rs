@@ -1,9 +1,9 @@
 //! Shared networking utilities for duopipe.
 
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::net::{TcpStream, lookup_host};
 
 /// Delay between starting connection attempts (Happy Eyeballs style).
 pub const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
@@ -267,59 +267,20 @@ pub fn tune_tcp_stream(stream: &TcpStream) {
 }
 
 // ============================================================================
-// UDP address ordering
-// ============================================================================
-
-/// Order UDP target addresses for connection attempts.
-///
-/// UDP sends do not reliably tell us whether a service exists, so for loopback
-/// names like `localhost` we prefer IPv4 first for consistency with TCP and with
-/// common local-service bindings. Non-loopback addresses use Happy Eyeballs
-/// ordering.
-#[inline]
-pub fn order_udp_addresses(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-    if addrs.iter().all(|addr| addr.ip().is_loopback()) {
-        order_by_loopback_preference(addrs.to_vec())
-    } else {
-        interleave_addresses(addrs)
-    }
-}
-
-// ============================================================================
-// URL Parsing Helpers
-// ============================================================================
-
-/// Extract address (host:port) from a source URL (protocol://host:port).
-/// For IPv6, `host_str()` already includes brackets (e.g., `[::1]`).
-pub fn extract_addr_from_source(source: &str) -> Option<String> {
-    let url = url::Url::parse(source).ok()?;
-    let host = url.host_str()?;
-    let port = url.port()?;
-    Some(format!("{}:{}", host, port))
-}
-
-/// Extract host (bare IP or hostname) from a source URL (protocol://host:port).
-/// For IPv6, strips the brackets that `host_str()` includes so the result can be
-/// parsed directly with `IpAddr::parse`.
-pub fn extract_host_from_source(source: &str) -> Option<String> {
-    let url = url::Url::parse(source).ok()?;
-    url.host_str()
-        .map(|s| s.trim_start_matches('[').trim_end_matches(']').to_string())
-}
-
-/// Extract port from a source URL (protocol://host:port).
-pub fn extract_port_from_source(source: &str) -> Option<u16> {
-    url::Url::parse(source).ok()?.port()
-}
-
-// ============================================================================
 // Source allowlist (CIDR) check
 // ============================================================================
 
-/// Whether `source` (a `tcp://host:port` / `udp://host:port` URL) is permitted by
-/// the CIDR `allowed_networks` list. **Fail-closed:** an empty list rejects
-/// everything. On rejection the `Err` carries a human-readable reason (sent back
-/// to the requester in a `StreamAck`).
+/// Split a bare `host:port` source into its host part (brackets stripped for IPv6
+/// literals). The port is discarded — only the host is needed for the CIDR check.
+fn host_of_source(source: &str) -> Option<&str> {
+    let (host, _port) = source.rsplit_once(':')?;
+    Some(host.trim_start_matches('[').trim_end_matches(']'))
+}
+
+/// Whether `source` (a bare `host:port`) is permitted by the CIDR
+/// `allowed_networks` list. **Fail-closed:** an empty list rejects everything. On
+/// rejection the `Err` carries a human-readable reason (sent back to the requester
+/// in a `StreamAck`).
 ///
 /// Literal IPs are checked directly; hostnames are resolved and **every** resolved
 /// address must fall within an allowed network (fail-closed: one disallowed IP
@@ -332,15 +293,13 @@ pub async fn check_source_allowed(source: &str, allowed_networks: &[String]) -> 
         );
     }
 
-    let host = extract_host_from_source(source)
-        .ok_or_else(|| anyhow::anyhow!("failed to parse source URL '{}'", source))?;
+    let host = host_of_source(source)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse source '{}': expected host:port", source))?;
 
-    let source_ips: Vec<std::net::IpAddr> = match host.parse::<std::net::IpAddr>() {
+    let source_ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => {
-            let port = extract_port_from_source(source)
-                .ok_or_else(|| anyhow::anyhow!("failed to parse port from source '{}'", source))?;
-            let addrs = lookup_host(format!("{}:{}", host, port))
+            let addrs = lookup_host(source)
                 .await
                 .with_context(|| format!("DNS resolution failed for source '{}'", source))?;
             let ips: Vec<_> = addrs.map(|a| a.ip()).collect();
@@ -405,46 +364,6 @@ where
             }
         }
     }
-}
-
-// ============================================================================
-// UDP target socket helper
-// ============================================================================
-
-fn udp_bind_addr_for_target(target_addr: SocketAddr) -> SocketAddr {
-    match target_addr {
-        SocketAddr::V4(addr) if addr.ip().is_loopback() => {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-        }
-        SocketAddr::V6(addr) if addr.ip().is_loopback() => {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)
-        }
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    }
-}
-
-/// Bind and connect a UDP socket to a specific target address.
-///
-/// Connected UDP sockets only receive datagrams from their connected peer. For
-/// loopback targets we also bind the local side to loopback instead of a wildcard
-/// address, so localhost tunnels do not create a publicly bound ephemeral socket.
-pub async fn connect_udp_to_target(target_addr: SocketAddr) -> Result<UdpSocket> {
-    let bind_addr = udp_bind_addr_for_target(target_addr);
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .with_context(|| format!("Failed to bind UDP socket at {}", bind_addr))?;
-
-    socket
-        .connect(target_addr)
-        .await
-        .with_context(|| format!("Failed to connect UDP socket to {}", target_addr))?;
-
-    if let Ok(local_addr) = socket.local_addr() {
-        log::debug!("Connected UDP socket {} -> {}", local_addr, target_addr);
-    }
-
-    Ok(socket)
 }
 
 // ============================================================================
@@ -515,7 +434,7 @@ mod tests {
     }
 
     // =========================================================================
-    // interleave_addresses tests (shared by TCP and UDP Happy Eyeballs)
+    // interleave_addresses tests (TCP Happy Eyeballs)
     // =========================================================================
 
     #[test]
@@ -624,28 +543,11 @@ mod tests {
         assert!(result.contains(&v6_1));
     }
 
-    #[test]
-    fn test_extract_addr_from_source_ipv4() {
-        let result = extract_addr_from_source("tcp://192.168.1.1:22");
-        assert_eq!(result.as_deref(), Some("192.168.1.1:22"));
-    }
-
-    #[test]
-    fn test_extract_addr_from_source_ipv6() {
-        let result = extract_addr_from_source("tcp://[2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8]:22");
-        assert_eq!(
-            result.as_deref(),
-            Some("[2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8]:22")
-        );
-        // Must be parseable as a SocketAddr
-        result.unwrap().parse::<SocketAddr>().unwrap();
-    }
-
     #[tokio::test]
     async fn check_source_empty_list_rejects() {
         // Fail-closed: with no configured networks, everything is rejected.
         assert!(
-            check_source_allowed("tcp://127.0.0.1:22", &[])
+            check_source_allowed("127.0.0.1:22", &[])
                 .await
                 .is_err()
         );
@@ -655,7 +557,7 @@ mod tests {
     async fn check_source_in_range_allowed() {
         let nets = vec!["127.0.0.0/8".to_string()];
         assert!(
-            check_source_allowed("tcp://127.0.0.1:22", &nets)
+            check_source_allowed("127.0.0.1:22", &nets)
                 .await
                 .is_ok()
         );
@@ -665,7 +567,7 @@ mod tests {
     async fn check_source_out_of_range_rejected() {
         let nets = vec!["192.168.0.0/16".to_string()];
         assert!(
-            check_source_allowed("tcp://10.0.0.1:22", &nets)
+            check_source_allowed("10.0.0.1:22", &nets)
                 .await
                 .is_err()
         );
@@ -674,13 +576,14 @@ mod tests {
     #[tokio::test]
     async fn check_source_ipv6_loopback_allowed() {
         let nets = vec!["::1/128".to_string()];
-        assert!(check_source_allowed("tcp://[::1]:22", &nets).await.is_ok());
+        assert!(check_source_allowed("[::1]:22", &nets).await.is_ok());
     }
 
     #[tokio::test]
-    async fn check_source_malformed_url_rejected() {
+    async fn check_source_malformed_rejected() {
         let nets = vec!["127.0.0.0/8".to_string()];
-        assert!(check_source_allowed("not-a-url", &nets).await.is_err());
+        // No port separator at all -> cannot parse host:port.
+        assert!(check_source_allowed("not-a-host-port", &nets).await.is_err());
     }
 
     #[tokio::test]
@@ -706,7 +609,7 @@ mod tests {
         // An allowlist covering every resolved IP must accept.
         let all_nets: Vec<String> = resolved.iter().copied().map(helper).collect();
         assert!(
-            check_source_allowed("tcp://localhost:22", &all_nets)
+            check_source_allowed("localhost:22", &all_nets)
                 .await
                 .is_ok(),
             "every resolved IP allowed -> accept"
@@ -718,110 +621,11 @@ mod tests {
         if distinct.len() >= 2 {
             let partial = vec![helper(resolved[0])]; // allow only the first IP
             assert!(
-                check_source_allowed("tcp://localhost:22", &partial)
+                check_source_allowed("localhost:22", &partial)
                     .await
                     .is_err(),
                 "one disallowed resolved IP must reject (all(), not any())"
             );
         }
-    }
-
-    #[test]
-    fn test_order_udp_addresses_is_alias() {
-        // Non-loopback UDP addresses use Happy Eyeballs ordering.
-        let addrs = vec![
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080),
-            SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-                8080,
-            ),
-        ];
-        assert_eq!(order_udp_addresses(&addrs), interleave_addresses(&addrs));
-    }
-
-    #[test]
-    fn test_order_udp_addresses_loopback_prefers_ipv4() {
-        let addrs = vec![
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-        ];
-
-        let result = order_udp_addresses(&addrs);
-        assert!(result[0].is_ipv4(), "IPv4 should be preferred for loopback");
-        assert!(result[1].is_ipv6(), "IPv6 should be second for loopback");
-    }
-
-    #[test]
-    fn udp_bind_addr_for_loopback_targets_is_loopback() {
-        let v4 = udp_bind_addr_for_target(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 42)),
-            53,
-        ));
-        assert_eq!(v4.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(v4.port(), 0);
-
-        let v6 = udp_bind_addr_for_target(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 53));
-        assert_eq!(v6.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
-        assert_eq!(v6.port(), 0);
-    }
-
-    #[test]
-    fn udp_bind_addr_for_non_loopback_targets_is_unspecified() {
-        let v4 =
-            udp_bind_addr_for_target(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53));
-        assert_eq!(v4.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        assert_eq!(v4.port(), 0);
-
-        let v6 = udp_bind_addr_for_target(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-            53,
-        ));
-        assert_eq!(v6.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
-        assert_eq!(v6.port(), 0);
-    }
-
-    #[tokio::test]
-    async fn connected_udp_target_binds_loopback_and_filters_other_senders() {
-        let target = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("target bind");
-        let target_addr = target.local_addr().expect("target local addr");
-
-        let client = connect_udp_to_target(target_addr)
-            .await
-            .expect("connected UDP client");
-        let client_addr = client.local_addr().expect("client local addr");
-        assert!(client_addr.ip().is_loopback());
-
-        let unrelated = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("unrelated bind");
-        unrelated
-            .send_to(b"wrong-source", client_addr)
-            .await
-            .expect("send unrelated datagram");
-
-        client.send(b"ping").await.expect("send target datagram");
-        let mut target_buf = [0u8; 16];
-        let (len, reply_addr) = target
-            .recv_from(&mut target_buf)
-            .await
-            .expect("target receive");
-        assert_eq!(&target_buf[..len], b"ping");
-
-        target
-            .send_to(b"pong", reply_addr)
-            .await
-            .expect("send target response");
-
-        let mut client_buf = [0u8; 16];
-        let len = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            client.recv(&mut client_buf),
-        )
-        .await
-        .expect("connected client should receive target response")
-        .expect("client receive");
-        assert_eq!(&client_buf[..len], b"pong");
     }
 }

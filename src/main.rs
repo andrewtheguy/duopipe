@@ -1,10 +1,9 @@
 //! duopipe
 //!
-//! Forwards TCP or UDP traffic through iroh P2P connections.
+//! Forwards a single TCP stream through iroh P2P connections.
 
 mod app_state;
 mod auth;
-mod buffer;
 mod config;
 mod error;
 mod iroh_mode;
@@ -37,7 +36,7 @@ use crate::iroh_mode::endpoint::validate_relay_only;
 #[derive(Parser)]
 #[command(name = "duopipe")]
 #[command(version)]
-#[command(about = "Forward TCP/UDP traffic through iroh P2P connections")]
+#[command(about = "Forward a single TCP stream through iroh P2P connections")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -535,7 +534,7 @@ async fn run_start_peer(
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
         logs: log_buffer,
-        tunnels: cfg.tunnel.clone(),
+        tunnel: cfg.tunnel.clone(),
         allowed_sources: cfg.allowed_sources.clone(),
         relay_urls,
         relay_only,

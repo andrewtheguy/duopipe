@@ -28,7 +28,7 @@ use crate::peer_params::ResolvedPeer;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SetupPhase {
     /// Start screen: a summary plus — when config supplies no `[allowed_sources]` — the
-    /// TCP/UDP CIDR allowlists gating what inbound peers may request. Enter proceeds.
+    /// TCP CIDR allowlist gating what inbound peers may request. Enter proceeds.
     Start,
     /// No token from config/env: set one up. Quick mode shows a "Generate new" button
     /// alongside an inline entry field (the token is ephemeral); nostr mode shows only
@@ -55,7 +55,6 @@ enum TokenFocus {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StartFocus {
     AllowedTcp,
-    AllowedUdp,
     Start,
     Exit,
 }
@@ -68,7 +67,7 @@ impl StartFocus {
 
 /// Up/Down move between vertical rows, top to bottom as rendered: the Start/Exit
 /// button row (the two buttons share one row; Left/Right pick between them), then the
-/// first CIDR field, then the second. The CIDR rows only exist when shown.
+/// CIDR field. The CIDR row only exists when shown.
 fn move_focus(state: &mut SetupState, down: bool) {
     // One representative per row; the button row stays on whichever button is focused
     // while moving within it, and is entered (from a field) on the primary Start button.
@@ -78,7 +77,7 @@ fn move_focus(state: &mut SetupState, down: bool) {
         StartFocus::Start
     };
     let rows: &[StartFocus] = if allowlist_fields_shown(state) {
-        &[button_row, StartFocus::AllowedTcp, StartFocus::AllowedUdp]
+        &[button_row, StartFocus::AllowedTcp]
     } else {
         &[button_row]
     };
@@ -115,10 +114,9 @@ pub struct SetupState {
     config_allowed_sources: AllowedSources,
     /// Currently focused element of the start screen.
     focus: StartFocus,
-    /// TCP/UDP CIDR text entered on the start screen (only used when
+    /// TCP CIDR text entered on the start screen (only used when
     /// `config_allowed_sources` is empty).
     allowed_tcp: Input,
-    allowed_udp: Input,
     /// Allowlist resolved once the start screen is submitted, carried to `Done`.
     allowed_sources: AllowedSources,
     /// Whether nostr discovery is active (nostr mode) — display only, for the summary.
@@ -153,7 +151,6 @@ impl SetupState {
             // CIDR fields are reached by arrowing down.
             focus: StartFocus::Start,
             allowed_tcp: Input::default(),
-            allowed_udp: Input::default(),
             allowed_sources: AllowedSources::default(),
             nostr_discovery,
             own_name,
@@ -239,15 +236,7 @@ fn submit_start(state: &mut SetupState) -> Step {
                 return Step::Continue;
             }
         };
-        let udp = match parse_cidr_list(state.allowed_udp.value()) {
-            Ok(list) => list,
-            Err(e) => {
-                state.focus = StartFocus::AllowedUdp;
-                state.error = Some(format!("Invalid UDP CIDR: {e}"));
-                return Step::Continue;
-            }
-        };
-        AllowedSources { tcp, udp }
+        AllowedSources { tcp }
     };
     state.allowed_sources = allowed;
 
@@ -321,9 +310,6 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
                 match state.focus {
                     StartFocus::AllowedTcp => {
                         handle_edit(&mut state.allowed_tcp, key, is_cidr_char)
-                    }
-                    StartFocus::AllowedUdp => {
-                        handle_edit(&mut state.allowed_udp, key, is_cidr_char)
                     }
                     // Buttons ignore text keystrokes.
                     StartFocus::Start | StartFocus::Exit => {}
@@ -466,8 +452,6 @@ fn render_start_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
             Constraint::Length(1),
             Constraint::Length(INPUT_FIELD_HEIGHT),
             Constraint::Length(1),
-            Constraint::Length(INPUT_FIELD_HEIGHT),
-            Constraint::Length(1),
         ]);
     }
     if state.error.is_some() {
@@ -504,23 +488,6 @@ fn render_start_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
             chunks[i],
             Line::from(Span::styled(
                 "space/comma-separated, e.g. 192.168.0.0/16 — blank = localhost (127.0.0.0/8 ::1/128)",
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
-        i += 1;
-        render_input_field(
-            frame,
-            chunks[i],
-            "Allowed UDP sources (CIDR)",
-            &state.allowed_udp,
-            state.focus == StartFocus::AllowedUdp,
-        );
-        i += 1;
-        render_line(
-            frame,
-            chunks[i],
-            Line::from(Span::styled(
-                "space/comma-separated, e.g. 10.0.0.0/8 — blank = localhost (127.0.0.0/8 ::1/128)",
                 Style::default().fg(Color::DarkGray),
             )),
         );
@@ -773,7 +740,6 @@ mod tests {
     fn from_config() -> AllowedSources {
         AllowedSources {
             tcp: vec!["127.0.0.0/8".into()],
-            udp: vec![],
         }
     }
 
@@ -945,8 +911,8 @@ mod tests {
     }
 
     #[test]
-    fn start_screen_collects_tcp_then_udp_allowlist() {
-        // Empty config allowlist -> the two CIDR fields appear below the Start/Exit
+    fn start_screen_collects_tcp_allowlist() {
+        // Empty config allowlist -> the TCP CIDR field appears below the Start/Exit
         // buttons. Focus starts on Start, so arrow down into the TCP field first.
         let mut s = SetupState::new(
             Some(auth::generate_token()),
@@ -958,8 +924,6 @@ mod tests {
         handle_key(key(KeyCode::Down), &mut s); // button row -> AllowedTcp
         assert_eq!(s.focus, StartFocus::AllowedTcp);
         type_str(&mut s, "127.0.0.0/8 192.168.0.0/16");
-        handle_key(key(KeyCode::Down), &mut s); // -> AllowedUdp
-        type_str(&mut s, "10.0.0.0/8");
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
@@ -967,7 +931,6 @@ mod tests {
                     r.allowed_sources.tcp,
                     vec!["127.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
                 );
-                assert_eq!(r.allowed_sources.udp, vec!["10.0.0.0/8".to_string()]);
             }
             _ => panic!("expected Done(Both) with the entered allowlist"),
         }
@@ -1037,17 +1000,15 @@ mod tests {
             false,
             None,
         );
-        // Down steps row-by-row: button group -> first field -> second field -> wrap.
+        // Down steps row-by-row: button group -> the single CIDR field -> wrap.
         assert_eq!(s.focus, StartFocus::Start);
         handle_key(key(KeyCode::Down), &mut s);
         assert_eq!(s.focus, StartFocus::AllowedTcp);
         handle_key(key(KeyCode::Down), &mut s);
-        assert_eq!(s.focus, StartFocus::AllowedUdp);
-        handle_key(key(KeyCode::Down), &mut s);
         assert_eq!(s.focus, StartFocus::Start, "wraps back to the button row");
 
         // The button row is one vertical stop: Left/Right pick between Start and Exit,
-        // and Down leaves the whole row for the first field (no Start->Exit step).
+        // and Down leaves the whole row for the field (no Start->Exit step).
         handle_key(key(KeyCode::Right), &mut s);
         assert_eq!(s.focus, StartFocus::Exit);
         handle_key(key(KeyCode::Down), &mut s);
