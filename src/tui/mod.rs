@@ -319,16 +319,15 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
     false
 }
 
-/// Home-screen keys. Every connection/forwarding state-change is a `Shift`+letter
-/// action so a stray keypress can't start or tear down anything; plain keys are only
-/// for view/dump.
+/// Home-screen keys. `Shift` is reserved for the dial-session lifecycle
+/// (`Shift-C` connect / `Shift-D` disconnect); tunnel actions are plain keys.
 ///
 /// The tunnel belongs to the combined node's outbound dial session; a pure listen-only
-/// half shows only its connected peers. `Shift-C`/`Shift-D` connect/disconnect the dial
-/// session. `Shift-E` opens the set-tunnel modal (set or replace the single tunnel, only
-/// while it is not running). `Shift-S`/`Shift-X` start/stop the listener; `Shift-R`
-/// removes it from the session (config is untouched). `w` writes (dumps) the connection
-/// info to a file. `Enter`/`Space` are intentionally inert here.
+/// half shows only its connected peers. `e` opens the set-tunnel modal (set or replace
+/// the single tunnel, only while it is not running). `s`/`x` start/stop the listener —
+/// `s` is a deliberate key, never the accidental `Enter`. `d` removes the tunnel from
+/// the session (config is untouched). `w` writes (dumps) the connection info to a file.
+/// `Enter`/`Space` are intentionally inert here.
 fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     match key.code {
         // Connect / re-point the on-demand dial session (interactive serve+dial mode).
@@ -342,7 +341,7 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         // The tunnel is driven by the dial half; a pure listen-only half initiates none.
         // Set or replace the single tunnel — only while it is not running (a Listening
         // tunnel must be stopped first so its bound port isn't orphaned).
-        KeyCode::Char('E')
+        KeyCode::Char('e')
             if matches!(state.role, Role::Dial | Role::Both) && !state.tunnel_running() =>
         {
             ui.add_form = Some(match state.tunnel() {
@@ -351,10 +350,10 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
             });
         }
         // Start / stop the listener — a deliberate keypress, never automatic.
-        KeyCode::Char('S') => state.start_tunnel(),
-        KeyCode::Char('X') => state.stop_tunnel(),
+        KeyCode::Char('s') => state.start_tunnel(),
+        KeyCode::Char('x') => state.stop_tunnel(),
         // Remove the single tunnel from the session (config untouched).
-        KeyCode::Char('R') => state.clear_tunnel(),
+        KeyCode::Char('d') | KeyCode::Delete => state.clear_tunnel(),
         KeyCode::Char('w') => match dump_connection_info(&state.snapshot()) {
             Ok(path) => log::info!("Wrote connection info (no auth token) to {path}"),
             Err(e) => log::warn!("Failed to write connection info: {e}"),
@@ -446,7 +445,7 @@ fn is_field_char(c: char) -> bool {
 
 /// Handle a key while the set-tunnel modal is open. Up/Down (or Tab/BackTab)
 /// move between fields; Enter advances, and Enter on the last field validates and
-/// (on success) sets the single tunnel. The listener stays Idle until `Shift-S`.
+/// (on success) sets the single tunnel. The listener stays Idle until `s`.
 /// Esc cancels.
 fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
@@ -494,7 +493,7 @@ fn prev_field(field: AddField) -> AddField {
 
 /// Validate the modal's fields and, on success, set (or replace) the single tunnel.
 /// Both fields are bare `host:port`. Saving only *sets* the spec — it leaves the
-/// listener Idle; the user starts it deliberately with `Shift-S`.
+/// listener Idle; the user starts it deliberately with `s`.
 fn submit_tunnel_form(ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
@@ -779,35 +778,35 @@ mod tests {
     }
 
     #[test]
-    fn shift_r_clears_the_tunnel() {
+    fn d_key_clears_the_tunnel() {
         let st = state();
         st.set_tunnel(req("127.0.0.1:1", "127.0.0.1:11"));
         let mut ui = UiState::default();
 
-        // `Shift-R` clears the single tunnel.
-        assert!(!handle_key(key(KeyCode::Char('R')), &mut ui, &st));
+        // `d` clears the single tunnel.
+        assert!(!handle_key(key(KeyCode::Char('d')), &mut ui, &st));
         assert!(!st.has_tunnel());
-        // Pressing it again with no tunnel is a harmless no-op.
-        assert!(!handle_key(key(KeyCode::Char('R')), &mut ui, &st));
+        // Pressing delete with no tunnel is a harmless no-op.
+        assert!(!handle_key(key(KeyCode::Delete), &mut ui, &st));
         assert!(!st.has_tunnel());
     }
 
     #[test]
-    fn shift_e_opens_set_form_prefilled_from_current_tunnel() {
+    fn e_key_opens_set_form_prefilled_from_current_tunnel() {
         let st = state();
         st.set_tunnel(req("127.0.0.1:53", "127.0.0.1:5353"));
         let mut ui = UiState::default();
 
-        assert!(!handle_key(key(KeyCode::Char('E')), &mut ui, &st));
+        assert!(!handle_key(key(KeyCode::Char('e')), &mut ui, &st));
         let form = ui.add_form.as_ref().expect("set form opened");
         assert_eq!(form.remote_source.value(), "127.0.0.1:53");
         assert_eq!(form.local_listen.value(), "127.0.0.1:5353");
     }
 
     #[test]
-    fn shift_s_x_drive_tunnel_and_enter_is_inert() {
-        // With a tunnel configured, Shift-S/Shift-X are accepted (no panic, no quit) and
-        // bare Enter/Space do nothing on the dashboard (no accidental start). There is no
+    fn s_x_drive_tunnel_and_enter_is_inert() {
+        // With a tunnel configured, `s`/`x` are accepted (no panic, no quit) and bare
+        // Enter/Space do nothing on the dashboard (no accidental start). There is no
         // supervisor in a unit test, so this asserts the keymap wiring, not the bind.
         let st = state();
         st.set_tunnel(req("127.0.0.1:1", "127.0.0.1:11"));
@@ -816,8 +815,8 @@ mod tests {
         for code in [
             KeyCode::Enter,
             KeyCode::Char(' '),
-            KeyCode::Char('S'),
-            KeyCode::Char('X'),
+            KeyCode::Char('s'),
+            KeyCode::Char('x'),
         ] {
             assert!(!handle_key(key(code), &mut ui, &st), "{code:?} must not quit");
         }
