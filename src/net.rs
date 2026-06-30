@@ -1,7 +1,7 @@
 //! Shared networking utilities for duopipe.
 
 use anyhow::{Context, Result};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::{TcpStream, lookup_host};
 
@@ -267,72 +267,6 @@ pub fn tune_tcp_stream(stream: &TcpStream) {
 }
 
 // ============================================================================
-// Source allowlist (CIDR) check
-// ============================================================================
-
-/// Split a bare `host:port` source into its host part (brackets stripped for IPv6
-/// literals). The port is discarded — only the host is needed for the CIDR check.
-fn host_of_source(source: &str) -> Option<&str> {
-    let (host, _port) = source.rsplit_once(':')?;
-    Some(host.trim_start_matches('[').trim_end_matches(']'))
-}
-
-/// Whether `source` (a bare `host:port`) is permitted by the CIDR
-/// `allowed_networks` list. **Fail-closed:** an empty list rejects everything. On
-/// rejection the `Err` carries a human-readable reason (sent back to the requester
-/// in a `StreamAck`).
-///
-/// Literal IPs are checked directly; hostnames are resolved and **every** resolved
-/// address must fall within an allowed network (fail-closed: one disallowed IP
-/// rejects the source, since the outbound connection may pick any of them).
-pub async fn check_source_allowed(source: &str, allowed_networks: &[String]) -> Result<()> {
-    if allowed_networks.is_empty() {
-        anyhow::bail!(
-            "source '{}' rejected: no allowed_sources configured",
-            source
-        );
-    }
-
-    let host = host_of_source(source)
-        .ok_or_else(|| anyhow::anyhow!("failed to parse source '{}': expected host:port", source))?;
-
-    let source_ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
-        Ok(ip) => vec![ip],
-        Err(_) => {
-            let addrs = lookup_host(source)
-                .await
-                .with_context(|| format!("DNS resolution failed for source '{}'", source))?;
-            let ips: Vec<_> = addrs.map(|a| a.ip()).collect();
-            if ips.is_empty() {
-                anyhow::bail!("DNS resolution returned no IPs for source '{}'", source);
-            }
-            ips
-        }
-    };
-
-    let networks: Vec<ipnet::IpNet> = allowed_networks
-        .iter()
-        .filter_map(|n| n.parse::<ipnet::IpNet>().ok())
-        .collect();
-
-    let allowed = source_ips
-        .iter()
-        .all(|ip| networks.iter().any(|net| net.contains(ip)));
-
-    if allowed {
-        Ok(())
-    } else {
-        let ips: Vec<String> = source_ips.iter().map(|ip| ip.to_string()).collect();
-        anyhow::bail!(
-            "source '{}' (resolved to {}) not in allowed networks {:?}",
-            source,
-            ips.join(", "),
-            allowed_networks
-        )
-    }
-}
-
-// ============================================================================
 // Exponential backoff helper
 // ============================================================================
 
@@ -543,89 +477,4 @@ mod tests {
         assert!(result.contains(&v6_1));
     }
 
-    #[tokio::test]
-    async fn check_source_empty_list_rejects() {
-        // Fail-closed: with no configured networks, everything is rejected.
-        assert!(
-            check_source_allowed("127.0.0.1:22", &[])
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn check_source_in_range_allowed() {
-        let nets = vec!["127.0.0.0/8".to_string()];
-        assert!(
-            check_source_allowed("127.0.0.1:22", &nets)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn check_source_out_of_range_rejected() {
-        let nets = vec!["192.168.0.0/16".to_string()];
-        assert!(
-            check_source_allowed("10.0.0.1:22", &nets)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn check_source_ipv6_loopback_allowed() {
-        let nets = vec!["::1/128".to_string()];
-        assert!(check_source_allowed("[::1]:22", &nets).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn check_source_malformed_rejected() {
-        let nets = vec!["127.0.0.0/8".to_string()];
-        // No port separator at all -> cannot parse host:port.
-        assert!(check_source_allowed("not-a-host-port", &nets).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn check_source_multi_ip_hostname_requires_all_allowed() {
-        // `localhost` commonly resolves to multiple IPs (127.0.0.1 and ::1), which
-        // exercises the multi-IP path. The check uses `all()` semantics: every
-        // resolved IP must be allowed, so one disallowed IP rejects the source
-        // (the outbound connection could pick any of them). This guards against a
-        // regression back to `any()`. Resilient to single-stack environments: the
-        // discriminating assertion only runs when localhost yields >=2 distinct IPs.
-        let helper = |ip: std::net::IpAddr| match ip {
-            std::net::IpAddr::V4(_) => format!("{ip}/32"),
-            std::net::IpAddr::V6(_) => format!("{ip}/128"),
-        };
-
-        let resolved: Vec<std::net::IpAddr> = lookup_host("localhost:22")
-            .await
-            .expect("localhost should resolve")
-            .map(|a| a.ip())
-            .collect();
-        assert!(!resolved.is_empty(), "localhost should resolve to >=1 IP");
-
-        // An allowlist covering every resolved IP must accept.
-        let all_nets: Vec<String> = resolved.iter().copied().map(helper).collect();
-        assert!(
-            check_source_allowed("localhost:22", &all_nets)
-                .await
-                .is_ok(),
-            "every resolved IP allowed -> accept"
-        );
-
-        // If localhost resolves to >=2 distinct IPs, an allowlist that omits one of
-        // them must reject under `all()` (it would wrongly pass under `any()`).
-        let distinct: std::collections::BTreeSet<_> = resolved.iter().collect();
-        if distinct.len() >= 2 {
-            let partial = vec![helper(resolved[0])]; // allow only the first IP
-            assert!(
-                check_source_allowed("localhost:22", &partial)
-                    .await
-                    .is_err(),
-                "one disallowed resolved IP must reject (all(), not any())"
-            );
-        }
-    }
 }

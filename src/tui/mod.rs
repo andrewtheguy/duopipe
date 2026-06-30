@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{
 use crate::app_state::{
     AppSnapshot, AppState, DialCommand, DialTarget, NameCommand, NameConflict, Role, TunnelCommand,
 };
-use crate::config::{AllowedSources, TransportTuning, TunnelEntry, validate_tunnel_spec};
+use crate::config::{TransportTuning, TunnelEntry, validate_tunnel_spec};
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use iroh::EndpointId;
@@ -40,7 +40,6 @@ const GENERATED_TOKEN_AUTO_HIDE_AFTER: Duration = Duration::from_secs(10 * 60);
 pub struct TuiLaunch {
     pub logs: Arc<LogBuffer>,
     pub tunnel: Option<TunnelEntry>,
-    pub allowed_sources: AllowedSources,
     pub relay_urls: Vec<String>,
     pub relay_only: bool,
     pub dns_server: Option<String>,
@@ -72,13 +71,12 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut events = EventStream::new();
 
-    // Phase 1: resolve the serving allowlist and auth token via the setup screen.
+    // Phase 1: resolve the auth token via the setup screen.
     let resolved = match run_setup(
         &mut terminal,
         &mut events,
         launch.config_auth_token.clone(),
         launch.expected_token_fingerprint.clone(),
-        launch.allowed_sources.clone(),
         launch.nostr_discovery,
         launch.peer_name.clone(),
     )
@@ -188,7 +186,6 @@ fn build_peer_config(
     crate::iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        allowed_sources: resolved.allowed_sources.clone(),
         autostart_tunnels: false,
         auth_token: resolved.auth_token.clone(),
         nostr_relays: launch.nostr_relays.clone(),
@@ -212,14 +209,12 @@ async fn run_setup(
     events: &mut EventStream,
     config_auth_token: Option<String>,
     expected_token_fingerprint: Option<String>,
-    config_allowed_sources: AllowedSources,
     nostr_discovery: bool,
     own_name: Option<String>,
 ) -> SetupOutcome {
     let mut state = SetupState::new(
         config_auth_token,
         expected_token_fingerprint,
-        config_allowed_sources,
         nostr_discovery,
         own_name,
     );

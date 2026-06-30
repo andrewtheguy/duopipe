@@ -76,8 +76,8 @@ impl std::ops::Deref for AuthToken {
 pub enum StreamHello {
     /// Request data stream. The opener listens locally and wants the acceptor to
     /// connect out over TCP to `source` (a bare `host:port`, e.g. "127.0.0.1:22").
-    /// The acceptor checks `source` against its `allowed_sources` allowlist,
-    /// replies with a [`StreamAck`], and (if accepted) bridges traffic.
+    /// The acceptor (trusting the peer once auth passed) replies with a
+    /// [`StreamAck`] and, on a successful connect, bridges traffic.
     LocalForward { version: u16, source: String },
 }
 

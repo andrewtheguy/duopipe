@@ -1096,7 +1096,6 @@ dependencies = [
  "env_logger",
  "futures",
  "gethostname",
- "ipnet",
  "iroh",
  "iroh-mdns-address-lookup",
  "jiff",

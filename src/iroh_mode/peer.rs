@@ -11,9 +11,8 @@
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
-//! peer is trusted, but the *acceptor* still gates each requested `source`
-//! against its `allowed_sources` CIDR allowlist before connecting. Empty TCP
-//! allowlists are defaulted to localhost at startup.
+//! peer is fully trusted — the acceptor connects out to any `host:port` it
+//! requests (there is no source allowlist).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -34,11 +33,10 @@ use crate::app_state::{
     TunnelStatus,
 };
 use crate::auth::is_token_valid;
-use crate::config::{AllowedSources, TransportTuning, TunnelEntry};
+use crate::config::{TransportTuning, TunnelEntry};
 use crate::error::{ErrorCategory, TunnelError};
 use crate::net::{
-    check_source_allowed, resolve_all_target_addrs, resolve_listen_addrs, try_connect_tcp,
-    tune_tcp_stream,
+    resolve_all_target_addrs, resolve_listen_addrs, try_connect_tcp, tune_tcp_stream,
 };
 
 use crate::iroh_mode::endpoint::{
@@ -94,9 +92,6 @@ pub struct PeerConfig {
     /// EndpointId of the peer to dial (required for `Dial`; the dial half's target
     /// for `Both` in quick mode).
     pub peer_node_id: Option<EndpointId>,
-    /// CIDR allowlist gating which of our sources the peer may request.
-    /// Empty protocol allowlists are defaulted to localhost in `run_peer`.
-    pub allowed_sources: AllowedSources,
     /// When true, start every configured tunnel as soon as a connection is up
     /// (set from `DUOPIPE_AUTOSTART_TUNNELS` in test mode; see `DUOPIPE_TEST_MODE`).
     pub autostart_tunnels: bool,
@@ -147,7 +142,6 @@ impl std::fmt::Debug for PeerConfig {
         f.debug_struct("PeerConfig")
             .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
-            .field("allowed_sources", &self.allowed_sources)
             .field("autostart_tunnels", &self.autostart_tunnels)
             .field("auth_token", &"[REDACTED]")
             .field("nostr_relays", &self.nostr_relays)
@@ -167,12 +161,8 @@ impl std::fmt::Debug for PeerConfig {
 }
 
 /// Run a symmetric peer: dial or listen, then serve tunnels in both directions.
-pub async fn run_peer(mut config: PeerConfig) -> Result<()> {
+pub async fn run_peer(config: PeerConfig) -> Result<()> {
     validate_relay_only(config.relay_only, &config.relay_urls)?;
-
-    // Empty allowlists default to dual-stack localhost; an empty list would
-    // otherwise reject the common loopback-tunnel case.
-    config.allowed_sources = config.allowed_sources.with_localhost_defaults();
 
     // One global stream limiter for the whole process, created up front so the
     // combined process shares a single cap across its serve and dial halves.
@@ -1011,15 +1001,14 @@ async fn handle_connection(
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
-    // Acceptor side (both roles): accept incoming tunnel requests from the peer, gate
-    // each requested source against our allowed_sources allowlist, then connect out.
+    // Acceptor side (both roles): accept incoming tunnel requests from the peer and
+    // connect out (the peer is trusted once auth passed — no source allowlist).
     // Streams are capped by the global semaphore shared across all peers.
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
-        let allowed_sources = Arc::new(config.allowed_sources.clone());
         tasks.spawn(crate::logging::inherit_source(async move {
-            if let Err(e) = accept_loop(conn, semaphore, allowed_sources).await {
+            if let Err(e) = accept_loop(conn, semaphore).await {
                 log::debug!("Accept loop ended: {}", e);
             }
         }));
@@ -1221,7 +1210,6 @@ async fn auth_as_listener(
 async fn accept_loop(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
-    allowed_sources: Arc<AllowedSources>,
 ) -> Result<()> {
     let mut stream_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1232,9 +1220,8 @@ async fn accept_loop(
             .context("accept_bi failed (connection closed)")?;
 
         let semaphore = semaphore.clone();
-        let allowed_sources = allowed_sources.clone();
         stream_tasks.spawn(crate::logging::inherit_source(async move {
-            if let Err(e) = handle_incoming_stream(send, recv, semaphore, allowed_sources).await {
+            if let Err(e) = handle_incoming_stream(send, recv, semaphore).await {
                 log::warn!("Stream error: {}", e);
             }
         }));
@@ -1247,7 +1234,6 @@ async fn handle_incoming_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     semaphore: Arc<Semaphore>,
-    allowed_sources: Arc<AllowedSources>,
 ) -> Result<()> {
     let hello_bytes = tokio::time::timeout(HELLO_TIMEOUT, read_length_prefixed(&mut recv))
         .await
@@ -1257,15 +1243,9 @@ async fn handle_incoming_stream(
 
     match hello {
         StreamHello::LocalForward { source, .. } => {
-            // Gate the requested source against our TCP allowlist (fail-closed) before
-            // committing a session permit or connecting out.
-            if let Err(e) = check_source_allowed(&source, &allowed_sources.tcp).await {
-                log::warn!("Rejecting requested source: {}", e);
-                let ack = StreamAck::rejected(e.to_string());
-                let _ = send.write_all(&encode_stream_ack(&ack)?).await;
-                let _ = send.finish();
-                return Ok(());
-            }
+            // The peer is trusted once auth passed, so we connect out to whatever
+            // source it requests — no allowlist check. Streams are still capped by
+            // the global session permit.
             let Some(permit) = acquire_or_reject(&semaphore, &mut send).await? else {
                 return Ok(());
             };
@@ -1464,7 +1444,6 @@ mod tests {
         Arc::new(PeerConfig {
             role,
             peer_node_id: None,
-            allowed_sources: AllowedSources::default(),
             autostart_tunnels: false,
             auth_token: token.to_string(),
             nostr_relays: vec![],
@@ -1482,9 +1461,9 @@ mod tests {
         })
     }
 
-    /// `split_serve_dial_config` keeps the serving allowlist + own name on an always-on
-    /// listen half (which owns the reported node id), gives the dial half no fixed
-    /// target, and shares one `AppState`.
+    /// `split_serve_dial_config` keeps the own name on an always-on listen half (which
+    /// owns the reported node id), gives the dial half no fixed target, and shares one
+    /// `AppState`.
     #[test]
     fn split_serve_dial_config_shapes_both_halves() {
         let status = AppState::new(
@@ -1498,9 +1477,6 @@ mod tests {
         let both = PeerConfig {
             role: Role::Both,
             peer_node_id: None,
-            allowed_sources: AllowedSources {
-                tcp: vec!["10.0.0.0/8".to_string()],
-            },
             autostart_tunnels: true,
             auth_token: "tok".to_string(),
             nostr_relays: vec![],
@@ -1526,7 +1502,6 @@ mod tests {
         assert_eq!(listen.nostr_identifier.as_deref(), Some("homelab"));
         assert!(listen.report_endpoint_id);
         assert!(!listen.autostart_tunnels);
-        assert_eq!(listen.allowed_sources.tcp, vec!["10.0.0.0/8".to_string()]);
 
         // The dial half carries no fixed target (it dials runtime requests) and its
         // endpoint id is internal.

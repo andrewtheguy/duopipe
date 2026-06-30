@@ -7,11 +7,10 @@
 //! table is the single TCP forward this node can open over its outbound dial
 //! session: it names a remote `host:port` source on the connected peer and a
 //! local listener address where traffic is delivered. The seed is activated
-//! interactively (nothing starts automatically). When a connected peer asks for
-//! one of *our* sources, the `[allowed_sources]` TCP CIDR list gates what we are
-//! willing to expose. An empty list defaults to dual-stack localhost
-//! (`127.0.0.0/8`, `::1/128`). `validate()` checks address and CIDR formats at
-//! parse time. The single `auth_token` is the shared secret used by both sides.
+//! interactively (nothing starts automatically). Once a connected peer passes
+//! token auth it is trusted to request any `host:port` source from us (there is
+//! no source allowlist). `validate()` checks address formats at parse time. The
+//! single `auth_token` is the shared secret used by both sides.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -32,11 +31,6 @@ pub struct PeerConfig {
     /// configless (`quick`) mode it is set from the TUI instead.
     #[serde(default)]
     pub tunnel: Option<TunnelEntry>,
-    /// Source networks (CIDR) this peer is willing to expose when the other party
-    /// requests one of *our* sources. Runtime defaulting fills an empty list with
-    /// dual-stack localhost.
-    #[serde(default)]
-    pub allowed_sources: AllowedSources,
     pub relay_urls: Option<Vec<String>>,
     /// Force all traffic through the relay server (disables direct P2P).
     /// Requires at least one entry in `relay_urls`.
@@ -79,40 +73,6 @@ pub struct TunnelEntry {
     pub remote_source: String,
     /// Local address to listen on (`host:port`) where traffic is delivered.
     pub local_listen: String,
-}
-
-/// Source networks (CIDR) we will expose over TCP when the peer requests one of
-/// our sources. An empty list defaults to dual-stack localhost (see
-/// [`AllowedSources::with_localhost_defaults`]).
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct AllowedSources {
-    /// Allowed TCP source networks (CIDR notation, e.g. "127.0.0.0/8", "::1/128").
-    #[serde(default)]
-    pub tcp: Vec<String>,
-}
-
-/// Dual-stack localhost networks used to default empty allowlists.
-pub const DEFAULT_LOCALHOST_SOURCES: [&str; 2] = ["127.0.0.0/8", "::1/128"];
-
-impl AllowedSources {
-    /// True when no networks are configured.
-    pub fn is_empty(&self) -> bool {
-        self.tcp.is_empty()
-    }
-
-    /// Fill an empty allowlist with dual-stack localhost. An empty list
-    /// otherwise rejects everything, which is surprising for the common
-    /// loopback-tunnel case.
-    pub fn with_localhost_defaults(mut self) -> Self {
-        if self.tcp.is_empty() {
-            self.tcp = DEFAULT_LOCALHOST_SOURCES
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
-        self
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,25 +218,6 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a string is valid CIDR notation (IPv4 or IPv6).
-pub fn validate_cidr(cidr: &str) -> Result<()> {
-    cidr.parse::<ipnet::IpNet>().with_context(|| {
-        format!(
-            "Invalid CIDR network '{}'. Expected format: 192.168.0.0/16 or ::1/128",
-            cidr
-        )
-    })?;
-    Ok(())
-}
-
-/// Validate the CIDR entries in the allowed-source list.
-pub fn validate_allowed_sources(allowed: &AllowedSources) -> Result<()> {
-    for cidr in &allowed.tcp {
-        validate_cidr(cidr).context("Invalid TCP allowed_sources")?;
-    }
-    Ok(())
-}
-
 /// Minimum QUIC window size (1 KB).
 const MIN_WINDOW_SIZE: u32 = 1024;
 
@@ -344,7 +285,6 @@ impl PeerConfig {
         if let Some(tunnel) = &self.tunnel {
             validate_tunnel_spec(tunnel)?;
         }
-        validate_allowed_sources(&self.allowed_sources)?;
         validate_transport_tuning(&self.transport, "transport")?;
         // A name is only required in nostr mode (checked at startup), but if one is
         // set it must be a valid identifier — it is used verbatim in the state path.
@@ -525,9 +465,6 @@ max_streams = 100
 remote_source = "127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 
-[allowed_sources]
-tcp = ["127.0.0.0/8", "::1/128"]
-
 [transport]
 congestion_controller = "bbr"
 receive_window = 67108864
@@ -537,7 +474,6 @@ receive_window = 67108864
         let tunnel = cfg.tunnel.as_ref().expect("a single tunnel");
         assert_eq!(tunnel.remote_source, "127.0.0.1:5678");
         assert_eq!(tunnel.local_listen, "127.0.0.1:15678");
-        assert_eq!(cfg.allowed_sources.tcp.len(), 2);
         assert_eq!(
             cfg.transport.congestion_controller,
             CongestionController::Bbr
@@ -576,16 +512,15 @@ local_listen = "127.0.0.1:15678"
     }
 
     #[test]
-    fn rejects_invalid_cidr() {
+    fn rejects_allowed_sources_key() {
+        // The allowlist was removed; `[allowed_sources]` is now an unknown field.
         let toml = r#"
 [allowed_sources]
-tcp = ["not-a-cidr"]
+tcp = ["127.0.0.0/8"]
 "#;
-        let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
-        let err = cfg.validate().unwrap_err();
         assert!(
-            err.to_string().contains("allowed_sources"),
-            "error was: {err}"
+            toml::from_str::<PeerConfig>(toml).is_err(),
+            "[allowed_sources] should no longer parse"
         );
     }
 
@@ -630,23 +565,6 @@ tcp = ["not-a-cidr"]
             ..Default::default()
         });
         assert!(bad_listen.validate().is_err());
-    }
-
-    #[test]
-    fn with_localhost_defaults_fills_empty_list() {
-        // Empty list -> dual-stack localhost.
-        let filled = AllowedSources::default().with_localhost_defaults();
-        assert_eq!(
-            filled.tcp,
-            vec!["127.0.0.0/8".to_string(), "::1/128".to_string()]
-        );
-
-        // Non-empty list is preserved untouched.
-        let explicit = AllowedSources {
-            tcp: vec!["192.168.0.0/16".to_string()],
-        }
-        .with_localhost_defaults();
-        assert_eq!(explicit.tcp, vec!["192.168.0.0/16".to_string()]);
     }
 
 }

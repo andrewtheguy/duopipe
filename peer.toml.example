@@ -17,7 +17,7 @@
 # no startup listen/dial role choice and no dial target in this file: press `c` on
 # the dashboard and type the target peer's `name` to start the single outbound dial
 # session. This file supplies the shared auth token, this peer's own `name`, the
-# single tunnel, the allowlist, relays, tuning, and the nostr relay override.
+# single tunnel, relays, tuning, and the nostr relay override.
 #
 # Tunnel model: every node always serves inbound peers AND can open one outbound TCP
 # tunnel on demand over its dial session. The [tunnel] table is that single tunnel:
@@ -27,9 +27,9 @@
 # only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start on
 # connect). Inbound, this peer serves any number of dialers at once.
 #
-# Trust model: once token auth succeeds the dialer is trusted to *ask*, but when it
-# requests one of OUR sources we only honor addresses inside [allowed_sources]
-# (a TCP CIDR list). An empty/absent list defaults to dual-stack localhost.
+# Trust model: once token auth succeeds the connected peer is fully trusted — it may
+# ask us to connect out to any host:port (there is no source allowlist). Keep the
+# shared token only on devices you own (or otherwise fully trust).
 #
 # Node id: the iroh identity key is always ephemeral (regenerated every run), so a
 # listening instance's node id changes between runs. nostr is used as a side
@@ -104,18 +104,6 @@ auth_token_fingerprint = "a1b2c3d4"
 [tunnel]
 remote_source = "127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
-
-# ============================================================================
-# Allowed source networks the peer may request of US (CIDR notation), over TCP.
-# Supports IPv4 and IPv6. An empty/omitted list defaults to dual-stack localhost
-# (127.0.0.0/8, ::1/128).
-# ============================================================================
-[allowed_sources]
-tcp = [
-    "127.0.0.0/8",      # localhost
-    "192.168.0.0/16",   # private network
-    "::1/128",          # IPv6 localhost
-]
 
 # ============================================================================
 # Transport Tuning (Optional)
