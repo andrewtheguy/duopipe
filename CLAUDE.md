@@ -15,7 +15,7 @@ user's machines. It is not a public service or a multi-tenant gateway.
 
 It is interactive: every run is **always listening** and holds **one** on-demand
 outbound dial session. Two interactive subcommands — `duopipe quick` (configless,
-dial by node id) and `duopipe nostr` (config-driven, dial by `name`). Headless test
+dial by node id) and `duopipe connect` (config-driven, dial by `name`). Headless test
 mode is gated by `DUOPIPE_TEST_MODE=1`.
 
 **Scope (v1):** a dial session forwards exactly **one TCP** stream — the single
@@ -25,11 +25,11 @@ supported** — that role lives in `../tunnel-rs`. There is no multi-tunnel/mult
 support; don't reintroduce it.
 
 # Automation / AI agents
-The interactive `quick`/`nostr` subcommands need a TTY and are not scriptable, but
+The interactive `quick`/`connect` subcommands need a TTY and are not scriptable, but
 `duopipe generate-auth-token` is. For programmatic use pass `--json` to get a
 `[{"token","fingerprint"}]` array (use `--count N` for several) instead of the
 human-readable `<token>  # fp: <fp>` lines — parse that rather than scraping stdout.
-The `fingerprint` is what goes in a nostr config's `auth_token_fingerprint`; the
+The `fingerprint` is what goes in a connect-mode config's `auth_token_fingerprint`; the
 `token` goes in the `auth_token_file` (or `DUOPIPE_AUTH_TOKEN`) on every paired device.
 
 # Where the details live

@@ -1,9 +1,9 @@
 # duopipe peer configuration example
 #
-# Usage: duopipe nostr -c peer.toml
-#        duopipe nostr                    # loads ~/.config/duopipe/peer.toml
+# Usage: duopipe connect -c peer.toml
+#        duopipe connect                  # loads ~/.config/duopipe/peer.toml
 #
-# This file is read by NOSTR MODE (`duopipe nostr`): the listener publishes its
+# This file is read by CONNECT MODE (`duopipe connect`): the listener publishes its
 # current ephemeral node id to nostr and a dialer looks it up, so the node id need
 # not be exchanged by hand. The auth token (the nostr rendezvous secret) is OPTIONAL
 # in this file — set 'auth_token_file' below or the DUOPIPE_AUTH_TOKEN env var, or
@@ -13,7 +13,7 @@
 # ephemeral, nostr is off, and the dialer enters the node id by hand (supply a token
 # there with `duopipe quick --auth-token-file <path>`, or generate/enter it at setup).
 #
-# `duopipe nostr` is interactive and always starts serving inbound peers. There is
+# `duopipe connect` is interactive and always starts serving inbound peers. There is
 # no startup listen/dial role choice and no dial target in this file: press `c` on
 # the dashboard and type the target peer's `name` to start the single outbound dial
 # session. This file supplies the shared auth token, this peer's own `name`, the
@@ -36,7 +36,7 @@
 # channel to publish & look up the current node id, keyed off the shared auth_token
 # (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
-# This peer's short, memorable identifier. REQUIRED in nostr mode. This peer's
+# This peer's short, memorable identifier. REQUIRED in connect mode. This peer's
 # always-on serve half publishes its node id under this name; another peer dials it
 # by typing this name. Several peers can share one auth token and be reached by name
 # (duplicate names just mean newest-wins). For the raw node-id flow, use quick mode
@@ -54,7 +54,7 @@ name = "web1"
 auth_token_file = "~/.config/duopipe/token.txt"
 
 # The shared token's fingerprint — the first 8 hex digits of its SHA-256. REQUIRED in
-# nostr mode, whether or not the token itself is set above. Whatever token is resolved —
+# connect mode, whether or not the token itself is set above. Whatever token is resolved —
 # from 'auth_token_file', the DUOPIPE_AUTH_TOKEN env var, or pasted at the setup
 # screen — must match this fingerprint, or duopipe refuses to start. This pins each
 # config to one pairing, so pointing it at the wrong token file (or pasting a token

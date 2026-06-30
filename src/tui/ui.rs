@@ -99,7 +99,7 @@ impl AddTunnelForm {
 /// In-progress entry for the runtime "connect to peer" modal (single text field).
 #[derive(Default)]
 pub struct ConnectForm {
-    /// The target: a peer name (nostr mode) or a full node id (quick mode).
+    /// The target: a peer name (connect mode) or a full node id (quick mode).
     pub target: Input,
     /// Inline validation error from the last failed submit; cleared on next keypress.
     pub error: Option<String>,
@@ -200,7 +200,7 @@ fn render_header(
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
-    // This peer's identity: mode and (in nostr mode) its name.
+    // This peer's identity: mode and (in connect mode) its name.
     let mut id_line = vec![
         Span::raw("mode: "),
         Span::styled(mode_label(snap), Style::default().add_modifier(Modifier::BOLD)),
@@ -306,7 +306,7 @@ pub fn render_name_conflict_dialog(frame: &mut Frame, message: &str) {
 
 pub(super) fn mode_label(snap: &AppSnapshot) -> &'static str {
     if snap.nostr_discovery {
-        "nostr"
+        "connect"
     } else {
         "quick"
     }
@@ -868,12 +868,12 @@ mod tests {
     }
 
     #[test]
-    fn nostr_idle_dashboard_shows_mode_name_and_idle_dial() {
+    fn connect_idle_dashboard_shows_mode_name_and_idle_dial() {
         let snap = base_snapshot(true, Some("web1"));
 
         let text = render_text(&snap, &UiState::default());
 
-        assert!(text.contains("mode: nostr"));
+        assert!(text.contains("mode: connect"));
         assert!(text.contains("name: web1"));
         assert!(text.contains("Outbound: not connected"));
         // The connect control hint lives on the dial header line, not the Tunnels box.

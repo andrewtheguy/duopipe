@@ -82,7 +82,7 @@ pub fn generate_token() -> String {
 /// first 4 bytes of the SHA-256 of the token string, as 8 lowercase hex digits — is
 /// displayed persistently in the UI: if it matches on both devices the tokens match,
 /// without ever re-revealing the secret. The same canonical form is used everywhere
-/// (UI, `--json`, the nostr config's `auth_token_fingerprint`, and the per-name state
+/// (UI, `--json`, the connect-mode config's `auth_token_fingerprint`, and the per-name state
 /// file path).
 pub fn token_fingerprint(token: &str) -> String {
     use std::fmt::Write as _;

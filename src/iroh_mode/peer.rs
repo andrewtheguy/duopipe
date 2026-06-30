@@ -110,7 +110,7 @@ pub struct PeerConfig {
     /// combined interactive process) this is the name it publishes its node id under;
     /// for the headless dial test path it is the target peer's name to look up. (An
     /// interactive dial session resolves its target's name at connect time instead.)
-    /// `None` outside nostr mode.
+    /// `None` outside connect mode.
     pub nostr_identifier: Option<String>,
     /// Whether this config's endpoint owns the node id surfaced in the TUI / published
     /// to nostr. Single roles set `true`; in `Role::Both` only the listen sub-config is
@@ -130,7 +130,7 @@ pub struct PeerConfig {
     /// stderr so a test harness can wire up the dialing side. The interactive TUI
     /// shows them in its header instead and leaves this false.
     pub announce_endpoint: bool,
-    /// Path to the loaded peer config file (nostr mode), used to append a rename nudge
+    /// Path to the loaded peer config file (connect mode), used to append a rename nudge
     /// when the user resolves a name conflict. `None` in quick/headless modes.
     pub config_path: Option<PathBuf>,
     /// Shared state surfaced by the TUI.
@@ -812,7 +812,7 @@ fn nudge_rename(config_path: &Option<PathBuf>, identifier: &str) {
 async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
     if config.peer_node_id.is_none() && config.nostr_identifier.is_none() {
         anyhow::bail!(
-            "dialing requires a peer node id (quick mode) or a peer identifier (nostr mode)"
+            "dialing requires a peer node id (quick mode) or a peer identifier (connect mode)"
         );
     }
 
@@ -886,7 +886,7 @@ async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
             && *id == own_id
         {
             anyhow::bail!(
-                "Refusing to dial this peer's own node id ({own_id}). Set a different target node id (quick mode) or peer identifier (nostr mode)."
+                "Refusing to dial this peer's own node id ({own_id}). Set a different target node id (quick mode) or peer identifier (connect mode)."
             );
         }
 

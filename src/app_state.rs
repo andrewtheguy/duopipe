@@ -72,7 +72,7 @@ pub enum NameConflict {
 }
 
 /// What to dial, as typed at runtime: a full node id (quick mode) or a peer name
-/// looked up via nostr (nostr mode).
+/// looked up via nostr (connect mode).
 #[derive(Debug, Clone)]
 pub enum DialTarget {
     NodeId(EndpointId),
@@ -272,7 +272,7 @@ pub struct AppState {
     /// Display string for the current dial target (`Some` while a session is up or
     /// being established), shown in the header. `None` when idle (serving only).
     dial_target: RwLock<Option<String>>,
-    /// Whether nostr discovery is active (nostr mode). Read by the connect prompt to
+    /// Whether nostr discovery is active (connect mode). Read by the connect prompt to
     /// decide whether the user types a peer name (true) or a node id (false).
     pub nostr_discovery: bool,
     /// This machine's own nostr name (config `name`), used by the connect prompt to

@@ -6,7 +6,7 @@
 //! freshly generated).
 //!
 //! Quick mode always generates a fresh ephemeral token — there is no token screen and
-//! no way to supply an existing token. Nostr mode shows a single entry field for the
+//! no way to supply an existing token. Connect mode shows a single entry field for the
 //! pre-shared rendezvous secret (generated out of band with `duopipe
 //! generate-auth-token`), validated against the config's declared fingerprint.
 //!
@@ -32,7 +32,7 @@ use crate::peer_params::ResolvedPeer;
 enum SetupPhase {
     /// Start screen: a summary and Start/Exit buttons. Enter proceeds.
     Start,
-    /// Nostr mode only: enter the pre-shared auth token (a secret generated out of
+    /// Connect mode only: enter the pre-shared auth token (a secret generated out of
     /// band with `duopipe generate-auth-token`). Validated before it is accepted, and
     /// checked against the config's declared fingerprint. Quick mode never reaches this
     /// phase — it always generates its token on Start.
@@ -65,17 +65,17 @@ pub struct SetupState {
     phase: SetupPhase,
     /// A valid auth token already supplied by config/env (pre-validated in main).
     config_auth_token: Option<String>,
-    /// Expected token fingerprint declared by a nostr config (validated in main). When
+    /// Expected token fingerprint declared by a connect-mode config (validated in main). When
     /// set, a token pasted here must match it — guarding against a token meant for a
     /// different pairing. `None` in quick mode.
     expected_token_fingerprint: Option<String>,
     /// Currently focused button of the start screen.
     focus: StartFocus,
-    /// Whether nostr discovery is active (nostr mode) — display only, for the summary.
+    /// Whether nostr discovery is active (connect mode) — display only, for the summary.
     nostr_discovery: bool,
     /// This machine's own nostr name (config `name`) — display only, for the summary.
     own_name: Option<String>,
-    /// Token typed/pasted on the [`SetupPhase::TokenSetup`] screen (nostr mode).
+    /// Token typed/pasted on the [`SetupPhase::TokenSetup`] screen (connect mode).
     auth_token_input: Input,
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
@@ -128,7 +128,7 @@ fn submit_token(state: &mut SetupState) -> Step {
         state.error = Some(format!("Invalid token: {e}"));
         return Step::Continue;
     }
-    // In nostr mode the config declares the expected fingerprint; a token for a
+    // In connect mode the config declares the expected fingerprint; a token for a
     // different pairing is rejected here rather than failing the connection later.
     if let Some(expected) = &state.expected_token_fingerprint
         && !auth::fingerprint_matches(&token, expected)
@@ -154,15 +154,15 @@ fn build_resolved(state: &SetupState) -> ResolvedPeer {
     }
 }
 
-/// Submit the start screen: finish with a config/env token (nostr mode), open the
-/// token-entry screen (nostr mode without a token), or generate a fresh ephemeral
+/// Submit the start screen: finish with a config/env token (connect mode), open the
+/// token-entry screen (connect mode without a token), or generate a fresh ephemeral
 /// token (quick mode, the common path).
 fn submit_start(state: &mut SetupState) -> Step {
     if let Some(token) = state.config_auth_token.clone() {
         // A config/env token is used as-is, no further prompt.
         finalize(state, token, false)
     } else if state.nostr_discovery {
-        // No token supplied: nostr's token is a pre-shared secret, so it must be
+        // No token supplied: the connect-mode token is a pre-shared secret, so it must be
         // entered. Quick mode never reaches here (handled below).
         state.phase = SetupPhase::TokenSetup;
         Step::Continue
@@ -201,7 +201,7 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
             }
             _ => Step::Continue,
         },
-        // Nostr-only: a single entry field for the pre-shared token.
+        // Connect-only: a single entry field for the pre-shared token.
         SetupPhase::TokenSetup => match key.code {
             KeyCode::Esc => {
                 state.phase = SetupPhase::Start;
@@ -289,7 +289,7 @@ fn render_setup_title(frame: &mut Frame, area: Rect, state: &SetupState) {
                 format!(
                     "duopipe v{} — {} setup",
                     env!("CARGO_PKG_VERSION"),
-                    if state.nostr_discovery { "nostr" } else { "quick" }
+                    if state.nostr_discovery { "connect" } else { "quick" }
                 ),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
@@ -393,7 +393,7 @@ fn start_summary_lines(state: &SetupState) -> Vec<Line<'static>> {
     lines
 }
 
-/// Intro lines for the nostr token-entry screen. (Quick mode never shows this screen.)
+/// Intro lines for the connect-mode token-entry screen. (Quick mode never shows this screen.)
 fn token_intro_lines(state: &SetupState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from("Enter the shared auth token:")];
     // The config declares the token's fingerprint; show it before submit.
@@ -430,7 +430,7 @@ fn token_fingerprint_line(state: &SetupState) -> Option<Line<'static>> {
     Some(Line::from(span))
 }
 
-/// Hint for the nostr token-entry screen. The token is a pre-shared secret made out
+/// Hint for the connect-mode token-entry screen. The token is a pre-shared secret made out
 /// of band, the same on every device.
 fn token_hint() -> &'static str {
     "Both peers need the same token. First time? Run `duopipe generate-auth-token`, then paste that token here on every device."
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn nostr_without_token_opens_entry_field() {
-        // Nostr mode's token is a pre-shared secret, so Start opens the entry field.
+        // Connect mode's token is a pre-shared secret, so Start opens the entry field.
         let token = auth::generate_token();
         let mut s = SetupState::new(None, None, true, Some("hl".into()));
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Continue));
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn nostr_rejects_token_with_wrong_fingerprint() {
-        // A nostr config declares the expected fingerprint; pasting a token from a
+        // A connect-mode config declares the expected fingerprint; pasting a token from a
         // different pairing is rejected with an inline error rather than accepted.
         let intended = auth::generate_token();
         let other = auth::generate_token();
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn token_setup_esc_returns_to_start() {
-        // Nostr mode: Esc from the token-entry screen returns to the start screen.
+        // Connect mode: Esc from the token-entry screen returns to the start screen.
         let mut s = SetupState::new(None, None, true, Some("hl".into()));
         handle_key(key(KeyCode::Enter), &mut s);
         assert_eq!(s.phase, SetupPhase::TokenSetup);
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn enter_token_rejects_invalid_and_stays_open() {
-        // Nostr mode: an invalid token keeps the entry screen open with an error.
+        // Connect mode: an invalid token keeps the entry screen open with an error.
         let mut s = SetupState::new(None, None, true, Some("hl".into()));
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup (entry field)
         type_str(&mut s, "not-a-real-token");
