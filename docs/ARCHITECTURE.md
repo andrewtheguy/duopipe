@@ -34,7 +34,7 @@ Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that 
 
 Config declares the single **tunnel request** (the dial target is chosen interactively at runtime, not here):
 
-- **`[tunnel]`** (`remote_source`, `local_listen`): the template for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source` (a bare `host:port`), then bridges the two. Activated on demand (TUI `Shift-S`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
+- **`[tunnel]`** (`remote_source`, `local_listen`): the template for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source` (a bare `host:port`), then bridges the two. Activated on demand (TUI `s`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
 
 #### Non-interactive mode (testing)
 
@@ -270,7 +270,7 @@ A single global `Semaphore` (default `max_streams = 100`), shared across all con
 
 ### Request Data Flow
 
-A peer activates its request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor connects out over TCP to `source` (a bare `host:port`), replies `StreamAck`, then bridges. The request starts/stops on demand (TUI `Shift-S`/`Shift-X`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping it cancels its task and frees the bound port.
+A peer activates its request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor connects out over TCP to `source` (a bare `host:port`), replies `StreamAck`, then bridges. The request starts/stops on demand (TUI `s`/`x`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping it cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
