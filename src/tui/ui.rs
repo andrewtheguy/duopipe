@@ -121,7 +121,7 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
     let show_token_banner = show_generated_token_banner(snap, ui);
-    let show_pin_banner = show_pin_banner(snap, ui);
+    let show_pin_banner = show_pin_banner(snap);
     let hide_at = banner_hide_at(show_token_banner || show_pin_banner, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let tunnel_rows = 1u16 + 2; // single tunnel row + header + border
@@ -141,9 +141,12 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
         frame,
         header_area,
         snap,
-        show_token_banner,
-        show_pin_banner,
-        hide_at.as_deref(),
+        HeaderBanners {
+            show_token: show_token_banner,
+            show_pin: show_pin_banner,
+            pin_hidden: ui.token_banner_hidden,
+            hide_at: hide_at.as_deref(),
+        },
         true,
     );
     render_tunnels(frame, tunnels_area, snap, ui);
@@ -154,7 +157,7 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
 /// The logs screen: the same header plus a full-height log pane.
 fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
     let show_token_banner = show_generated_token_banner(snap, ui);
-    let show_pin_banner = show_pin_banner(snap, ui);
+    let show_pin_banner = show_pin_banner(snap);
     let hide_at = banner_hide_at(show_token_banner || show_pin_banner, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let [header_area, logs_area] = Layout::vertical([
@@ -167,9 +170,12 @@ fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], u
         frame,
         header_area,
         snap,
-        show_token_banner,
-        show_pin_banner,
-        hide_at.as_deref(),
+        HeaderBanners {
+            show_token: show_token_banner,
+            show_pin: show_pin_banner,
+            pin_hidden: ui.token_banner_hidden,
+            hide_at: hide_at.as_deref(),
+        },
         false,
     );
     render_logs(frame, logs_area, logs, ui);
@@ -211,12 +217,15 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
 /// Quick PIN mode shows a banner with the current rotating PIN and its refresh countdown,
 /// shown once the publisher has minted the first PIN. Like the token banner it auto-hides
 /// after a few minutes and is toggled with `h`.
-fn show_pin_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
+fn show_pin_banner(snap: &AppSnapshot) -> bool {
+    // The banner *area* is present whenever the serve half is up in quick PIN mode and a
+    // PIN has been minted, hidden or not. Visibility of the value itself is decoupled from
+    // presence (`token_banner_hidden`): when hidden, the `dial PIN:` label and the
+    // `press h to hide/show` hint stay sticky so the user can bring the code back.
     snap.listening
         && matches!(snap.role, Role::Listen | Role::Both)
         && snap.pin_mode
         && snap.current_pin.is_some()
-        && !ui.token_banner_hidden
 }
 
 /// The wall-clock time the visible generated-secret banner will auto-hide, as an absolute
@@ -241,13 +250,24 @@ fn header_height(show_token_banner: bool, show_pin_banner: bool, show_conflict_w
     base + if show_conflict_warning { 1 } else { 0 }
 }
 
+/// The header's optional banner state, bundled to keep `render_header`'s signature small.
+struct HeaderBanners<'a> {
+    /// The freshly generated auth-token banner (manual quick mode / config mode).
+    show_token: bool,
+    /// The rotating dial-PIN banner (quick PIN mode); present even while the value is hidden.
+    show_pin: bool,
+    /// Whether the secret value is hidden. For the PIN the label and hide/show hint stay
+    /// sticky while the value/timers are masked.
+    pin_hidden: bool,
+    /// Absolute auto-hide time (`HH:MM`), when a banner with an armed deadline is shown.
+    hide_at: Option<&'a str>,
+}
+
 fn render_header(
     frame: &mut Frame,
     area: Rect,
     snap: &AppSnapshot,
-    show_token_banner: bool,
-    show_pin_banner: bool,
-    hide_at: Option<&str>,
+    banners: HeaderBanners<'_>,
     show_dial_hint: bool,
 ) {
     let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
@@ -315,7 +335,7 @@ fn render_header(
         dial_header_line(snap, show_dial_hint),
     ];
 
-    if show_token_banner {
+    if banners.show_token {
         // Freshly generated token, not yet dismissed: surface it so the dialer can
         // copy it. Hidden once a peer connects or the user presses `h`.
         let token = snap.auth_token.as_deref().unwrap_or("(pending)");
@@ -335,7 +355,7 @@ fn render_header(
             ));
         }
         lines.push(Line::from(token_line));
-        let hint = match hide_at {
+        let hint = match banners.hide_at {
             Some(at) => format!("auto-hides at {at} · press h to hide/show"),
             None => "press h to hide/show".to_string(),
         };
@@ -345,42 +365,55 @@ fn render_header(
         )));
     }
 
-    if show_pin_banner {
+    if banners.show_pin {
         // Quick PIN mode: the rotating code the other device types to connect. It carries
-        // this peer's node id + token, so no copy-paste is needed.
-        let pin = snap.current_pin.as_deref().unwrap_or("");
-        let mut pin_line = vec![
-            Span::raw("dial PIN: "),
-            Span::styled(
-                crate::pin::format_pin(pin),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if let Some(token) = snap.auth_token.as_deref() {
-            pin_line.push(Span::styled(
-                format!("  (fp: {})", crate::auth::token_fingerprint(token)),
+        // this peer's node id + token, so no copy-paste is needed. When hidden, the label
+        // and hide/show hint stay sticky (the value and its timers/fp are masked) so the
+        // user still sees a PIN exists and how to bring it back.
+        if banners.pin_hidden {
+            lines.push(Line::from(vec![
+                Span::raw("dial PIN: "),
+                Span::styled("(hidden)", Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "press h to hide/show",
                 Style::default().fg(Color::DarkGray),
-            ));
-        }
-        lines.push(Line::from(pin_line));
+            )));
+        } else {
+            let pin = snap.current_pin.as_deref().unwrap_or("");
+            let mut pin_line = vec![
+                Span::raw("dial PIN: "),
+                Span::styled(
+                    crate::pin::format_pin(pin),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if let Some(token) = snap.auth_token.as_deref() {
+                pin_line.push(Span::styled(
+                    format!("  (fp: {})", crate::auth::token_fingerprint(token)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(pin_line));
 
-        // Two timers: a live 60s refresh countdown (the PIN itself rotates) and the
-        // absolute auto-hide time (shown as a clock time, not a countdown, to avoid
-        // confusion with the refresh).
-        let refresh = snap
-            .pin_deadline
-            .map(|d| d.saturating_duration_since(Instant::now()).as_secs())
-            .unwrap_or(0);
-        let hint = match hide_at {
-            Some(at) => format!("refreshes in {refresh:>2}s · auto-hides at {at} · press h to hide/show"),
-            None => format!("refreshes in {refresh:>2}s · press h to hide/show"),
-        };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        )));
+            // Two timers: a live 60s refresh countdown (the PIN itself rotates) and the
+            // absolute auto-hide time (shown as a clock time, not a countdown, to avoid
+            // confusion with the refresh).
+            let refresh = snap
+                .pin_deadline
+                .map(|d| d.saturating_duration_since(Instant::now()).as_secs())
+                .unwrap_or(0);
+            let hint = match banners.hide_at {
+                Some(at) => format!("refreshes in {refresh:>2}s · auto-hides at {at} · press h to hide/show"),
+                None => format!("refreshes in {refresh:>2}s · press h to hide/show"),
+            };
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     if let NameConflict::Degraded { message } = &snap.name_conflict {
@@ -984,6 +1017,30 @@ mod tests {
         assert!(out.contains("refreshes in"), "countdown shown");
         // The raw auth-token banner must not appear in PIN mode.
         assert!(!out.contains("auth token:"), "token banner suppressed in PIN mode");
+    }
+
+    #[test]
+    fn pin_banner_sticky_when_hidden() {
+        // Hiding the PIN (via `h` or auto-hide) keeps the label and hide/show hint on
+        // screen while masking the value and its timers/fingerprint.
+        let mut snap = base_snapshot(false, None); // listening = true
+        snap.pin_mode = true;
+        snap.token_generated = true;
+        snap.auth_token = Some(crate::auth::generate_token());
+        snap.current_pin = Some("K7P29QXM".to_string());
+        snap.pin_deadline = Some(Instant::now() + std::time::Duration::from_secs(41));
+
+        let ui = UiState {
+            token_banner_hidden: true,
+            ..Default::default()
+        };
+        let out = render_text(&snap, &ui);
+        assert!(out.contains("dial PIN:"), "label stays sticky when hidden");
+        assert!(out.contains("(hidden)"), "value is masked");
+        assert!(out.contains("press h to hide/show"), "hint stays sticky when hidden");
+        // The secret value and its timers must not leak while hidden.
+        assert!(!out.contains("K7P2-9QXM"), "PIN value hidden");
+        assert!(!out.contains("refreshes in"), "refresh countdown hidden");
     }
 
     #[test]
