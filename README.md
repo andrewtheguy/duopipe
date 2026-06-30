@@ -37,7 +37,7 @@ duopipe runs as a peer launched in one of two modes — `duopipe quick` (configl
 
 There is **no listen/dial choice at startup**. Quick mode always generates a fresh ephemeral token and at setup you pick how to share this device: **PIN** (the dashboard shows a short code that refreshes every 60s and carries this peer's node id + token over nostr — the dialer just types the PIN) or **Manual** (no nostr/internet — the node id + token are shown to copy by hand). Connect mode uses a pre-shared token you generated with `duopipe generate-auth-token`, supplied via config/env or pasted at setup. Then the dashboard opens, already listening. To dial a peer, press **`Shift-C`** and type the target — its `name` in connect mode, a **PIN** in quick PIN mode, or its **node id** in quick manual mode; press **`Shift-D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time.
 
-- The TUI header shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256, shown in every mode so you can confirm both devices match). In quick **PIN** mode it also shows the **current PIN with a live countdown** (always visible, refreshing every 60s). In quick **manual** mode it shows the full **auth token** to copy (hidden automatically after 10 minutes, or immediately when you press `h`).
+- The TUI header shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256, shown in every mode so you can confirm both devices match). In quick **PIN** mode it shows the **current PIN** (which refreshes every 60s, with a small countdown to the next refresh); in quick **manual** mode it shows the full **auth token** to copy. Either secret **auto-hides after 10 minutes** — the line also shows the absolute clock time it will hide at — and **`h` toggles it off/on at any time** (re-showing re-arms the 10-minute timer).
 - The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated/entered at setup.
 - The dashboard shows a **single tunnel row** (there is no list to navigate). Press **`s`** to start the listener and **`x`** to stop it — starting is its own deliberate key, never `Enter`, so a stray press can't begin forwarding; press **`e`** to open the **set-tunnel** form — two fields only, the remote source (`host:port`) and the local listen (`host:port`), with no protocol picker and no name field (saving only *sets* the spec — it does not start it); press **`d`** (or **`Del`**) to clear the tunnel. (`Shift` is reserved for the dial session: **`Shift-C`** connect, **`Shift-D`** disconnect.)
 
@@ -166,7 +166,7 @@ Generate auth tokens with: `duopipe generate-auth-token`
 
 ### Token Management
 
-When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id for 10 minutes, or until you press `h` to hide it. You can also mint tokens ahead of time:
+When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token

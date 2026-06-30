@@ -33,7 +33,9 @@ use ui::{AddField, AddTunnelForm, ConnectForm, Screen, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
-/// How long to show a freshly generated auth token before hiding it automatically.
+/// How long the generated-secret banner (the manual-mode auth token or the quick-mode
+/// rotating PIN) stays shown before auto-hiding. Re-showing it with `h` re-arms the same
+/// window.
 const GENERATED_TOKEN_AUTO_HIDE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Everything the TUI needs to run setup and build the runtime `PeerConfig`.
@@ -119,9 +121,12 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                 } else {
                     state.logs.concise_snapshot()
                 };
-                // Once a peer has connected, the generated-token banner is no longer
-                // needed (the dialer already has it); hide it for the rest of the run.
-                if !snap.peers.is_empty() {
+                // When the first peer connects, hide the generated-secret banner once (the
+                // dialer already has what it needs). It's a one-shot, not a per-tick force,
+                // so the user can still toggle it back with `h` afterwards (e.g. to pair
+                // another device in PIN mode).
+                if !snap.peers.is_empty() && !ui_state.peers_seen {
+                    ui_state.peers_seen = true;
                     hide_token_banner(&mut ui_state);
                 }
                 maybe_auto_hide_generated_token_banner(&mut ui_state, &snap, Instant::now());
@@ -309,7 +314,7 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
             return false;
         }
         KeyCode::Char('h') => {
-            hide_token_banner(ui);
+            toggle_token_banner(ui);
             return false;
         }
         _ => {}
@@ -420,6 +425,17 @@ fn handle_conflict_prompt(key: KeyEvent, state: &Arc<AppState>) {
 fn hide_token_banner(ui: &mut UiState) {
     ui.token_banner_hidden = true;
     ui.token_banner_auto_hide_at = None;
+}
+
+/// Toggle the generated-secret banner. Hiding clears the auto-hide deadline; re-showing
+/// leaves it cleared so the next tick re-arms a fresh auto-hide window.
+fn toggle_token_banner(ui: &mut UiState) {
+    if ui.token_banner_hidden {
+        ui.token_banner_hidden = false;
+        ui.token_banner_auto_hide_at = None;
+    } else {
+        hide_token_banner(ui);
+    }
 }
 
 fn maybe_auto_hide_generated_token_banner(ui: &mut UiState, snap: &AppSnapshot, now: Instant) {
@@ -1046,6 +1062,27 @@ mod tests {
 
         assert!(ui.token_banner_hidden);
         assert!(ui.token_banner_auto_hide_at.is_none());
+    }
+
+    #[test]
+    fn h_toggles_banner_back_on_and_rearms_auto_hide() {
+        let st = listen_generated_state();
+        let snap = st.snapshot();
+        let mut ui = UiState::default();
+
+        // Arm + hide via `h`.
+        maybe_auto_hide_generated_token_banner(&mut ui, &snap, Instant::now());
+        handle_key(key(KeyCode::Char('h')), &mut ui, &st);
+        assert!(ui.token_banner_hidden);
+
+        // A second `h` shows it again; the next tick re-arms a fresh auto-hide deadline.
+        handle_key(key(KeyCode::Char('h')), &mut ui, &st);
+        assert!(!ui.token_banner_hidden);
+        assert!(ui.token_banner_auto_hide_at.is_none());
+        let now = Instant::now();
+        maybe_auto_hide_generated_token_banner(&mut ui, &snap, now);
+        let deadline = ui.token_banner_auto_hide_at.expect("re-armed after toggle on");
+        assert_eq!(deadline.duration_since(now), GENERATED_TOKEN_AUTO_HIDE_AFTER);
     }
 
     #[test]

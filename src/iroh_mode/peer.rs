@@ -818,7 +818,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
 
 /// Quick PIN mode publisher: mint a fresh PIN each rotation period, publish the
 /// `{node_id, token}` record under it, and surface the PIN + rollover deadline to the TUI
-/// for the always-on countdown. The PIN is set on `AppState` *before* the network publish
+/// for the header's refresh countdown. The PIN is set on `AppState` *before* the network publish
 /// so the header and connect prompt see it immediately; relay failures are logged but
 /// non-fatal (a dialer simply retries on the next code).
 async fn run_pin_publisher(

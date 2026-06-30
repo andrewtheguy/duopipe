@@ -43,13 +43,16 @@ pub struct UiState {
     pub add_form: Option<AddTunnelForm>,
     /// When `Some`, the "connect to peer" modal is open and captures all keystrokes.
     pub connect_form: Option<ConnectForm>,
-    /// Set once the user presses `h`, once a peer has connected, or once the
-    /// auto-hide timeout expires: hides the generated-token banner for the rest
-    /// of the session.
+    /// Whether the generated-secret banner (manual-mode auth token or quick-mode PIN) is
+    /// currently hidden. Set by `h`, by the auto-hide timeout, or once when the first peer
+    /// connects; `h` toggles it back on.
     pub token_banner_hidden: bool,
-    /// Deadline for auto-hiding a freshly generated auth token. Set by the
-    /// dashboard loop, not by rendering.
+    /// Deadline for auto-hiding the generated-secret banner. Set by the dashboard loop, not
+    /// by rendering; cleared while hidden and re-armed when shown again.
     pub token_banner_auto_hide_at: Option<Instant>,
+    /// Set once the first inbound peer has connected, so the one-shot connect-hide does not
+    /// re-fire every tick (which would fight the `h` toggle).
+    pub peers_seen: bool,
     /// First Esc of a double-Esc quit has been seen; the next Esc quits. Cleared
     /// by any other key. Drives the "press Esc again" hint.
     pub quit_armed: bool,
@@ -118,7 +121,8 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
     let show_token_banner = show_generated_token_banner(snap, ui);
-    let show_pin_banner = show_pin_banner(snap);
+    let show_pin_banner = show_pin_banner(snap, ui);
+    let hide_at = banner_hide_at(show_token_banner || show_pin_banner, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let tunnel_rows = 1u16 + 2; // single tunnel row + header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
@@ -133,7 +137,15 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
 
     // The dial hint advertises the home-only Shift-C/Shift-D controls, so it shows
     // only here (not on the logs screen, where those keys are inert).
-    render_header(frame, header_area, snap, show_token_banner, show_pin_banner, true);
+    render_header(
+        frame,
+        header_area,
+        snap,
+        show_token_banner,
+        show_pin_banner,
+        hide_at.as_deref(),
+        true,
+    );
     render_tunnels(frame, tunnels_area, snap, ui);
     render_peers(frame, peers_area, snap);
     render_home_footer(frame, footer_area, snap, ui);
@@ -142,7 +154,8 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
 /// The logs screen: the same header plus a full-height log pane.
 fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
     let show_token_banner = show_generated_token_banner(snap, ui);
-    let show_pin_banner = show_pin_banner(snap);
+    let show_pin_banner = show_pin_banner(snap, ui);
+    let hide_at = banner_hide_at(show_token_banner || show_pin_banner, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let [header_area, logs_area] = Layout::vertical([
         Constraint::Length(header_height(show_token_banner, show_pin_banner, show_conflict_warning)),
@@ -150,7 +163,15 @@ fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], u
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, snap, show_token_banner, show_pin_banner, false);
+    render_header(
+        frame,
+        header_area,
+        snap,
+        show_token_banner,
+        show_pin_banner,
+        hide_at.as_deref(),
+        false,
+    );
     render_logs(frame, logs_area, logs, ui);
 }
 
@@ -159,11 +180,9 @@ fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], u
 fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
     let text = if ui.quit_armed {
         "press Esc again to quit".to_string()
-    } else if snap.pin_mode {
-        // No token banner to hide in PIN mode; the PIN is always shown.
-        "l logs · w dump · Esc Esc quit".to_string()
     } else {
-        "l logs · w dump · h hide token · Esc Esc quit".to_string()
+        let secret = if snap.pin_mode { "PIN" } else { "token" };
+        format!("l logs · w dump · h show/hide {secret} · Esc Esc quit")
     };
     let para = Paragraph::new(Line::from(Span::styled(
         text,
@@ -180,10 +199,29 @@ fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
         && !ui.token_banner_hidden
 }
 
-/// Quick PIN mode shows an always-on banner with the current rotating PIN and its
-/// countdown (never hidden); it is shown once the publisher has minted the first PIN.
-fn show_pin_banner(snap: &AppSnapshot) -> bool {
-    matches!(snap.role, Role::Listen | Role::Both) && snap.pin_mode && snap.current_pin.is_some()
+/// Quick PIN mode shows a banner with the current rotating PIN and its refresh countdown,
+/// shown once the publisher has minted the first PIN. Like the token banner it auto-hides
+/// after a few minutes and is toggled with `h`.
+fn show_pin_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
+    matches!(snap.role, Role::Listen | Role::Both)
+        && snap.pin_mode
+        && snap.current_pin.is_some()
+        && !ui.token_banner_hidden
+}
+
+/// The wall-clock time the visible generated-secret banner will auto-hide, as an absolute
+/// `HH:MM` string (deliberately not a live countdown). `None` when no banner is showing or
+/// no auto-hide deadline is armed yet (e.g. just after a toggle, before the next tick).
+fn banner_hide_at(showing: bool, ui: &UiState) -> Option<String> {
+    if !showing {
+        return None;
+    }
+    let deadline = ui.token_banner_auto_hide_at?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let at = jiff::Zoned::now()
+        .checked_add(jiff::Span::new().seconds(remaining.as_secs() as i64))
+        .unwrap_or_else(|_| jiff::Zoned::now());
+    Some(at.strftime("%H:%M").to_string())
 }
 
 fn header_height(show_token_banner: bool, show_pin_banner: bool, show_conflict_warning: bool) -> u16 {
@@ -199,6 +237,7 @@ fn render_header(
     snap: &AppSnapshot,
     show_token_banner: bool,
     show_pin_banner: bool,
+    hide_at: Option<&str>,
     show_dial_hint: bool,
 ) {
     let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
@@ -271,15 +310,19 @@ fn render_header(
             ));
         }
         lines.push(Line::from(token_line));
+        let hint = match hide_at {
+            Some(at) => format!("auto-hides at {at} · press h to hide/show"),
+            None => "press h to hide/show".to_string(),
+        };
         lines.push(Line::from(Span::styled(
-            "auth token hides after 10 minutes, press h to hide now",
+            hint,
             Style::default().fg(Color::DarkGray),
         )));
     }
 
     if show_pin_banner {
-        // Quick PIN mode: the always-on rotating code that the other device types to
-        // connect. It carries this peer's node id + token, so no copy-paste is needed.
+        // Quick PIN mode: the rotating code the other device types to connect. It carries
+        // this peer's node id + token, so no copy-paste is needed.
         let pin = snap.current_pin.as_deref().unwrap_or("");
         let mut pin_line = vec![
             Span::raw("dial PIN: "),
@@ -298,15 +341,19 @@ fn render_header(
         }
         lines.push(Line::from(pin_line));
 
-        let remaining = snap
+        // Two timers: a live 60s refresh countdown (the PIN itself rotates) and the
+        // absolute auto-hide time (shown as a clock time, not a countdown, to avoid
+        // confusion with the refresh).
+        let refresh = snap
             .pin_deadline
             .map(|d| d.saturating_duration_since(Instant::now()).as_secs())
             .unwrap_or(0);
-        let filled = (((remaining as f64) / (crate::pin::BUCKET_SECS as f64)) * 10.0).round() as usize;
-        let filled = filled.min(10);
-        let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
+        let hint = match hide_at {
+            Some(at) => format!("refreshes in {refresh:>2}s · auto-hides at {at} · press h to hide/show"),
+            None => format!("refreshes in {refresh:>2}s · press h to hide/show"),
+        };
         lines.push(Line::from(Span::styled(
-            format!("refreshes in {remaining:>2}s [{bar}] — type it on the other device (Shift-C)"),
+            hint,
             Style::default().fg(Color::DarkGray),
         )));
     }

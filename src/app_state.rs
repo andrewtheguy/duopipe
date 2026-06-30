@@ -284,7 +284,7 @@ pub struct AppState {
     /// in connect mode and in quick manual (copy-paste) mode.
     pub pin_mode: bool,
     /// The current rotating PIN (canonical form) and the instant it rolls over, set by the
-    /// PIN publisher each rotation. Drives the always-on PIN + countdown header in PIN mode.
+    /// PIN publisher each rotation. Drives the PIN + refresh-countdown header in PIN mode.
     current_pin: RwLock<Option<String>>,
     pin_deadline: RwLock<Option<Instant>>,
     /// This machine's own nostr name (config `name`), used by the connect prompt to
@@ -391,7 +391,7 @@ impl AppState {
     }
 
     /// Record the current rotating PIN (canonical form) and the instant it rolls over,
-    /// for the always-on PIN + countdown header. Set by the PIN publisher each rotation.
+    /// for the PIN + refresh-countdown header. Set by the PIN publisher each rotation.
     pub fn set_current_pin(&self, pin: String, deadline: Instant) {
         *self.current_pin.write() = Some(pin);
         *self.pin_deadline.write() = Some(deadline);
