@@ -71,12 +71,15 @@ pub enum NameConflict {
     Degraded { message: String },
 }
 
-/// What to dial, as typed at runtime: a full node id (quick mode) or a peer name
-/// looked up via nostr (connect mode).
+/// What to dial, as typed at runtime: a full node id (quick manual mode), a peer name
+/// looked up via nostr (connect mode), or a rotating PIN resolved via nostr to the peer's
+/// node id + auth token (quick PIN mode).
 #[derive(Debug, Clone)]
 pub enum DialTarget {
     NodeId(EndpointId),
     Name(String),
+    /// Canonical (de-grouped, uppercase) PIN; resolved at runtime to `(node_id, token)`.
+    Pin(String),
 }
 
 impl DialTarget {
@@ -89,6 +92,7 @@ impl DialTarget {
                 s.chars().take(12).collect::<String>() + "…"
             }
             DialTarget::Name(name) => name.clone(),
+            DialTarget::Pin(pin) => format!("PIN {}", crate::pin::format_pin(pin)),
         }
     }
 }
@@ -275,6 +279,14 @@ pub struct AppState {
     /// Whether nostr discovery is active (connect mode). Read by the connect prompt to
     /// decide whether the user types a peer name (true) or a node id (false).
     pub nostr_discovery: bool,
+    /// Quick mode's nostr PIN signaling: the listener publishes a rotating PIN carrying its
+    /// node id + token, and the connect prompt asks for a PIN instead of a node id. `false`
+    /// in connect mode and in quick manual (copy-paste) mode.
+    pub pin_mode: bool,
+    /// The current rotating PIN (canonical form) and the instant it rolls over, set by the
+    /// PIN publisher each rotation. Drives the always-on PIN + countdown header in PIN mode.
+    current_pin: RwLock<Option<String>>,
+    pin_deadline: RwLock<Option<Instant>>,
     /// This machine's own nostr name (config `name`), used by the connect prompt to
     /// reject dialing ourselves. `None` in quick mode.
     pub own_name: Option<String>,
@@ -290,6 +302,7 @@ impl AppState {
         tunnel: Option<TunnelEntry>,
         nostr_discovery: bool,
         own_name: Option<String>,
+        pin_mode: bool,
     ) -> Arc<Self> {
         let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
         let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
@@ -314,6 +327,9 @@ impl AppState {
             name_conflict: RwLock::new(NameConflict::Inactive),
             dial_target: RwLock::new(None),
             nostr_discovery,
+            pin_mode,
+            current_pin: RwLock::new(None),
+            pin_deadline: RwLock::new(None),
             own_name,
             shutdown: CancellationToken::new(),
             logs,
@@ -372,6 +388,13 @@ impl AppState {
     /// Set (or clear) the current dial target's display string.
     pub fn set_dial_target(&self, target: Option<String>) {
         *self.dial_target.write() = target;
+    }
+
+    /// Record the current rotating PIN (canonical form) and the instant it rolls over,
+    /// for the always-on PIN + countdown header. Set by the PIN publisher each rotation.
+    pub fn set_current_pin(&self, pin: String, deadline: Instant) {
+        *self.current_pin.write() = Some(pin);
+        *self.pin_deadline.write() = Some(deadline);
     }
 
     /// Start the single tunnel's listener. A no-op when no tunnel is configured; the
@@ -505,6 +528,9 @@ impl AppState {
             hostname: self.hostname.clone(),
             token_generated: self.token_generated,
             nostr_discovery: self.nostr_discovery,
+            pin_mode: self.pin_mode,
+            current_pin: self.current_pin.read().clone(),
+            pin_deadline: *self.pin_deadline.read(),
             own_name: self.own_name.clone(),
             endpoint_id: self.endpoint_id.read().clone(),
             auth_token: self.auth_token.read().clone(),
@@ -526,6 +552,11 @@ pub struct AppSnapshot {
     pub hostname: String,
     pub token_generated: bool,
     pub nostr_discovery: bool,
+    pub pin_mode: bool,
+    /// Current rotating PIN (canonical form) and the instant it rolls over; `Some` only
+    /// in quick PIN mode once the publisher has generated the first PIN.
+    pub current_pin: Option<String>,
+    pub pin_deadline: Option<Instant>,
     pub own_name: Option<String>,
     pub endpoint_id: Option<String>,
     pub auth_token: Option<String>,
@@ -558,7 +589,7 @@ mod tests {
     fn config_tunnel_seeded_into_snapshot_at_construction() {
         // A configured tunnel must be visible (Idle) in the dashboard from launch.
         let seed = Some(req("127.0.0.1:5678", "127.0.0.1:15678"));
-        let state = AppState::new(Role::Both, false, LogBuffer::new(16), seed, false, None);
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), seed, false, None, false);
         assert!(state.has_tunnel());
         let row = state.snapshot().tunnel.expect("tunnel row present");
         assert_eq!(row.spec, "127.0.0.1:15678 <- 127.0.0.1:5678");
@@ -567,7 +598,7 @@ mod tests {
 
     #[test]
     fn set_and_clear_tunnel() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
         assert!(!state.has_tunnel());
         assert!(state.snapshot().tunnel.is_none());
 
@@ -590,7 +621,7 @@ mod tests {
 
     #[test]
     fn update_tunnel_reflects_in_snapshot() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
         state.set_tunnel(req("127.0.0.1:22", "127.0.0.1:2222"));
 
         state.update_tunnel(TunnelStatus::Listening, "127.0.0.1:2222");
@@ -610,7 +641,7 @@ mod tests {
 
     #[test]
     fn listener_tracks_multiple_peers() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None);
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
 
         // Many distinct peers connect at once — all are tracked.
         state.add_peer("peer-a".into());
@@ -637,6 +668,7 @@ mod tests {
             None,
             true,
             Some("web1".to_string()),
+            false,
         );
 
         let snap = state.snapshot();
@@ -647,7 +679,7 @@ mod tests {
 
     #[test]
     fn name_conflict_state_transitions_in_snapshot() {
-        let state = AppState::new(Role::Both, false, LogBuffer::new(16), None, true, None);
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), None, true, None, false);
         assert_eq!(state.snapshot().name_conflict, NameConflict::Inactive);
 
         state.set_name_conflict(NameConflict::Prompt {

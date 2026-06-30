@@ -33,4 +33,9 @@ pub struct ResolvedPeer {
     /// `true` when `auth_token` was freshly generated (no token in config/env), so
     /// the TUI must surface it for the user to copy. `false` when supplied.
     pub token_generated: bool,
+    /// Quick mode only. When true, nostr PIN signaling is used: the listener shares its node
+    /// id and token via a rotating PIN and the dialer types a PIN. When false, the manual
+    /// copy-paste flow is used (node id entered by hand). Always false in connect mode and in
+    /// headless test mode.
+    pub quick_pin: bool,
 }

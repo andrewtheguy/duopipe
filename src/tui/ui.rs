@@ -118,11 +118,12 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
     let show_token_banner = show_generated_token_banner(snap, ui);
+    let show_pin_banner = show_pin_banner(snap);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let tunnel_rows = 1u16 + 2; // single tunnel row + header + border
     let peer_rows = snap.peers.len().max(1) as u16 + 2;
     let [header_area, tunnels_area, peers_area, _filler, footer_area] = Layout::vertical([
-        Constraint::Length(header_height(show_token_banner, show_conflict_warning)),
+        Constraint::Length(header_height(show_token_banner, show_pin_banner, show_conflict_warning)),
         Constraint::Length(tunnel_rows.clamp(4, 10)),
         Constraint::Length(peer_rows.clamp(3, 8)),
         Constraint::Min(0),
@@ -132,31 +133,35 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
 
     // The dial hint advertises the home-only Shift-C/Shift-D controls, so it shows
     // only here (not on the logs screen, where those keys are inert).
-    render_header(frame, header_area, snap, show_token_banner, true);
+    render_header(frame, header_area, snap, show_token_banner, show_pin_banner, true);
     render_tunnels(frame, tunnels_area, snap, ui);
     render_peers(frame, peers_area, snap);
-    render_home_footer(frame, footer_area, ui);
+    render_home_footer(frame, footer_area, snap, ui);
 }
 
 /// The logs screen: the same header plus a full-height log pane.
 fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiState) {
     let show_token_banner = show_generated_token_banner(snap, ui);
+    let show_pin_banner = show_pin_banner(snap);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let [header_area, logs_area] = Layout::vertical([
-        Constraint::Length(header_height(show_token_banner, show_conflict_warning)),
+        Constraint::Length(header_height(show_token_banner, show_pin_banner, show_conflict_warning)),
         Constraint::Min(3),
     ])
     .areas(frame.area());
 
-    render_header(frame, header_area, snap, show_token_banner, false);
+    render_header(frame, header_area, snap, show_token_banner, show_pin_banner, false);
     render_logs(frame, logs_area, logs, ui);
 }
 
 /// One-line footer for the home screen carrying the global key hints (the per-pane
 /// hints live in the tunnel/log titles).
-fn render_home_footer(frame: &mut Frame, area: Rect, ui: &UiState) {
+fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &UiState) {
     let text = if ui.quit_armed {
         "press Esc again to quit".to_string()
+    } else if snap.pin_mode {
+        // No token banner to hide in PIN mode; the PIN is always shown.
+        "l logs · w dump · Esc Esc quit".to_string()
     } else {
         "l logs · w dump · h hide token · Esc Esc quit".to_string()
     };
@@ -168,13 +173,23 @@ fn render_home_footer(frame: &mut Frame, area: Rect, ui: &UiState) {
 }
 
 fn show_generated_token_banner(snap: &AppSnapshot, ui: &UiState) -> bool {
-    matches!(snap.role, Role::Listen | Role::Both) && snap.token_generated && !ui.token_banner_hidden
+    // In quick PIN mode the rotating-PIN banner replaces the raw token banner entirely.
+    matches!(snap.role, Role::Listen | Role::Both)
+        && snap.token_generated
+        && !snap.pin_mode
+        && !ui.token_banner_hidden
 }
 
-fn header_height(show_token_banner: bool, show_conflict_warning: bool) -> u16 {
+/// Quick PIN mode shows an always-on banner with the current rotating PIN and its
+/// countdown (never hidden); it is shown once the publisher has minted the first PIN.
+fn show_pin_banner(snap: &AppSnapshot) -> bool {
+    matches!(snap.role, Role::Listen | Role::Both) && snap.pin_mode && snap.current_pin.is_some()
+}
+
+fn header_height(show_token_banner: bool, show_pin_banner: bool, show_conflict_warning: bool) -> u16 {
     // Five content rows (app identity, mode/name, streams/fp, node id, dial line) plus
-    // the border. The token banner adds two rows: the token itself and the hide hint.
-    let base = if show_token_banner { 9 } else { 7 };
+    // the border. The token *or* PIN banner adds two rows.
+    let base = if show_token_banner || show_pin_banner { 9 } else { 7 };
     base + if show_conflict_warning { 1 } else { 0 }
 }
 
@@ -183,6 +198,7 @@ fn render_header(
     area: Rect,
     snap: &AppSnapshot,
     show_token_banner: bool,
+    show_pin_banner: bool,
     show_dial_hint: bool,
 ) {
     let endpoint = snap.endpoint_id.as_deref().unwrap_or("(pending)");
@@ -257,6 +273,40 @@ fn render_header(
         lines.push(Line::from(token_line));
         lines.push(Line::from(Span::styled(
             "auth token hides after 10 minutes, press h to hide now",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    if show_pin_banner {
+        // Quick PIN mode: the always-on rotating code that the other device types to
+        // connect. It carries this peer's node id + token, so no copy-paste is needed.
+        let pin = snap.current_pin.as_deref().unwrap_or("");
+        let mut pin_line = vec![
+            Span::raw("dial PIN: "),
+            Span::styled(
+                crate::pin::format_pin(pin),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(token) = snap.auth_token.as_deref() {
+            pin_line.push(Span::styled(
+                format!("  (fp: {})", crate::auth::token_fingerprint(token)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(pin_line));
+
+        let remaining = snap
+            .pin_deadline
+            .map(|d| d.saturating_duration_since(Instant::now()).as_secs())
+            .unwrap_or(0);
+        let filled = (((remaining as f64) / (crate::pin::BUCKET_SECS as f64)) * 10.0).round() as usize;
+        let filled = filled.min(10);
+        let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
+        lines.push(Line::from(Span::styled(
+            format!("refreshes in {remaining:>2}s [{bar}] — type it on the other device (Shift-C)"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -475,12 +525,23 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
 }
 
 /// Modal for starting the on-demand dial session. One text field whose meaning depends
-/// on the mode: a peer name (nostr) or a full node id (quick).
-pub fn render_connect_dialog(frame: &mut Frame, form: &ConnectForm, nostr_discovery: bool) {
+/// on the mode: a peer name (connect), a rotating PIN (quick PIN mode), or a full node id
+/// (quick manual mode).
+pub fn render_connect_dialog(
+    frame: &mut Frame,
+    form: &ConnectForm,
+    nostr_discovery: bool,
+    pin_mode: bool,
+) {
     let (label, hint) = if nostr_discovery {
         (
             "Peer name",
             "the target peer's name (its config `name`); looked up via nostr",
+        )
+    } else if pin_mode {
+        (
+            "Dial PIN",
+            "the short code shown on the other device (dashes/case ignored)",
         )
     } else {
         ("Node id", "the target peer's full node id")
@@ -785,6 +846,9 @@ mod tests {
             hostname: "test-host".to_string(),
             token_generated: false,
             nostr_discovery,
+            pin_mode: false,
+            current_pin: None,
+            pin_deadline: None,
             own_name: own_name.map(str::to_string),
             endpoint_id: Some("node-123".to_string()),
             auth_token: None,
@@ -828,6 +892,46 @@ mod tests {
             ts: jiff::Zoned::now(),
             verbose_only,
         }
+    }
+
+    #[test]
+    fn pin_mode_header_shows_rotating_pin_and_countdown_not_token() {
+        let mut snap = base_snapshot(false, None);
+        snap.pin_mode = true;
+        snap.token_generated = true; // quick mode always has one, but PIN mode hides it
+        snap.auth_token = Some(crate::auth::generate_token());
+        snap.current_pin = Some("K7P29QXM".to_string());
+        snap.pin_deadline = Some(Instant::now() + std::time::Duration::from_secs(41));
+
+        let out = render_text(&snap, &UiState::default());
+        assert!(out.contains("dial PIN"), "PIN banner shown");
+        assert!(out.contains("K7P2-9QXM"), "PIN is grouped for display");
+        assert!(out.contains("refreshes in"), "countdown shown");
+        // The raw auth-token banner must not appear in PIN mode.
+        assert!(!out.contains("auth token:"), "token banner suppressed in PIN mode");
+    }
+
+    #[test]
+    fn connect_dialog_label_depends_on_mode() {
+        let backend = TestBackend::new(120, 24);
+        let render_dialog = |nostr: bool, pin: bool| {
+            let mut terminal = Terminal::new(backend.clone()).expect("terminal");
+            let form = ConnectForm::default();
+            terminal
+                .draw(|f| render_connect_dialog(f, &form, nostr, pin))
+                .expect("draw");
+            let buf = terminal.backend().buffer();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    out.push_str(buf[(x, y)].symbol());
+                }
+            }
+            out
+        };
+        assert!(render_dialog(true, false).contains("Peer name"));
+        assert!(render_dialog(false, true).contains("Dial PIN"));
+        assert!(render_dialog(false, false).contains("Node id"));
     }
 
     #[test]

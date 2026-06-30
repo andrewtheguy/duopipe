@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::endpoint::ConnectionError;
@@ -112,6 +112,12 @@ pub struct PeerConfig {
     /// interactive dial session resolves its target's name at connect time instead.)
     /// `None` outside connect mode.
     pub nostr_identifier: Option<String>,
+    /// Quick mode's nostr PIN signaling. When true, the listener half publishes a rotating
+    /// PIN record (node id + auth token, encrypted under a PIN-derived key) over
+    /// `nostr_relays`, and the dial manager resolves a [`DialTarget::Pin`] back to those.
+    /// Distinct from `nostr_discovery` (the name-based node-id discovery used by connect
+    /// mode). `false` in connect mode and headless test mode.
+    pub pin_rendezvous: bool,
     /// Whether this config's endpoint owns the node id surfaced in the TUI / published
     /// to nostr. Single roles set `true`; in `Role::Both` only the listen sub-config is
     /// `true` so the dial half's separate ephemeral endpoint id doesn't clobber it.
@@ -147,6 +153,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("nostr_relays", &self.nostr_relays)
             .field("nostr_discovery", &self.nostr_discovery)
             .field("nostr_identifier", &self.nostr_identifier)
+            .field("pin_rendezvous", &self.pin_rendezvous)
             .field("report_endpoint_id", &self.report_endpoint_id)
             .field("relay_urls", &self.relay_urls)
             .field("relay_only", &self.relay_only)
@@ -328,9 +335,11 @@ async fn run_managed_dial_session(
         config.status.set_conn_status(ConnStatus::Connecting);
 
         // Resolve the target each attempt: a nostr name re-resolves so a listener that
-        // restarted with a fresh ephemeral id self-heals on the next try.
-        let resolved: Result<EndpointId> = match &target {
-            DialTarget::NodeId(id) => Ok(*id),
+        // restarted with a fresh ephemeral id self-heals on the next try. The optional
+        // second element is an auth-token override: quick PIN mode learns the listener's
+        // token from the PIN record and must present *that* token (not this dialer's own).
+        let resolved: Result<(EndpointId, Option<String>)> = match &target {
+            DialTarget::NodeId(id) => Ok((*id, None)),
             DialTarget::Name(name) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
@@ -342,10 +351,28 @@ async fn run_managed_dial_session(
                     ) => match r {
                         Ok(id) => {
                             log::info!("Discovered peer '{name}' node id via nostr: {id}");
-                            Ok(id)
+                            Ok((id, None))
                         }
                         Err(e) => Err(e.context("nostr node-id lookup failed")),
                     },
+                }
+            }
+            DialTarget::Pin(pin) => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = cancel.cancelled() => return,
+                    r = crate::nostr_discovery::lookup_pin_record(pin, &config.nostr_relays) => {
+                        match r {
+                            Ok(Some((id, token))) => {
+                                log::info!("Resolved PIN to peer node id via nostr: {id}");
+                                Ok((id, Some(token)))
+                            }
+                            Ok(None) => Err(anyhow::anyhow!(
+                                "no peer found for that PIN (it refreshes every 60s — check the current code on the other device)"
+                            )),
+                            Err(e) => Err(e.context("nostr PIN lookup failed")),
+                        }
+                    }
                 }
             }
         };
@@ -355,7 +382,7 @@ async fn run_managed_dial_session(
         // node id, which is a separate endpoint in the combined process — so dialing our
         // own published id (a quick-mode paste, or a name that resolves back to us) is
         // caught here as a last line of defense behind the connect prompt's checks.
-        if let Ok(id) = &resolved {
+        if let Ok((id, _)) = &resolved {
             let id_str = id.to_string();
             let is_own_published =
                 config.status.snapshot().endpoint_id.as_deref() == Some(id_str.as_str());
@@ -367,9 +394,9 @@ async fn run_managed_dial_session(
             }
         }
 
-        let connect = match resolved {
-            Ok(id) => {
-                tokio::select! {
+        let (token_override, connect) = match resolved {
+            Ok((id, token_override)) => {
+                let c = tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = cancel.cancelled() => return,
                     c = connect_to_server(
@@ -379,19 +406,31 @@ async fn run_managed_dial_session(
                         config.relay_only,
                         ALPN,
                     ) => c,
-                }
+                };
+                (token_override, c)
             }
-            Err(e) => Err(e),
+            Err(e) => (None, Err(e)),
         };
 
         match connect {
             Ok(conn) => {
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
+                // Quick PIN mode authenticates with the token learned from the PIN record;
+                // every other path uses this process's own token. A per-session config
+                // clone carries the override down to the auth handshake.
+                let session_config = match &token_override {
+                    Some(token) => {
+                        let mut c = (*config).clone();
+                        c.auth_token = token.clone();
+                        Arc::new(c)
+                    }
+                    None => config.clone(),
+                };
                 // handle_connection returns on conn-close or process shutdown; also race
                 // the session cancel so a disconnect/replace tears it down promptly.
                 let outcome = tokio::select! {
-                    r = handle_connection(conn, config.clone(), semaphore.clone(), true) => Some(r),
+                    r = handle_connection(conn, session_config, semaphore.clone(), true) => Some(r),
                     _ = cancel.cancelled() => None,
                 };
                 match outcome {
@@ -498,6 +537,23 @@ async fn run_listen(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()>
             config_path: config.config_path.clone(),
         })),
         _ => None,
+    };
+
+    // Quick PIN mode: publish a rotating PIN record (node id + token, encrypted under a
+    // PIN-derived key) so a dialer can connect by typing a short code. Independent of the
+    // name-based node-id discovery above; runs only when explicitly enabled.
+    let _pin_publisher = if config.pin_rendezvous {
+        Some(PublisherGuard(tokio::spawn(crate::logging::inherit_source(
+            run_pin_publisher(
+                endpoint_id,
+                config.auth_token.clone(),
+                config.nostr_relays.clone(),
+                config.status.clone(),
+                config.status.shutdown.clone(),
+            ),
+        ))))
+    } else {
+        None
     };
 
     let shutdown = config.status.shutdown.clone();
@@ -756,6 +812,42 @@ async fn run_node_id_publisher(params: PublisherParams) {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Quick PIN mode publisher: mint a fresh PIN each rotation period, publish the
+/// `{node_id, token}` record under it, and surface the PIN + rollover deadline to the TUI
+/// for the always-on countdown. The PIN is set on `AppState` *before* the network publish
+/// so the header and connect prompt see it immediately; relay failures are logged but
+/// non-fatal (a dialer simply retries on the next code).
+async fn run_pin_publisher(
+    node_id: EndpointId,
+    token: String,
+    relays: Vec<String>,
+    state: Arc<AppState>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let pin = crate::pin::generate_pin();
+        let bucket = crate::pin::current_bucket();
+        let remaining = crate::pin::secs_until_next_bucket();
+        // Show the new code right away (deadline = the bucket boundary it rotates on).
+        state.set_current_pin(pin.clone(), Instant::now() + Duration::from_secs(remaining));
+
+        match crate::nostr_discovery::publish_pin_record(&pin, bucket, &node_id, &token, &relays)
+            .await
+        {
+            Ok(()) => log::info!("Published rotating PIN to nostr (refreshes in {remaining}s)"),
+            Err(e) => log::warn!("Failed to publish PIN to nostr: {e:#}"),
+        }
+
+        // Sleep to the next bucket boundary, then rotate. `max(1)` avoids a busy spin if we
+        // happen to land exactly on the boundary.
+        let sleep_for = Duration::from_secs(crate::pin::secs_until_next_bucket().max(1));
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(sleep_for) => {}
         }
     }
 }
@@ -1440,7 +1532,7 @@ mod tests {
     }
 
     fn test_peer_config(role: Role, token: &str) -> Arc<PeerConfig> {
-        let status = AppState::new(role, false, LogBuffer::new(16), None, false, None);
+        let status = AppState::new(role, false, LogBuffer::new(16), None, false, None, false);
         Arc::new(PeerConfig {
             role,
             peer_node_id: None,
@@ -1449,6 +1541,7 @@ mod tests {
             nostr_relays: vec![],
             nostr_discovery: false,
             nostr_identifier: None,
+            pin_rendezvous: false,
             report_endpoint_id: true,
             relay_urls: vec![],
             relay_only: false,
@@ -1473,6 +1566,7 @@ mod tests {
             None,
             true,
             Some("homelab".to_string()),
+            false,
         );
         let both = PeerConfig {
             role: Role::Both,
@@ -1482,6 +1576,7 @@ mod tests {
             nostr_relays: vec![],
             nostr_discovery: true,
             nostr_identifier: Some("homelab".to_string()),
+            pin_rendezvous: false,
             report_endpoint_id: true,
             relay_urls: vec![],
             relay_only: false,
@@ -1518,7 +1613,7 @@ mod tests {
     /// surfaces in the snapshot.
     #[test]
     fn dial_command_roundtrip_and_target_in_snapshot() {
-        let status = AppState::new(Role::Both, false, LogBuffer::new(16), None, true, None);
+        let status = AppState::new(Role::Both, false, LogBuffer::new(16), None, true, None, false);
         let mut rx = status.subscribe_dial();
         status.set_dial_target(Some("laptop".to_string()));
         assert_eq!(status.snapshot().dial_target.as_deref(), Some("laptop"));

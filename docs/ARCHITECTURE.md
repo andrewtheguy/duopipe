@@ -646,7 +646,7 @@ sequenceDiagram
 
 ### Node-id discovery (nostr)
 
-Because the node id is ephemeral, **connect mode** (active whenever a config file is loaded) uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Configless mode (no config file) does not use nostr — the dialer enters the node id by hand. Implemented in `nostr_discovery.rs`:
+Because the node id is ephemeral, **connect mode** (active whenever a config file is loaded) uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Configless **quick** mode offers two signaling choices at setup: a rotating **PIN** over nostr (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous) below) or **manual** copy-paste with nostr off (the dialer enters the node id by hand). The name-based discovery here is connect mode's; it is implemented in `nostr_discovery.rs`:
 
 - **Shared author key from the auth token.** Both peers derive the same nostr *author* keypair via `sha256("duopipe:nostr-rendezvous:v1" || auth_token)`. The token both sides share *is* the rendezvous, so discovery only works when it's shared (which the dialer needs anyway, for auth).
 - **Per-peer `d` tag from the `name`.** Each peer is distinguished by its `name`: the `d` tag is `duopipe:nodeid:<sha256("duopipe:peer-id:v1" || auth_token || name)>` (`identifier_dtag`). Salting the hash with the auth token stops a short, low-entropy name from being guessed or enumerated on relays. Several peers can share one auth token and stay individually addressable; duplicate names just clobber (replaceable, newest wins).
@@ -655,6 +655,18 @@ Because the node id is ephemeral, **connect mode** (active whenever a config fil
 - **Encrypted content.** The node id is encrypted (NIP-44) under the shared auth-token-derived keypair — self-encryption to the listener's own derived public key, so any peer with the same auth token derives the same key to decrypt — keeping it off relays in the clear. The auth token still gates the actual connection. Relays default to `DEFAULT_NOSTR_RELAYS`, overridable via `nostr_relay_urls`. To dial a raw node id without nostr, use quick mode.
 
 Hermetic tests bypass nostr entirely: when `DUOPIPE_PEER_NODE_ID` is set the dialer dials that id directly, so the test suite needs no live relays.
+
+### Quick-mode PIN rendezvous
+
+Quick mode can share its node id **and** auth token through nostr with no copy-paste, via a short rotating **PIN**. Unlike connect-mode discovery (keyed off the shared auth token), here the dialer does *not* yet have the token — the PIN is the only shared secret. PIN format/KDF live in `pin.rs`; the relay record in `nostr_discovery.rs`.
+
+- **PIN format.** 8 Crockford-base32 characters (alphabet `0-9A-Z` minus the ambiguous `I L O U`), displayed UPPERCASE and grouped `XXXX-XXXX`. Input is normalized case-insensitively and ignores dashes/spaces (mapping the look-alikes `I`/`L`→`1`, `O`→`0`). ~40 bits. A fresh random PIN is minted per 60-second bucket.
+- **Key from `(PIN, bucket)` via Argon2id.** `pin::derive_key_material` runs Argon2id (64 MiB, t=3) over the canonical PIN with a salt of `"duopipe:pin-rendezvous:v1" || bucket`; `nostr_discovery::pin_keys` turns the 32-byte output into a nostr keypair. The slow, memory-hard KDF raises the cost of brute-forcing the short PIN against a captured record.
+- **Publish (listener).** When quick PIN mode is selected, `run_listen` spawns `run_pin_publisher`: each 60-second bucket it generates a PIN, sets it (plus the rollover deadline) on `AppState` for the always-on countdown header, and publishes a **regular (stored, non-replaceable) event** — kind `9421`, NIP-44-encrypted `{node_id, token}` content, with a NIP-40 `expiration` a few buckets out so per-bucket records coexist for boundary look-back then self-clean. The lookup key is the **author pubkey** (only a holder of the PIN can derive it); no extra tag is needed. A different kind from connect mode's replaceable 30078 is used deliberately so each bucket's record persists.
+- **Lookup on demand (dialer).** A `DialTarget::Pin` resolves in the dial session: `lookup_pin_record` derives the keypair for the current bucket and its two neighbors (covering the rotation boundary and small clock skew), queries all of them by author in one round-trip, then NIP-44-decrypts the newest matching record to `(node_id, token)`. The dial session then authenticates with that **decrypted token** (carried via a per-session `PeerConfig` clone), not this dialer's own token.
+- **Trust.** Anyone who reads the current PIN within its window can connect (it conveys the token). The 60-second rotation, short record TTL, and Argon2id cost bound the exposure; raising PIN length or KDF parameters tightens it further.
+
+The PIN crypto round-trips are unit-tested offline (`pin.rs`, `nostr_discovery.rs`); no live-relay tests.
 
 ---
 

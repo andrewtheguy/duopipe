@@ -97,6 +97,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         launch.tunnel.clone(),
         launch.nostr_discovery,
         launch.peer_name.clone(),
+        resolved.quick_pin,
     );
     // Seed the active token now so the header fingerprint is populated from the first
     // frame (the runtime sets the same value again once it starts — idempotent).
@@ -130,7 +131,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                         ui::render_add_tunnel_dialog(f, form);
                     }
                     if let Some(form) = &ui_state.connect_form {
-                        ui::render_connect_dialog(f, form, state.nostr_discovery);
+                        ui::render_connect_dialog(f, form, state.nostr_discovery, state.pin_mode);
                     }
                     // A name-conflict prompt is drawn last so it sits on top of any
                     // other modal until the user resolves it.
@@ -191,6 +192,8 @@ fn build_peer_config(
         nostr_relays: launch.nostr_relays.clone(),
         nostr_discovery: launch.nostr_discovery,
         nostr_identifier,
+        // Quick PIN mode publishes/resolves the rotating PIN over nostr.
+        pin_rendezvous: resolved.quick_pin,
         report_endpoint_id: true,
         relay_urls: launch.relay_urls.clone(),
         relay_only: launch.relay_only,
@@ -552,6 +555,24 @@ fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
             return;
         }
         DialTarget::Name(raw)
+    } else if state.pin_mode {
+        // Quick PIN mode: the user types the rotating code from the other device. Normalize
+        // (ignore dashes/spaces/case) and validate the format up front; resolution to a node
+        // id + token happens via nostr in the dial session.
+        if raw.is_empty() {
+            form.error = Some("Enter the PIN shown on the other device".to_string());
+            return;
+        }
+        match crate::pin::normalize_pin(&raw) {
+            Some(canonical) => DialTarget::Pin(canonical),
+            None => {
+                form.error = Some(format!(
+                    "That is not a valid {}-character PIN",
+                    crate::pin::PIN_LEN
+                ));
+                return;
+            }
+        }
     } else {
         if raw.is_empty() {
             form.error = Some("Enter the peer's node id".to_string());
@@ -670,11 +691,11 @@ mod tests {
     }
 
     fn state() -> Arc<AppState> {
-        AppState::new(Role::Dial, false, LogBuffer::new(16), None, false, None)
+        AppState::new(Role::Dial, false, LogBuffer::new(16), None, false, None, false)
     }
 
     fn listen_generated_state() -> Arc<AppState> {
-        AppState::new(Role::Listen, true, LogBuffer::new(16), None, false, None)
+        AppState::new(Role::Listen, true, LogBuffer::new(16), None, false, None, false)
     }
 
     fn type_str(ui: &mut UiState, st: &Arc<AppState>, s: &str) {
@@ -690,6 +711,41 @@ mod tests {
     }
 
     #[test]
+    fn pin_mode_connect_form_normalizes_and_rejects_bad_pin() {
+        // pin_mode = true, nostr_discovery = false (quick PIN mode).
+        let st = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, true);
+
+        // A dashed, lowercase PIN passes normalization+validation; with no dial manager
+        // running the only remaining error is the dial-manager one (i.e. it got that far).
+        let mut ui = UiState {
+            connect_form: Some(ConnectForm::default()),
+            ..Default::default()
+        };
+        type_connect_target(&mut ui, &st, "k7p2-9qxm");
+        handle_connect_form(key(KeyCode::Enter), &mut ui, &st);
+        let form = ui.connect_form.as_ref().expect("form stays open");
+        assert_eq!(
+            form.error.as_deref(),
+            Some("Dial manager is not running; cannot connect"),
+            "valid PIN passed validation"
+        );
+
+        // A malformed PIN is rejected up front with a format error.
+        let mut ui = UiState {
+            connect_form: Some(ConnectForm::default()),
+            ..Default::default()
+        };
+        type_connect_target(&mut ui, &st, "nope");
+        handle_connect_form(key(KeyCode::Enter), &mut ui, &st);
+        let form = ui.connect_form.as_ref().expect("form stays open");
+        assert!(
+            form.error.as_deref().unwrap_or("").contains("valid"),
+            "bad PIN rejected: {:?}",
+            form.error
+        );
+    }
+
+    #[test]
     fn connect_submit_keeps_modal_open_when_dial_manager_is_absent() {
         let st = AppState::new(
             Role::Both,
@@ -698,6 +754,7 @@ mod tests {
             None,
             true,
             Some("web1".to_string()),
+            false,
         );
         let mut ui = UiState {
             connect_form: Some(ConnectForm::default()),
@@ -1000,6 +1057,7 @@ mod tests {
             None,
             true,
             Some("web1".to_string()),
+            false,
         );
         st.set_endpoint_id("node-123".to_string());
 
