@@ -374,18 +374,22 @@ impl AppState {
         *self.dial_target.write() = target;
     }
 
-    /// Toggle the single tunnel: stop it if running, otherwise start it. A no-op
-    /// when no tunnel is configured.
-    pub fn toggle_tunnel(&self) {
+    /// Start the single tunnel's listener. A no-op when no tunnel is configured; the
+    /// supervisor ignores a redundant Start if it is already running.
+    pub fn start_tunnel(&self) {
         if self.tunnel.read().is_none() {
             return;
         }
-        let cmd = if self.tunnel_running() {
-            TunnelCommand::Stop
-        } else {
-            TunnelCommand::Start
-        };
-        self.send_command(cmd);
+        self.send_command(TunnelCommand::Start);
+    }
+
+    /// Stop the single tunnel's listener. A no-op when no tunnel is configured; the
+    /// supervisor ignores a Stop if it is not running.
+    pub fn stop_tunnel(&self) {
+        if self.tunnel.read().is_none() {
+            return;
+        }
+        self.send_command(TunnelCommand::Stop);
     }
 
     pub fn set_endpoint_id(&self, id: String) {
