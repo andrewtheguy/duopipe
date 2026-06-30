@@ -305,9 +305,10 @@ fn render_header(
         Span::raw(format!("{}/{}", snap.streams_used, snap.streams_max)),
     ];
     // Only meaningful once the serve half is up and there is a live endpoint to pair with.
-    // Suppressed in quick PIN mode: the PIN already carries the token, and the
-    // auto-generated token is identical across paired devices, so the fp is pure noise.
-    if snap.listening && !snap.pin_mode && let Some(token) = snap.auth_token.as_deref() {
+    // Suppressed whenever the token was auto-generated: it is shared automatically (via the
+    // PIN or the token banner) and is identical across paired devices, so the fp is pure
+    // noise. With a config-supplied token the fp lets the user confirm both devices match.
+    if snap.listening && !snap.token_generated && let Some(token) = snap.auth_token.as_deref() {
         status_line.push(Span::raw("  token fp: "));
         status_line.push(Span::styled(
             crate::auth::token_fingerprint(token),
@@ -1031,13 +1032,26 @@ mod tests {
     }
 
     #[test]
-    fn non_pin_listening_keeps_token_fp() {
-        // Outside PIN mode the fp still lets the user cross-check the shared token.
-        let mut snap = base_snapshot(false, None); // listening = true, pin_mode = false
+    fn config_token_listening_keeps_token_fp() {
+        // A config-supplied token (not auto-generated) keeps the fp so the user can
+        // cross-check that both devices share the same token.
+        let mut snap = base_snapshot(false, None); // listening = true, token_generated = false
         snap.auth_token = Some(crate::auth::generate_token());
 
         let out = render_text(&snap, &UiState::default());
-        assert!(out.contains("token fp:"), "token fp shown outside PIN mode");
+        assert!(out.contains("token fp:"), "token fp shown for a config token");
+    }
+
+    #[test]
+    fn generated_token_listening_hides_token_fp() {
+        // An auto-generated token is shared automatically and identical across devices, so
+        // its fp is noise — dropped even outside PIN mode (quick manual mode).
+        let mut snap = base_snapshot(false, None); // listening = true, pin_mode = false
+        snap.token_generated = true;
+        snap.auth_token = Some(crate::auth::generate_token());
+
+        let out = render_text(&snap, &UiState::default());
+        assert!(!out.contains("token fp:"), "token fp dropped for a generated token");
     }
 
     #[test]
