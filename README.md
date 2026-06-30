@@ -35,11 +35,11 @@ duopipe runs as a peer launched in one of two modes — `duopipe quick` (configl
 
 > **Note:** v1 forwards a **single TCP stream** per dial session — one `remote_source` reached through one `local_listen`. A single SOCKS5 listener (so one tunnel can reach many destinations) is the planned future direction, modeled on [flextunnel](https://github.com/andrewtheguy/flextunnel). UDP is intentionally out of scope; that role belongs to [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs).
 
-There is **no listen/dial choice at startup**. Setup only collects the auth token — supplied via file/env, or chosen interactively (quick mode lets you generate a fresh ephemeral token or paste one; nostr mode pastes a pre-shared token you generated with `duopipe generate-auth-token`) — then the dashboard opens, already listening. To dial a peer, press **`c`** and type the target (its `name` in nostr mode, or its node id in quick mode); press **`D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time.
+There is **no listen/dial choice at startup**. Setup only collects the auth token — quick mode always generates a fresh ephemeral token (shown in the dashboard to copy to your other device); nostr mode uses a pre-shared token you generated with `duopipe generate-auth-token`, supplied via config/env or pasted at setup — then the dashboard opens, already listening. To dial a peer, press **`Shift-C`** and type the target (its `name` in nostr mode, or its node id in quick mode); press **`Shift-D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time.
 
 - The TUI header shows this instance's **node id**, a short **token fingerprint** (the first 8 hex digits of the token's SHA-256, shown in every mode so you can confirm both devices match even after the token hides), and — when the token was freshly generated — the full **auth token**, so you can copy it to your other device. Generated tokens hide automatically after 10 minutes, or immediately when you press `h`.
 - The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated/entered at setup.
-- The dashboard shows a **single tunnel row** (there is no list to navigate). Press **`Enter`** or **`Space`** to toggle that tunnel start/stop; press **`a`** (or **`e`**) to open the **set-tunnel** form — two fields only, the remote source (`host:port`) and the local listen (`host:port`), with no protocol picker and no name field; press **`d`** or **`Del`** to clear the tunnel.
+- The dashboard shows a **single tunnel row** (there is no list to navigate). Every tunnel action is a deliberate **`Shift`** key so a stray press can't start or tear anything down: press **`Shift-S`** to start the listener and **`Shift-X`** to stop it; press **`Shift-E`** to open the **set-tunnel** form — two fields only, the remote source (`host:port`) and the local listen (`host:port`), with no protocol picker and no name field (saving only *sets* the spec — it does not start it); press **`Shift-R`** to clear the tunnel.
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In nostr mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
 
@@ -193,7 +193,7 @@ remote_source = "127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 ```
 
-The instance always listens; the dial target is chosen **interactively** at runtime (press `c`), not in the config file. The `[tunnel]` entry is the template for that dial session, started/stopped from the TUI — nothing forwards automatically.
+The instance always listens; the dial target is chosen **interactively** at runtime (press `Shift-C`), not in the config file. The `[tunnel]` entry is the template for that dial session, started/stopped from the TUI — nothing forwards automatically.
 
 ---
 
@@ -233,7 +233,7 @@ There is no role prompt — setup just confirms the token and the dashboard open
 
 ### 2. Dial a peer
 
-In the TUI on either machine, press **`c`** and type the **`name`** of the peer you want (e.g. `web1`, which must differ from this instance's own `name`); duopipe resolves it via nostr and connects. Press **`D`** to disconnect, then `c` again to dial a different peer. The **auth token** comes from config, `DUOPIPE_AUTH_TOKEN`, or the interactive setup prompt, and is shared by both sides — compare the **token fingerprint** in each header to confirm they match.
+In the TUI on either machine, press **`Shift-C`** and type the **`name`** of the peer you want (e.g. `web1`, which must differ from this instance's own `name`); duopipe resolves it via nostr and connects. Press **`Shift-D`** to disconnect, then `Shift-C` again to dial a different peer. The **auth token** comes from config, `DUOPIPE_AUTH_TOKEN`, or the interactive setup prompt, and is shared by both sides — compare the **token fingerprint** in each header to confirm they match.
 
 Once connected, the request you start in the TUI flows over that session. For example, a config with:
 
@@ -262,9 +262,9 @@ Each individual connection is one-directional: **whoever dialed is the requester
 other side serves.** But every instance both serves and dials, so you get both
 directions naturally — just dial from whichever side needs to pull:
 
-- `homelab` wants a service on `laptop`: on `homelab` press `c`, dial `laptop`, and
+- `homelab` wants a service on `laptop`: on `homelab` press `Shift-C`, dial `laptop`, and
   start its `[tunnel]` for that service.
-- `laptop` wants a service on `homelab`: on `laptop` press `c`, dial `homelab`, and
+- `laptop` wants a service on `homelab`: on `laptop` press `Shift-C`, dial `homelab`, and
   start its request.
 
 Both can be connected at the same time — each instance's serve half accepts the
@@ -289,21 +289,19 @@ duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1`
 | `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
 | `DUOPIPE_AUTOSTART_TUNNELS=1` | Start the configured `[tunnel]` (dial side) once connected (nothing auto-starts otherwise). |
-| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token (also valid outside test mode; see env table below). |
+| `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token. In **quick mode** it is honored **only** in test mode (interactive quick mode always generates its own token); in **nostr mode** it is also valid outside test mode (see env table below). |
 
 In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
 
 ## CLI Options
 
-Both interactive subcommands launch the same always-listening TUI; they differ only in how the connect prompt names a target. In `quick`, press `c` and enter the peer's node id. In `nostr`, press `c` and enter the peer's `name`. Headless test mode is the only path with a fixed listen/dial role (see [Test mode (testing only)](#test-mode-testing-only)).
+Both interactive subcommands launch the same always-listening TUI; they differ only in how the connect prompt names a target. In `quick`, press `Shift-C` and enter the peer's node id. In `nostr`, press `Shift-C` and enter the peer's `name`. Headless test mode is the only path with a fixed listen/dial role (see [Test mode (testing only)](#test-mode-testing-only)).
 
 ### quick (configless mode)
 
 `duopipe quick` runs everything ephemeral with **no config file** and **no nostr**: the node id changes every run, and to dial you enter the peer's node id by hand in the connect prompt (`c`).
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--auth-token-file` | - | Path to a file holding the shared auth token. Precedence: this flag > `DUOPIPE_AUTH_TOKEN`. Without either, setup prompts to generate a fresh token or enter an existing one. |
+It takes **no options**. The auth token is always generated fresh on startup and shown in the dashboard header (with its fingerprint) so you can copy it to your other device — there is no way to supply an existing token. (`DUOPIPE_AUTH_TOKEN` is honored only under `DUOPIPE_TEST_MODE=1`; see [Test mode](#test-mode-testing-only).)
 
 ### nostr (config-driven mode)
 
@@ -317,7 +315,7 @@ Both interactive subcommands launch the same always-listening TUI; they differ o
 
 | Env Var | Description |
 |---------|-------------|
-| `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: below `--auth-token-file`, above config `auth_token_file`). |
+| `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
 | `DUOPIPE_AUTOSTART_TUNNELS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start the dial-side tunnel on connect. |
@@ -332,7 +330,7 @@ Config files are used by `duopipe nostr`: run it with no flag to load the defaul
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-`duopipe nostr` requires a `name` and an `auth_token_fingerprint`; the auth token itself is optional in the config (supply it via `auth_token_file`/`DUOPIPE_AUTH_TOKEN`, or paste it at setup — generate it first with `duopipe generate-auth-token` and pre-share it). The resolved token must match `auth_token_fingerprint`, which pins the config to one pairing. The config holds the tunnel request, the token fingerprint, the optional path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The instance always listens; the **dial target** is chosen interactively at runtime (press `c`), not in the config.
+`duopipe nostr` requires a `name` and an `auth_token_fingerprint`; the auth token itself is optional in the config (supply it via `auth_token_file`/`DUOPIPE_AUTH_TOKEN`, or paste it at setup — generate it first with `duopipe generate-auth-token` and pre-share it). The resolved token must match `auth_token_fingerprint`, which pins the config to one pairing. The config holds the tunnel request, the token fingerprint, the optional path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. The instance always listens; the **dial target** is chosen interactively at runtime (press `Shift-C`), not in the config.
 
 ### Node-id discovery
 

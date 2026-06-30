@@ -34,7 +34,7 @@ Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that 
 
 Config declares the single **tunnel request** (the dial target is chosen interactively at runtime, not here):
 
-- **`[tunnel]`** (`remote_source`, `local_listen`): the template for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source` (a bare `host:port`), then bridges the two. Activated on demand (TUI `Enter`/`a`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
+- **`[tunnel]`** (`remote_source`, `local_listen`): the template for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source` (a bare `host:port`), then bridges the two. Activated on demand (TUI `Shift-S`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
 
 #### Non-interactive mode (testing)
 
@@ -43,7 +43,7 @@ The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_
 - `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
 - `DUOPIPE_AUTOSTART_TUNNELS=1` — start the configured `[tunnel]` (dial side) on connect.
-- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (also valid outside test mode).
+- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (in quick mode honored only here in test mode; also valid outside test mode in nostr mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
 
@@ -270,7 +270,7 @@ A single global `Semaphore` (default `max_streams = 100`), shared across all con
 
 ### Request Data Flow
 
-A peer activates its request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor connects out over TCP to `source` (a bare `host:port`), replies `StreamAck`, then bridges. The request starts/stops on demand (TUI `Enter`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping it cancels its task and frees the bound port.
+A peer activates its request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor connects out over TCP to `source` (a bare `host:port`), replies `StreamAck`, then bridges. The request starts/stops on demand (TUI `Shift-S`/`Shift-X`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping it cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
@@ -408,11 +408,11 @@ The outbound dial target is not a config field. In interactive mode it is entere
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-Token precedence is `--auth-token-file` (CLI flag) > `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. When none of these supply a token, the interactive setup screen resolves it (validated against its CRC before acceptance): **quick mode** offers generate-or-enter — a generated token is ephemeral and surfaced in the dashboard header for copying — while **nostr mode** only accepts a pasted token, since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`). `auth_token_file` is therefore optional in nostr mode too — only a `name` and `auth_token_fingerprint` are mandatory.
+Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** always generates a fresh ephemeral token in the interactive setup screen — there is no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it). The generated token is surfaced in the dashboard header for copying. **Nostr mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
 
 The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, the first 4 bytes of the token string's SHA-256 rendered as 8 lowercase hex digits — persistently in the header (all modes/roles) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret. The same canonical form also namespaces the per-name local state/lock file (`peer_state`): its path is `state-<fingerprint>-<name>.json`, with the `name` used verbatim (safe because `config::validate_name` restricts it to ASCII letters, digits, and `_`), so different pairings (tokens) that share a `name` get distinct, human-readable state files.
 
-**Fingerprint pinning (nostr mode):** a nostr config must declare `auth_token_fingerprint` (the same 8-hex-digit value) regardless of whether the token itself is in the config. The resolved token — from file, env, or pasted at setup — is checked against it (`auth::fingerprint_matches`): a file/env token is verified in `main::resolve_expected_fingerprint` before the TUI launches (a mismatch is a plain config error), and a pasted token is verified in the setup screen (`submit_token`). This disambiguates configs meant for different pairings, so pointing a config at the wrong token file is caught up front instead of failing as an auth error on connect. Quick mode declares no fingerprint.
+**Fingerprint pinning (nostr mode):** a nostr config must declare `auth_token_fingerprint` (the same 8-hex-digit value) regardless of whether the token itself is in the config. The resolved token — from config, env, or pasted at setup — is checked against it (`auth::fingerprint_matches`): a file/env token is verified in `main::resolve_expected_fingerprint` before the TUI launches (a mismatch is a plain config error), and a pasted token is verified in the setup screen (`submit_token`). This disambiguates configs meant for different pairings, so pointing a config at the wrong token file is caught up front instead of failing as an auth error on connect. Quick mode declares no fingerprint.
 
 ```toml
 # peer.toml
@@ -426,7 +426,7 @@ local_listen = "127.0.0.1:2222"
 
 ### Configuration Loading Flow
 
-Config files are read by `duopipe nostr` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config: configuration comes from environment variables, the `--auth-token-file` flag, and interactive prompts only.
+Config files are read by `duopipe nostr` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config and takes no options: it always generates its own token, and the dial target is entered interactively.
 
 ```mermaid
 sequenceDiagram
@@ -446,7 +446,7 @@ sequenceDiagram
         Config->>Source: Read file
         Source-->>Config: TOML content
     else duopipe quick
-        Main->>Main: Use env vars + --auth-token-file + setup screen
+        Main->>Main: Generate token in setup screen (no config/options)
     end
 
     alt Config loaded

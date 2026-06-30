@@ -5,6 +5,8 @@
 - Keep tests hermetic — they must never depend on live relays or network
   rendezvous. With `DUOPIPE_PEER_NODE_ID` set the dialer dials that id directly and
   never touches nostr, so `cargo test -q` runs offline; preserve that.
+- The program has only either interactive TUI mode or non-interactive test mode
+  (`DUOPIPE_TEST_MODE=1`)
 
 # What this is
 duopipe is for a **single user connecting their own devices** (laptop ↔ homelab box

@@ -449,7 +449,7 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         frame,
         chunks[i],
         Line::from(Span::styled(
-            "↑/↓ move field · Enter on local_listen sets & starts · Esc cancel",
+            "↑/↓ move field · Enter on local_listen sets (Shift-S to start) · Esc cancel",
             Style::default().fg(Color::DarkGray),
         )),
     );
@@ -583,7 +583,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, _ui: &UiSta
     // empty; the combined node's dial half drives the single tunnel.
     let empty_msg = match snap.role {
         Role::Listen => "(serving peers — this side initiates no tunnel)",
-        Role::Dial | Role::Both => "(no tunnel set — press a)",
+        Role::Dial | Role::Both => "(no tunnel set — press Shift-E)",
     };
     let rows: Vec<Row> = match &snap.tunnel {
         None => vec![Row::new(["", empty_msg, "", ""])],
@@ -606,11 +606,11 @@ fn tunnel_title(snap: &AppSnapshot) -> &'static str {
     match snap.role {
         Role::Listen => " Tunnel ",
         Role::Dial | Role::Both if has_connected_dial(snap) => {
-            " Outbound Tunnel  [Enter start/stop · a set · d/Del clear] "
+            " Outbound Tunnel  [Shift-S start · Shift-X stop · Shift-E set · Shift-R clear] "
         }
         // Without a dial session the tunnel can be set but not started; the connect
         // hint lives on the dial header line above, not here.
-        Role::Dial | Role::Both => " Outbound Tunnel  [a set · d/Del clear] ",
+        Role::Dial | Role::Both => " Outbound Tunnel  [Shift-E set · Shift-R clear] ",
     }
 }
 
@@ -985,15 +985,15 @@ mod tests {
     fn tunnel_title_matches_dial_state() {
         let snap = base_snapshot(false, None);
         let idle_text = render_text(&snap, &UiState::default());
-        // Idle: no start/stop hint, and the Tunnel box carries only set/clear actions
-        // (the connect hint moved to the dial header line).
-        assert!(!idle_text.contains("Enter start/stop"));
-        assert!(idle_text.contains("[a set · d/Del clear]"));
+        // Idle (no dial session): no start/stop hint, and the Tunnel box carries only
+        // set/clear actions (the connect hint moved to the dial header line).
+        assert!(!idle_text.contains("Shift-S start"));
+        assert!(idle_text.contains("[Shift-E set · Shift-R clear]"));
 
         let mut connected = base_snapshot(false, None);
         connected.dial_target = Some("peer".to_string());
         connected.conn_status = ConnStatus::Connected;
         let connected_text = render_text(&connected, &UiState::default());
-        assert!(connected_text.contains("Enter start/stop"));
+        assert!(connected_text.contains("Shift-S start"));
     }
 }
