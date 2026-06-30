@@ -150,38 +150,148 @@ pub struct TransportTuning {
 // Validation Helpers
 // ============================================================================
 
-/// Validate that a string is a valid host:port address.
+/// Validate that a string is a strict bare `host:port` address. Accepts exactly one of:
+/// an IPv4 literal (`127.0.0.1:8000`), a bracketed IPv6 literal (`[::1]:8000`), or a
+/// DNS hostname (`host.example:8000`), each followed by a port in `1..=65535`.
+///
+/// Rejects URL-shaped values — a scheme like `tcp://`, a path, userinfo (`@`), a
+/// query/fragment, or any whitespace — and bare (unbracketed) IPv6. A lenient
+/// right-split used to wave these through (e.g. `tcp://127.0.0.1:8000` parsed as host
+/// `tcp://127.0.0.1`), so the typo only surfaced as a connection reset at dial time;
+/// catch it here instead.
 fn validate_host_port(value: &str, field_name: &str) -> Result<()> {
-    if !value.contains(':') {
-        anyhow::bail!(
-            "{} '{}' missing port. Expected format: host:port",
-            field_name,
-            value
-        );
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let invalid = |reason: &str| {
+        anyhow::anyhow!(
+            "{field_name} '{value}' is not a valid host:port ({reason}). Use a bare \
+             address like 127.0.0.1:8000, [::1]:8000, or host.example:8000 — no scheme, \
+             path, or spaces."
+        )
+    };
+
+    if value.is_empty() {
+        return Err(invalid("empty"));
+    }
+    // Reject URL syntax outright: scheme separators, paths, userinfo, query/fragment,
+    // and any whitespace.
+    if value.contains('/')
+        || value.contains('@')
+        || value.contains('?')
+        || value.contains('#')
+        || value.contains(char::is_whitespace)
+    {
+        return Err(invalid("contains scheme, path, userinfo, or whitespace"));
     }
 
-    // Use rsplitn to split from the right (handles IPv6 addresses like [::1]:8080)
-    let parts: Vec<&str> = value.rsplitn(2, ':').collect();
-    if parts.len() != 2 {
-        anyhow::bail!(
-            "{} '{}' has invalid format. Expected format: host:port",
-            field_name,
-            value
-        );
+    // Split host from port, then validate each.
+    let (host, port_str, bracketed) = if let Some(rest) = value.strip_prefix('[') {
+        // Bracketed IPv6: [addr]:port
+        let close = rest
+            .find(']')
+            .ok_or_else(|| invalid("unterminated '[' in IPv6 address"))?;
+        let host = &rest[..close];
+        let port = rest[close + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| invalid("expected ':port' after ']'"))?;
+        if host.parse::<Ipv6Addr>().is_err() {
+            return Err(invalid("invalid IPv6 address inside brackets"));
+        }
+        (host, port, true)
+    } else {
+        // Unbracketed: exactly one ':' separating host and port.
+        let mut it = value.rsplitn(2, ':');
+        let port = it.next().expect("rsplitn yields at least one element");
+        let host = it.next().ok_or_else(|| invalid("missing port"))?;
+        if host.contains(':') {
+            return Err(invalid("bracket IPv6 addresses as [addr]:port"));
+        }
+        (host, port, false)
+    };
+
+    // Port: 1..=65535 (u16 rejects out-of-range and non-numeric; 0 is meaningless here).
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| invalid("port must be a number in 1..=65535"))?;
+    if port == 0 {
+        return Err(invalid("port must be in 1..=65535"));
     }
 
-    let port_str = parts[0];
-    let host = parts[1];
-
+    // Host: the bracketed branch already validated the IPv6 literal; otherwise it must
+    // be an IPv4 literal or a DNS hostname.
+    if bracketed {
+        return Ok(());
+    }
     if host.is_empty() {
-        anyhow::bail!("{} '{}' missing host", field_name, value);
+        return Err(invalid("missing host"));
     }
-
-    port_str
-        .parse::<u16>()
-        .with_context(|| format!("{} '{}' has invalid port number", field_name, value))?;
-
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    validate_hostname(host).map_err(|reason| invalid(&reason))?;
     Ok(())
+}
+
+/// Validate a DNS hostname: dot-separated labels, each 1–63 chars of ASCII letters,
+/// digits, or `-` (not at a label edge), total length ≤ 253. Returns a short reason
+/// string on failure so the caller can wrap it in the field-specific message.
+fn validate_hostname(host: &str) -> std::result::Result<(), String> {
+    if host.len() > 253 {
+        return Err("hostname is longer than 253 characters".into());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("hostname has an empty label".into());
+        }
+        if label.len() > 63 {
+            return Err("hostname label is longer than 63 characters".into());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("hostname label must not start or end with '-'".into());
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("hostname may contain only letters, digits, '-', and '.'".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a string is a well-formed URL whose scheme is in `allowed_schemes`
+/// and that has a non-empty host. Used for the relay / DNS URL config fields, where a
+/// bare hostname or a wrong/missing scheme is a common mistake — `relay_urls` fails
+/// late at endpoint build, and a bad `nostr_relay_urls` entry is silently skipped, so
+/// catch both here at parse time. `example` is shown in the error to demonstrate the
+/// expected form.
+fn validate_url(
+    value: &str,
+    field_name: &str,
+    allowed_schemes: &[&str],
+    example: &str,
+) -> Result<()> {
+    let invalid = |reason: &str| {
+        anyhow::anyhow!(
+            "{field_name} '{value}' is not a valid URL ({reason}). Expected a {} URL like {example}.",
+            allowed_schemes.join("/")
+        )
+    };
+
+    if value.is_empty() {
+        return Err(invalid("empty"));
+    }
+    if value.contains(char::is_whitespace) {
+        return Err(invalid("contains whitespace"));
+    }
+    let url = url::Url::parse(value).map_err(|e| invalid(&e.to_string()))?;
+    if !allowed_schemes.contains(&url.scheme()) {
+        return Err(invalid(&format!(
+            "scheme must be one of {}",
+            allowed_schemes.join("/")
+        )));
+    }
+    match url.host_str() {
+        Some(h) if !h.is_empty() => Ok(()),
+        _ => Err(invalid("missing host")),
+    }
 }
 
 /// Validate the single tunnel's address formats: both `remote_source` and
@@ -290,6 +400,20 @@ impl PeerConfig {
         // set it must be a valid identifier — it is used verbatim in the state path.
         if let Some(name) = &self.name {
             validate_name(name)?;
+        }
+        // DNS server: the `"none"` sentinel disables discovery; otherwise it is an
+        // HTTP(S) pkarr URL.
+        if let Some(dns) = &self.dns_server
+            && dns != "none"
+        {
+            validate_url(dns, "dns_server", &["http", "https"], "https://dns.example.com")?;
+        }
+        // iroh relay URLs are HTTP(S); nostr relay URLs are WebSocket (ws/wss).
+        for relay in self.relay_urls.iter().flatten() {
+            validate_url(relay, "relay_urls", &["http", "https"], "https://relay.example.com")?;
+        }
+        for relay in self.nostr_relay_urls.iter().flatten() {
+            validate_url(relay, "nostr_relay_urls", &["ws", "wss"], "wss://relay.example.com")?;
         }
 
         Ok(())
@@ -567,4 +691,130 @@ tcp = ["127.0.0.0/8"]
         assert!(bad_listen.validate().is_err());
     }
 
+    #[test]
+    fn host_port_accepts_valid_forms() {
+        for ok in [
+            "127.0.0.1:8000",
+            "0.0.0.0:1",
+            "1.2.3.4:65535",
+            "[::1]:8080",
+            "[::]:443",
+            "[2001:db8::1]:22",
+            "localhost:8000",
+            "host.example.com:443",
+            "a-b.c:53",
+        ] {
+            assert!(
+                validate_host_port(ok, "field").is_ok(),
+                "expected '{ok}' to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn host_port_rejects_scheme_path_and_malformed() {
+        for bad in [
+            "tcp://127.0.0.1:8000", // scheme — the original bug
+            "http://x/y:80",        // scheme + path
+            "127.0.0.1:8000/path",  // trailing path
+            "user@127.0.0.1:8000",  // userinfo
+            "127.0.0.1:8000?x=1",   // query
+            "127.0.0.1",            // missing port
+            "127.0.0.1:",           // empty port
+            "127.0.0.1:0",          // port 0
+            "127.0.0.1:70000",      // port out of range
+            "127.0.0.1:abc",        // non-numeric port
+            "::1:8080",             // bare (unbracketed) IPv6
+            "[::1]8080",            // missing ':' after ']'
+            "[zzzz]:80",            // invalid IPv6 literal
+            "host .example:80",     // whitespace
+            "-bad.example:80",      // label starts with '-'
+            ":8000",                // missing host
+            "",                     // empty
+        ] {
+            assert!(
+                validate_host_port(bad, "field").is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn url_validation_accepts_and_rejects() {
+        // relay-style http(s)
+        assert!(validate_url("https://relay.example.com", "f", &["http", "https"], "ex").is_ok());
+        assert!(validate_url("http://127.0.0.1:8443", "f", &["http", "https"], "ex").is_ok());
+        // nostr-style ws(s)
+        assert!(validate_url("wss://nos.lol", "f", &["ws", "wss"], "ex").is_ok());
+
+        for bad in [
+            "relay.example.com",           // no scheme
+            "wss://nos.lol",               // wrong scheme for an http field (below)
+            "https://",                    // missing host
+            "ftp://example.com",           // disallowed scheme
+            "https://exa mple.com",        // whitespace
+            "",                            // empty
+            "not a url",                   // garbage
+        ] {
+            // Validate against the http/https allowlist; "wss://nos.lol" is rejected here.
+            assert!(
+                validate_url(bad, "f", &["http", "https"], "ex").is_err(),
+                "expected '{bad}' to be rejected for http/https"
+            );
+        }
+    }
+
+    #[test]
+    fn default_nostr_relays_validate() {
+        // Guard against a typo in the built-in default relay set.
+        let cfg = peer_config(PeerConfig {
+            nostr_relay_urls: Some(
+                crate::nostr_discovery::DEFAULT_NOSTR_RELAYS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_checks_relay_dns_fields() {
+        // dns_server "none" sentinel is accepted; a bare host is rejected.
+        let none_dns = peer_config(PeerConfig {
+            dns_server: Some("none".into()),
+            ..Default::default()
+        });
+        assert!(none_dns.validate().is_ok());
+
+        let bad_dns = peer_config(PeerConfig {
+            dns_server: Some("dns.example.com".into()), // no scheme
+            ..Default::default()
+        });
+        assert!(bad_dns.validate().is_err());
+
+        // A relay URL with the wrong scheme (ws:// where http(s) is expected) fails.
+        let bad_relay = peer_config(PeerConfig {
+            relay_urls: Some(vec!["wss://relay.example.com".into()]),
+            ..Default::default()
+        });
+        assert!(bad_relay.validate().is_err());
+
+        // A nostr relay with the wrong scheme (https:// where ws(s) is expected) fails.
+        let bad_nostr = peer_config(PeerConfig {
+            nostr_relay_urls: Some(vec!["https://relay.example.com".into()]),
+            ..Default::default()
+        });
+        assert!(bad_nostr.validate().is_err());
+
+        // Valid combination passes.
+        let good = peer_config(PeerConfig {
+            dns_server: Some("https://dns.example.com".into()),
+            relay_urls: Some(vec!["https://relay.example.com".into()]),
+            nostr_relay_urls: Some(vec!["wss://relay.example.com".into()]),
+            ..Default::default()
+        });
+        assert!(good.validate().is_ok());
+    }
 }
