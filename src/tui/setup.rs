@@ -1,9 +1,9 @@
 //! Interactive in-TUI setup: confirm token generation before the runtime starts.
 //!
-//! There is no role question: every interactive run is always listening, and the
-//! single outbound dial session is started on demand from the dashboard (see
-//! `super::handle_key`). Setup therefore only resolves the auth token (supplied, or
-//! freshly generated).
+//! There is no role question: every interactive run can both serve peers and hold one
+//! outbound dial session, and both are started on demand from the dashboard — press
+//! Shift-L to start/stop listening, Shift-C to dial (see `super::handle_key`). Setup
+//! therefore only resolves the auth token (supplied, or freshly generated).
 //!
 //! Quick mode always generates a fresh ephemeral token — there is no token screen and
 //! no way to supply an existing token. Config mode shows a single entry field for the
@@ -160,8 +160,9 @@ fn submit_token(state: &mut SetupState) -> Step {
     finalize(state, token, false)
 }
 
-/// Build the final `ResolvedPeer`. Interactive runs are always `Role::Both` (serve
-/// always + dial on demand); the dial target is supplied at runtime, not here.
+/// Build the final `ResolvedPeer`. Interactive runs are always `Role::Both` (serve and
+/// dial, both started on demand from the dashboard); the dial target is supplied at
+/// runtime, not here.
 fn build_resolved(state: &SetupState) -> ResolvedPeer {
     ResolvedPeer {
         role: Role::Both,
@@ -411,7 +412,9 @@ fn render_token_phase(frame: &mut Frame, area: Rect, state: &SetupState) {
 }
 
 fn start_summary_lines(state: &SetupState) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from("This instance will always listen for peers.")];
+    let mut lines = vec![Line::from(
+        "Listen for peers on demand from the dashboard (press Shift-L).",
+    )];
     if state.nostr_discovery
         && let Some(name) = &state.own_name
     {

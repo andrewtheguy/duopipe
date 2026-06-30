@@ -329,7 +329,10 @@ async fn run_inner() -> Result<()> {
     let test_env = TestEnv::from_env();
     let is_tui_command = matches!(&command, Command::Quick { .. } | Command::Run { .. });
     let log_buffer = if is_tui_command && test_env.is_none() {
-        if !std::io::stdout().is_terminal() {
+        // The TUI both renders to stdout and reads keyboard input from stdin, so both
+        // must be terminals — a piped stdin would otherwise pass and then starve the
+        // event loop of input.
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return Err(TunnelError::config(anyhow::anyhow!(
                 "duopipe requires an interactive terminal (set DUOPIPE_TEST_MODE=1 for headless test mode)."
             ))

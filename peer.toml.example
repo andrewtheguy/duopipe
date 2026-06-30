@@ -19,13 +19,14 @@
 # outbound dial session. This file supplies the shared auth token, this peer's own
 # `name`, the single tunnel, relays, tuning, and the nostr relay override.
 #
-# Tunnel model: every node always serves inbound peers AND can open one outbound TCP
-# tunnel on demand over its dial session. The [tunnel] table is that single tunnel:
-# it binds a local listener and asks the connected peer to connect out to a remote
-# 'remote_source' (a bare host:port, TCP), bridging the two. It does NOT start
-# automatically — the TUI shows it and you start/stop it with `s`/`x` (in test mode
-# only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start once
-# connected). Inbound, this peer serves any number of dialers at once.
+# Tunnel model: a node can serve inbound peers AND open one outbound TCP tunnel over
+# its dial session — both start on demand, nothing listens or dials automatically.
+# Press Shift-L to start/stop listening (while listening this peer serves any number
+# of dialers at once); the [tunnel] table is the single outbound tunnel, which binds a
+# local listener and asks the connected peer to connect out to a remote 'remote_source'
+# (a bare host:port, TCP), bridging the two. The tunnel does NOT start automatically
+# either — the TUI shows it and you start/stop it with `s`/`x` (in test mode only, with
+# DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start once connected).
 #
 # Trust model: once token auth succeeds the connected peer is fully trusted — it may
 # ask us to connect out to any host:port (there is no source allowlist). Keep the
