@@ -1038,8 +1038,10 @@ mod tests {
         assert!(out.contains("dial PIN:"), "label stays sticky when hidden");
         assert!(out.contains("(hidden)"), "value is masked");
         assert!(out.contains("press h to hide/show"), "hint stays sticky when hidden");
-        // The secret value and its timers must not leak while hidden.
-        assert!(!out.contains("K7P2-9QXM"), "PIN value hidden");
+        // The secret value and its timers must not leak while hidden — neither the
+        // grouped display form nor the raw unformatted PIN.
+        assert!(!out.contains("K7P2-9QXM"), "grouped PIN value hidden");
+        assert!(!out.contains("K7P29QXM"), "raw PIN value hidden");
         assert!(!out.contains("refreshes in"), "refresh countdown hidden");
     }
 
