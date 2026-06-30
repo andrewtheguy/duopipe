@@ -590,7 +590,7 @@ fn submit_connect_form(ui: &mut UiState, state: &Arc<AppState>) {
             Some(canonical) => DialTarget::Pin(canonical),
             None => {
                 form.error = Some(format!(
-                    "That is not a valid {}-character PIN",
+                    "That is not a valid {}-character PIN (check for a typo)",
                     crate::pin::PIN_LEN
                 ));
                 return;
@@ -740,11 +740,13 @@ mod tests {
 
         // A dashed, lowercase PIN passes normalization+validation; with no dial manager
         // running the only remaining error is the dial-manager one (i.e. it got that far).
+        // Generate a real PIN so it carries a valid check digit, then group + lowercase it.
+        let valid_pin = crate::pin::format_pin(&crate::pin::generate_pin()).to_ascii_lowercase();
         let mut ui = UiState {
             connect_form: Some(ConnectForm::default()),
             ..Default::default()
         };
-        type_connect_target(&mut ui, &st, "k7p2-9qxm");
+        type_connect_target(&mut ui, &st, &valid_pin);
         handle_connect_form(key(KeyCode::Enter), &mut ui, &st);
         let form = ui.connect_form.as_ref().expect("form stays open");
         assert_eq!(

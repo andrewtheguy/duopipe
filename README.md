@@ -307,7 +307,7 @@ Both interactive subcommands launch the same TUI — idle at startup, with liste
 <a name="quick-mode-pin"></a>
 #### Quick-mode PIN
 
-The PIN is **8 Crockford-base32 characters** drawn from unambiguous letters/numbers only (no `I L O U`), shown UPPERCASE and grouped like `K7P2-9QXM`. Input is case-insensitive and ignores dashes/spaces. A fresh random PIN is minted every 60 seconds.
+The PIN is **8 Crockford-base32 characters** drawn from unambiguous letters/numbers only (no `I L O U`), shown UPPERCASE and grouped like `K7P2-9QXM`. The last character is a **check digit** (7 random data characters + 1 checksum, ~35 bits), so a mistyped PIN is rejected up front instead of failing later as an empty lookup. Input is case-insensitive and ignores dashes/spaces. A fresh random PIN is minted every 60 seconds.
 
 How it works: both sides turn `(PIN, 60-second time bucket)` into the same nostr keypair via **Argon2id** (memory-hard, to slow brute-force). The listener publishes a single relay record under that key whose content is the **NIP-44 encrypted** `{node_id, token}`; a dialer holding the PIN derives the same key, finds the record by author, and decrypts it. The record carries a short expiration and the dialer also searches the adjacent buckets, so typing a PIN right across a rotation boundary still works.
 
