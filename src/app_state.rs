@@ -102,7 +102,10 @@ impl DialTarget {
                 s.chars().take(12).collect::<String>() + "…"
             }
             DialTarget::Name(name) => name.clone(),
-            DialTarget::Pin(pin) => format!("PIN {}", crate::pin::format_pin(pin)),
+            // Never echo the rotating PIN secret. This placeholder shows only during the
+            // brief pre-resolution / reconnect window; once the PIN resolves, the dial
+            // session swaps in the resolved peer's (truncated) node id.
+            DialTarget::Pin(_) => "PIN".to_string(),
         }
     }
 }
@@ -783,5 +786,25 @@ mod tests {
 
         state.clear_name_conflict();
         assert_eq!(state.snapshot().name_conflict, NameConflict::Inactive);
+    }
+
+    #[test]
+    fn pin_dial_target_describe_never_echoes_the_pin() {
+        // The rotating PIN is a secret and must not appear in the outbound display string;
+        // the placeholder is shown until the dial session swaps in the resolved node id.
+        let d = DialTarget::Pin("AH5AFBEJ".to_string()).describe();
+        assert_eq!(d, "PIN");
+        assert!(!d.contains("AH5A"));
+        assert!(!d.contains("AH5A-FBEJ"));
+    }
+
+    #[test]
+    fn node_id_dial_target_describe_truncates() {
+        let id = iroh::SecretKey::generate().public();
+        let d = DialTarget::NodeId(id).describe();
+        assert!(d.ends_with('…'), "truncated form ends with ellipsis: {d}");
+        // First 12 id chars plus the ellipsis.
+        assert_eq!(d.chars().count(), 13);
+        assert!(id.to_string().starts_with(&d[..d.len() - '…'.len_utf8()]));
     }
 }

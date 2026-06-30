@@ -403,6 +403,14 @@ async fn run_managed_dial_session(
                 config.status.set_dial_target(None);
                 return;
             }
+            // A PIN dial starts out displaying the bare "PIN" placeholder (the rotating
+            // secret is never echoed); now that it resolved, surface the peer's truncated
+            // node id so the outbound line is meaningful. Other targets keep their display.
+            if matches!(target, DialTarget::Pin(_)) {
+                config
+                    .status
+                    .set_dial_target(Some(DialTarget::NodeId(*id).describe()));
+            }
         }
 
         let (token_override, connect) = match resolved {
