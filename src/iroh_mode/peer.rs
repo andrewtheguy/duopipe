@@ -534,7 +534,7 @@ async fn run_listen_supervisor(config: PeerConfig, semaphore: Arc<Semaphore>) ->
                 Ok(ListenCommand::Stop) => {
                     if let Some((tok, h)) = current.take() {
                         tok.cancel();
-                        let _ = h.await;
+                        join_stopped_listen(h).await;
                         config.status.clear_listen();
                     }
                 }
@@ -559,9 +559,20 @@ async fn run_listen_supervisor(config: PeerConfig, semaphore: Arc<Semaphore>) ->
 
     if let Some((tok, h)) = current.take() {
         tok.cancel();
-        let _ = h.await;
+        join_stopped_listen(h).await;
     }
     Ok(())
+}
+
+/// Await a serve task that was just cancelled (user Stop or global shutdown). A clean
+/// teardown returns `Ok(())`; an error or panic is logged rather than propagated, since
+/// the cancellation was intentional and must not crash the process or the dial half.
+async fn join_stopped_listen(h: tokio::task::JoinHandle<Result<()>>) {
+    match h.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("serve half stopped with error: {e:#}"),
+        Err(e) => log::warn!("serve half panicked on stop: {e}"),
+    }
 }
 
 /// Run the serve half: create the public endpoint, publish/display the node id and auth

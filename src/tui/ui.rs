@@ -1161,6 +1161,51 @@ mod tests {
     }
 
     #[test]
+    fn non_listening_dashboard_prompts_for_shift_l_and_hides_node_id_and_secrets() {
+        // The serve half is started on-demand: until then the header points the user at
+        // Shift+L instead of a node id, and no secret (token banner / PIN) is surfaced.
+        let mut snap = base_snapshot(false, None);
+        snap.listening = false;
+        // A generated token *and* a rotating PIN exist, but neither must show pre-listen.
+        snap.token_generated = true;
+        snap.pin_mode = true;
+        snap.auth_token = Some("generated-secret-token".to_string());
+        snap.current_pin = Some("K7P29QXM".to_string());
+        snap.pin_deadline = Some(Instant::now() + std::time::Duration::from_secs(41));
+        snap.endpoint_id = Some("node-123".to_string());
+
+        let text = render_text(&snap, &UiState::default());
+
+        // Node-id row replaced by the call-to-action; the id itself stays hidden.
+        assert!(text.contains("not listening — press Shift+L to start"));
+        assert!(!text.contains("node id:"));
+        assert!(!text.contains("node-123"));
+        // Both secret banners are suppressed while not listening.
+        assert!(!text.contains("auth token:"), "token banner suppressed pre-listen");
+        assert!(!text.contains("generated-secret-token"));
+        assert!(!text.contains("dial PIN"), "PIN banner suppressed pre-listen");
+        // The token fingerprint line is gated too (nothing to pair with yet).
+        assert!(!text.contains("token fp:"));
+        // Footer offers to start listening and drops the show/hide-secret hint.
+        assert!(text.contains("Shift+L start listening"));
+        assert!(!text.contains("h show/hide"));
+    }
+
+    #[test]
+    fn listening_dashboard_shows_node_id_and_stop_hint() {
+        // The flip side of the idle state: once listening, the node id renders and the
+        // footer offers to stop and to show/hide the secret.
+        let snap = base_snapshot(false, None); // base_snapshot is listening = true
+
+        let text = render_text(&snap, &UiState::default());
+
+        assert!(text.contains("node id: node-123"));
+        assert!(!text.contains("not listening — press Shift+L to start"));
+        assert!(text.contains("Shift+L stop listening"));
+        assert!(text.contains("h show/hide"));
+    }
+
+    #[test]
     fn tunnel_title_matches_dial_state() {
         let snap = base_snapshot(false, None);
         let idle_text = render_text(&snap, &UiState::default());
