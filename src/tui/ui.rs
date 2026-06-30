@@ -386,7 +386,9 @@ fn render_header(
             )));
         } else {
             let pin = snap.current_pin.as_deref().unwrap_or("");
-            let mut pin_line = vec![
+            // No fp here: the PIN's token is always auto-generated and carried by the PIN
+            // itself, so the fingerprint is redundant noise (matching the status line).
+            let pin_line = vec![
                 Span::raw("dial PIN: "),
                 Span::styled(
                     crate::pin::format_pin(pin),
@@ -395,12 +397,6 @@ fn render_header(
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
-            if let Some(token) = snap.auth_token.as_deref() {
-                pin_line.push(Span::styled(
-                    format!("  (fp: {})", crate::auth::token_fingerprint(token)),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
             lines.push(Line::from(pin_line));
 
             // Two timers: a live 60s refresh countdown (the PIN itself rotates) and the
@@ -1024,8 +1020,10 @@ mod tests {
         assert!(out.contains("refreshes in"), "countdown shown");
         // The raw auth-token banner must not appear in PIN mode.
         assert!(!out.contains("auth token:"), "token banner suppressed in PIN mode");
-        // The token fp is redundant noise in PIN mode (the PIN carries the token).
+        // The token fp is redundant noise in PIN mode (the PIN carries the token) — dropped
+        // both on the status line and from the PIN banner itself.
         assert!(!out.contains("token fp:"), "token fp dropped in PIN mode");
+        assert!(!out.contains("(fp:"), "no fp alongside the PIN");
         // The node id is truncated, not the full 64-char hash.
         assert!(out.contains("node id: f06c35c4091"), "node id shown truncated");
         assert!(!out.contains(full_id), "full node id not shown");
