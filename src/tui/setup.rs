@@ -39,12 +39,20 @@ enum SetupPhase {
     TokenSetup,
 }
 
-/// Which button of the [`SetupPhase::Start`] screen has focus. Left/Right pick between
-/// `Start` and `Exit`; Enter activates the focused one.
+/// Which button of the [`SetupPhase::Start`] screen has focus; Enter activates it.
+///
+/// Connect mode shows the `Start`/`Exit` pair. Quick mode instead shows the two signaling
+/// choices `PinStart`/`ManualStart` (each one *is* the start action, picking how to pair)
+/// plus `Exit`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StartFocus {
+    /// Connect mode: confirm and proceed (resolve the pre-shared token).
     Start,
     Exit,
+    /// Quick mode: start with rotating-PIN nostr signaling.
+    PinStart,
+    /// Quick mode: start with manual node-id copy-paste.
+    ManualStart,
 }
 
 /// Result of running the setup screen to completion.
@@ -80,6 +88,10 @@ pub struct SetupState {
     /// Resolved credential, carried to `Done`.
     auth_token: Option<String>,
     token_generated: bool,
+    /// Quick mode: whether the chosen signaling is the rotating nostr PIN (`true`) or
+    /// manual copy-paste (`false`). Set when the user activates a choice; ignored in
+    /// connect mode.
+    quick_pin: bool,
     /// Inline error from the last failed validation; cleared on the next keypress.
     error: Option<String>,
 }
@@ -95,13 +107,19 @@ impl SetupState {
             phase: SetupPhase::Start,
             config_auth_token,
             expected_token_fingerprint,
-            // The Start button is the primary action and focused first.
-            focus: StartFocus::Start,
+            // Connect mode's primary action is Start; quick mode leads with the PIN choice.
+            focus: if nostr_discovery {
+                StartFocus::Start
+            } else {
+                StartFocus::PinStart
+            },
             nostr_discovery,
             own_name,
             auth_token_input: Input::default(),
             auth_token: None,
             token_generated: false,
+            // Quick mode defaults to the rotating-PIN flow (the headline option).
+            quick_pin: true,
             error: None,
         }
     }
@@ -151,25 +169,59 @@ fn build_resolved(state: &SetupState) -> ResolvedPeer {
         peer_identifier: None,
         auth_token: state.auth_token.clone().unwrap_or_default(),
         token_generated: state.token_generated,
+        // Quick mode only; connect mode never sets a PIN choice and ignores this.
+        quick_pin: !state.nostr_discovery && state.quick_pin,
     }
 }
 
-/// Submit the start screen: finish with a config/env token (connect mode), open the
-/// token-entry screen (connect mode without a token), or generate a fresh ephemeral
-/// token (quick mode, the common path).
+/// The focusable buttons on the start screen, in cycle order. Connect mode confirms with
+/// a single Start; quick mode leads with the two signaling choices.
+fn start_ring(nostr_discovery: bool) -> &'static [StartFocus] {
+    if nostr_discovery {
+        &[StartFocus::Start, StartFocus::Exit]
+    } else {
+        &[StartFocus::PinStart, StartFocus::ManualStart, StartFocus::Exit]
+    }
+}
+
+fn next_start_focus(cur: StartFocus, nostr_discovery: bool) -> StartFocus {
+    let ring = start_ring(nostr_discovery);
+    let i = ring.iter().position(|f| *f == cur).unwrap_or(0);
+    ring[(i + 1) % ring.len()]
+}
+
+fn prev_start_focus(cur: StartFocus, nostr_discovery: bool) -> StartFocus {
+    let ring = start_ring(nostr_discovery);
+    let i = ring.iter().position(|f| *f == cur).unwrap_or(0);
+    ring[(i + ring.len() - 1) % ring.len()]
+}
+
+/// Start quick mode with the chosen signaling. Quick mode always mints a fresh ephemeral
+/// token; PIN mode delivers it to the dialer over nostr, manual mode surfaces it in the
+/// dashboard to copy.
+fn start_quick(state: &mut SetupState, pin: bool) -> Step {
+    state.quick_pin = pin;
+    let token = state
+        .config_auth_token
+        .clone()
+        .unwrap_or_else(auth::generate_token);
+    let generated = state.config_auth_token.is_none();
+    finalize(state, token, generated)
+}
+
+/// Submit the connect-mode start screen: finish with a config/env token, or open the
+/// token-entry screen when none is supplied. (Quick mode starts via [`start_quick`].)
 fn submit_start(state: &mut SetupState) -> Step {
     if let Some(token) = state.config_auth_token.clone() {
         // A config/env token is used as-is, no further prompt.
         finalize(state, token, false)
-    } else if state.nostr_discovery {
+    } else {
         // No token supplied: the connect-mode token is a pre-shared secret, so it must be
-        // entered. Quick mode never reaches here (handled below).
+        // entered on the token screen. Quick mode never reaches here — it is only called
+        // from `StartFocus::Start`, which exists only in the connect-mode focus ring;
+        // quick mode starts via `start_quick`.
         state.phase = SetupPhase::TokenSetup;
         Step::Continue
-    } else {
-        // Quick mode always generates a fresh ephemeral token, surfaced in the
-        // dashboard so it can be copied to the other device. There is no token screen.
-        finalize(state, auth::generate_token(), true)
     }
 }
 
@@ -186,17 +238,21 @@ pub fn handle_key(key: KeyEvent, state: &mut SetupState) -> Step {
     match state.phase {
         SetupPhase::Start => match key.code {
             KeyCode::Esc => Step::Quit,
-            // Enter activates the focused button: Exit quits, Start submits and starts.
+            // Enter activates the focused button. Connect mode: Start submits. Quick mode:
+            // each signaling choice both picks the mode and starts. Exit quits in either.
             KeyCode::Enter => match state.focus {
                 StartFocus::Exit => Step::Quit,
                 StartFocus::Start => submit_start(state),
+                StartFocus::PinStart => start_quick(state, true),
+                StartFocus::ManualStart => start_quick(state, false),
             },
-            // Left/Right (or Tab) move between the Start and Exit buttons.
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
-                state.focus = match state.focus {
-                    StartFocus::Exit => StartFocus::Start,
-                    StartFocus::Start => StartFocus::Exit,
-                };
+            // Arrow keys / Tab cycle the focus ring (its members depend on the mode).
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+                state.focus = prev_start_focus(state.focus, state.nostr_discovery);
+                Step::Continue
+            }
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                state.focus = next_start_focus(state.focus, state.nostr_discovery);
                 Step::Continue
             }
             _ => Step::Continue,
@@ -376,20 +432,39 @@ fn start_summary_lines(state: &SetupState) -> Vec<Line<'static>> {
             ),
             Style::default().fg(Color::DarkGray),
         )));
-    } else if !state.nostr_discovery {
-        // Quick mode generates a fresh ephemeral token on Start; it appears in the
-        // dashboard header to copy to the other device.
-        lines.push(Line::from(Span::styled(
-            "  A fresh auth token is generated on start, shown in the dashboard to copy.",
-            Style::default().fg(Color::DarkGray),
-        )));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        button_span("Start", state.focus == StartFocus::Start),
-        Span::raw("  "),
-        button_span("Exit", state.focus == StartFocus::Exit),
-    ]));
+
+    if state.nostr_discovery {
+        // Connect mode: a single confirm action.
+        lines.push(Line::from(vec![
+            button_span("Start", state.focus == StartFocus::Start),
+            Span::raw("  "),
+            button_span("Exit", state.focus == StartFocus::Exit),
+        ]));
+    } else {
+        // Quick mode: pick how to share this device with the dialer. Each choice both
+        // selects the signaling and starts.
+        lines.push(Line::from("Choose how to share this device:"));
+        lines.push(Line::from(button_span(
+            "Start with PIN",
+            state.focus == StartFocus::PinStart,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  shows a short code that refreshes every 60s (over nostr; needs internet).",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(button_span(
+            "Start manual",
+            state.focus == StartFocus::ManualStart,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  copy the node id + auth token by hand (no nostr/internet).",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(button_span("Exit", state.focus == StartFocus::Exit)));
+    }
     lines
 }
 
@@ -518,16 +593,33 @@ mod tests {
 
     #[test]
     fn quick_start_generates_token_directly() {
-        // Quick mode: no config token -> pressing Start generates a fresh token and
-        // finishes immediately, with no token-choice screen.
+        // Quick mode: the PIN choice is focused first; pressing Enter generates a fresh
+        // token, selects PIN signaling, and finishes immediately (no token-choice screen).
         let mut s = SetupState::new(None, None, false, None);
+        assert_eq!(s.focus, StartFocus::PinStart);
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
                 assert!(r.token_generated);
+                assert!(r.quick_pin, "PIN choice selects nostr signaling");
                 assert!(auth::validate_token(&r.auth_token).is_ok());
             }
             _ => panic!("expected Done(Both) with a generated token"),
+        }
+    }
+
+    #[test]
+    fn quick_manual_choice_disables_pin() {
+        // Tab to the manual choice and start: a fresh token is generated, PIN off.
+        let mut s = SetupState::new(None, None, false, None);
+        handle_key(key(KeyCode::Tab), &mut s);
+        assert_eq!(s.focus, StartFocus::ManualStart);
+        match handle_key(key(KeyCode::Enter), &mut s) {
+            Step::Done(r) => {
+                assert!(r.token_generated);
+                assert!(!r.quick_pin, "manual choice uses copy-paste, not nostr");
+            }
+            _ => panic!("expected Done(Both) in manual mode"),
         }
     }
 
@@ -639,22 +731,28 @@ mod tests {
     }
 
     #[test]
-    fn start_button_focused_first_and_enter_starts() {
-        let mut s = SetupState::new(Some(auth::generate_token()), None, false, None);
+    fn connect_start_focused_first_and_enter_starts() {
+        // Connect mode (with a config token) leads with the Start button.
+        let mut s = SetupState::new(Some(auth::generate_token()), None, true, Some("hl".into()));
         assert_eq!(s.focus, StartFocus::Start);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Done(_)));
     }
 
     #[test]
-    fn exit_button_is_focusable_and_enter_quits() {
-        let mut s = SetupState::new(Some(auth::generate_token()), None, false, None);
-        // Focus order is just [Start, Exit]; Right reaches Exit.
+    fn quick_focus_ring_cycles_and_exit_quits() {
+        let mut s = SetupState::new(None, None, false, None);
+        // Ring is [PinStart, ManualStart, Exit].
+        assert_eq!(s.focus, StartFocus::PinStart);
+        handle_key(key(KeyCode::Right), &mut s);
+        assert_eq!(s.focus, StartFocus::ManualStart);
         handle_key(key(KeyCode::Right), &mut s);
         assert_eq!(s.focus, StartFocus::Exit);
-        // Left toggles back, Right again to Exit, then Enter quits.
-        handle_key(key(KeyCode::Left), &mut s);
-        assert_eq!(s.focus, StartFocus::Start);
+        // Wraps back to the start of the ring.
         handle_key(key(KeyCode::Right), &mut s);
+        assert_eq!(s.focus, StartFocus::PinStart);
+        // Left wraps to Exit; Enter there quits.
+        handle_key(key(KeyCode::Left), &mut s);
+        assert_eq!(s.focus, StartFocus::Exit);
         assert!(matches!(handle_key(key(KeyCode::Enter), &mut s), Step::Quit));
     }
 

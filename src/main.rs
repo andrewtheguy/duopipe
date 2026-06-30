@@ -12,6 +12,7 @@ mod net;
 mod nostr_discovery;
 mod peer_params;
 mod peer_state;
+mod pin;
 mod signaling;
 mod tui;
 
@@ -45,13 +46,17 @@ enum Command {
     /// Start a peer in configless mode (interactive TUI): always serving, with
     /// one on-demand outbound dial session.
     ///
-    /// Everything is ephemeral and nostr is off: the node id changes every run and
-    /// a dialer enters the peer's node id manually. A fresh auth token is always
-    /// generated and shown in the dashboard to copy to the other device — there is
-    /// no way to supply an existing token. No config file is read.
+    /// Everything is ephemeral and no config file is read: the node id changes every run
+    /// and a fresh auth token is always generated (there is no way to supply an existing
+    /// one). At setup you pick how to share this device with the dialer:
     ///
-    /// On startup the TUI confirms setup, then opens the dashboard already
-    /// listening. Press `c` in the dashboard to dial a peer by node id.
+    /// - **PIN** — the dashboard shows a short code that refreshes every 60s; it carries
+    ///   this peer's node id and token over nostr, so the dialer just types the PIN
+    ///   (Shift-C). Needs internet (public relays).
+    /// - **Manual** — no nostr/internet: the node id and token are shown to copy by hand,
+    ///   and the dialer enters the node id (Shift-C). The token moves out of band.
+    ///
+    /// On startup the TUI confirms setup, then opens the dashboard already listening.
     Quick {},
     /// Start a peer in connect mode (config-driven, interactive TUI): always
     /// serving, with one on-demand outbound dial session.
@@ -201,6 +206,7 @@ impl TestEnv {
                     peer_identifier: None,
                     auth_token,
                     token_generated: false,
+                    quick_pin: false,
                 })
             }
             None => {
@@ -219,6 +225,7 @@ impl TestEnv {
                     peer_identifier: None,
                     auth_token,
                     token_generated,
+                    quick_pin: false,
                 })
             }
         }
@@ -245,6 +252,7 @@ async fn run_peer_headless(
         cfg.tunnel.clone(),
         false,
         None,
+        false,
     );
     let peer_cfg = iroh_mode::PeerConfig {
         role: resolved.role,
@@ -256,6 +264,8 @@ async fn run_peer_headless(
         nostr_relays: vec![],
         nostr_discovery: false,
         nostr_identifier: None,
+        // Headless test mode never uses nostr (and never the PIN side channel).
+        pin_rendezvous: false,
         // Headless test mode is single-role (listen or dial); this endpoint reports its
         // own id.
         report_endpoint_id: true,
