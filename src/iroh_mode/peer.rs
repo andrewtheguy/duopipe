@@ -177,9 +177,12 @@ pub async fn run_peer(config: PeerConfig) -> Result<()> {
 
     match config.role {
         // Headless test mode listens immediately; its child token simply mirrors the
-        // global shutdown (there is no interactive Shift+L toggle here).
+        // global shutdown (there is no interactive Shift+L toggle here). This path bypasses
+        // the supervisor, so set the status here to keep it consistent with an active
+        // listener.
         Role::Listen => {
             let listen_shutdown = config.status.shutdown.child_token();
+            config.status.set_listen_status(ListenStatus::Listening);
             run_listen(config, semaphore, listen_shutdown).await
         }
         Role::Dial => run_dial(config, semaphore).await,
