@@ -1,6 +1,6 @@
 //! Per-name local state file: a process-lifetime lock plus the nostr conflict flag.
 //!
-//! In nostr mode a peer is identified by its config `name`. We keep a single small
+//! In connect mode a peer is identified by its config `name`. We keep a single small
 //! state file per name under the config dir and use it two ways:
 //!
 //! 1. **Local lock.** While a peer runs, it holds an OS advisory lock (flock) on this

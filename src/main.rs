@@ -23,7 +23,7 @@ use ::iroh::EndpointId;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Capacity of the in-memory log ring buffer shown in the TUI.
 const LOG_CAPACITY: usize = 2000;
@@ -53,8 +53,8 @@ enum Command {
     /// On startup the TUI confirms setup, then opens the dashboard already
     /// listening. Press `c` in the dashboard to dial a peer by node id.
     Quick {},
-    /// Start a peer in nostr mode (interactive TUI): always serving, with one
-    /// on-demand outbound dial session.
+    /// Start a peer in connect mode (config-driven, interactive TUI): always
+    /// serving, with one on-demand outbound dial session.
     ///
     /// Requires a config file. The auth token (the nostr rendezvous secret) is shared
     /// and pre-generated: supply it via config `auth_token_file` or DUOPIPE_AUTH_TOKEN,
@@ -65,7 +65,7 @@ enum Command {
     ///
     /// On startup the TUI confirms setup, then opens the dashboard already
     /// listening. Press `c` in the dashboard to dial a peer by name.
-    Nostr {
+    Connect {
         /// Path to config file. Defaults to ~/.config/duopipe/peer.toml.
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -117,18 +117,18 @@ fn resolve_config_auth_token(cfg: &PeerConfig) -> Result<Option<String>> {
     Ok(token)
 }
 
-/// Resolve the expected auth-token fingerprint for nostr mode. Nostr configs must
-/// declare `auth_token_fingerprint` (the 8-hex-digit fingerprint of the shared token):
+/// Resolve the expected auth-token fingerprint for connect mode. Connect-mode configs
+/// must declare `auth_token_fingerprint` (the 8-hex-digit fingerprint of the shared token):
 /// it disambiguates configs meant for different pairings, so a config can't be run with
 /// the wrong pairing's token. Returns the validated fingerprint so a token pasted at the
 /// setup screen can also be checked against it; a token already resolved from file/env is
 /// checked here. Quick mode declares no fingerprint and returns `None`.
 fn resolve_expected_fingerprint(
     cfg: &PeerConfig,
-    nostr_mode: bool,
+    connect_mode: bool,
     config_auth_token: Option<&str>,
 ) -> Result<Option<String>> {
-    if !nostr_mode {
+    if !connect_mode {
         return Ok(None);
     }
     let expected = cfg
@@ -138,7 +138,7 @@ fn resolve_expected_fingerprint(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Nostr mode requires `auth_token_fingerprint` in the config: the 8-hex-digit \
+                "Connect mode requires `auth_token_fingerprint` in the config: the 8-hex-digit \
                  fingerprint of your shared token (shown by `duopipe generate-auth-token` and in \
                  the dashboard header). It guards against running this config with a token meant \
                  for a different pairing."
@@ -223,12 +223,6 @@ impl TestEnv {
             }
         }
     }
-}
-
-/// Load the nostr-mode peer config: from `config` if given, else the default
-/// location (~/.config/duopipe/peer.toml).
-fn load_nostr_config(config: Option<&Path>) -> Result<PeerConfig> {
-    load_peer_config(config)
 }
 
 /// Run a peer headless (no TUI) for non-interactive test mode. Logs go to stderr
@@ -316,13 +310,13 @@ async fn run_inner() -> Result<()> {
     let args = Args::parse();
     let command = args.command;
 
-    // The interactive `quick`/`nostr` commands render a TUI and capture logs into a
+    // The interactive `quick`/`connect` commands render a TUI and capture logs into a
     // ring buffer. In test mode — `DUOPIPE_TEST_MODE=1` — the peer runs headless
     // with no TUI, logging to stderr, so it needs no terminal. `DUOPIPE_TEST_MODE`
     // is the single gate for all test-only env vars. Every other command logs to
     // the console as usual.
     let test_env = TestEnv::from_env();
-    let is_tui_command = matches!(&command, Command::Quick { .. } | Command::Nostr { .. });
+    let is_tui_command = matches!(&command, Command::Quick { .. } | Command::Connect { .. });
     let log_buffer = if is_tui_command && test_env.is_none() {
         if !std::io::stdout().is_terminal() {
             return Err(TunnelError::config(anyhow::anyhow!(
@@ -352,10 +346,10 @@ async fn run_inner() -> Result<()> {
             )
             .await
         }
-        // Nostr mode: load the config (from `-c` or the default path) and use nostr
+        // Connect mode: load the config (from `-c` or the default path) and use nostr
         // for node-id discovery. The token is required, from config/env only.
-        Command::Nostr { config } => {
-            let cfg = load_nostr_config(config.as_deref()).map_err(TunnelError::config)?;
+        Command::Connect { config } => {
+            let cfg = load_peer_config(config.as_deref()).map_err(TunnelError::config)?;
             // Resolve the actual file path so a name-conflict rename can annotate it.
             let config_path = crate::config::resolve_peer_config_path(config.as_deref());
             run_start_peer(cfg, ConfigSource::File, config_path, &test_env, log_buffer).await
@@ -379,7 +373,7 @@ async fn run_inner() -> Result<()> {
             } else {
                 // The fingerprint is appended as an inline `#` comment so the output is
                 // still a valid token file (the parser strips inline comments), while
-                // surfacing the value to put in a nostr config's `auth_token_fingerprint`.
+                // surfacing the value to put in a connect-mode config's `auth_token_fingerprint`.
                 for token in &tokens {
                     println!("{}  # fp: {}", token, auth::token_fingerprint(token));
                 }
@@ -389,9 +383,9 @@ async fn run_inner() -> Result<()> {
     }
 }
 
-/// Shared startup for both interactive modes (`quick` / `nostr`). `source`
+/// Shared startup for both interactive modes (`quick` / `connect`). `source`
 /// distinguishes them: `ConfigSource::None` is configless mode (no nostr; the token
-/// is always generated by interactive setup), `ConfigSource::File` is nostr mode
+/// is always generated by interactive setup), `ConfigSource::File` is connect mode
 /// (discovery on; auth token required, from config/env/paste). Test mode is handled
 /// here too — it runs headless and never touches nostr.
 async fn run_start_peer(
@@ -419,7 +413,7 @@ async fn run_start_peer(
         resolve_config_auth_token(&cfg).map_err(TunnelError::config)?
     };
 
-    // Nostr discovery is on exactly in nostr mode. The iroh identity is always
+    // Nostr discovery is on exactly in connect mode. The iroh identity is always
     // ephemeral; nostr is the side channel that publishes/looks up the current node
     // id, keyed off the shared auth token. Relays default to the public set.
     let nostr_discovery_enabled = source == ConfigSource::File;
@@ -432,7 +426,7 @@ async fn run_start_peer(
 
     // Test mode: resolve the preset and run headless, no TUI. Test mode never uses
     // nostr (the node id is wired directly via DUOPIPE_PEER_NODE_ID), so the
-    // nostr-mode token requirement below does not apply here.
+    // connect-mode token requirement below does not apply here.
     if let Some(test_env) = test_env {
         let resolved = test_env
             .resolve_preset(config_auth_token)
@@ -447,7 +441,7 @@ async fn run_start_peer(
         .await;
     }
 
-    // Nostr mode must declare the shared token's fingerprint. A token already resolved
+    // Connect mode must declare the shared token's fingerprint. A token already resolved
     // from file/env is checked against it now (plain error, exit); a token pasted at the
     // setup screen is checked there, so carry the expected fingerprint into the TUI.
     let expected_token_fingerprint =
@@ -455,18 +449,18 @@ async fn run_start_peer(
             .map_err(TunnelError::config)?;
 
     // The interactive setup screen resolves the token when none is supplied. Quick mode
-    // always generates a fresh ephemeral token (no existing-token input). Nostr mode
+    // always generates a fresh ephemeral token (no existing-token input). Connect mode
     // lets you paste a token (or supply it via config/env): it is the pre-shared
     // rendezvous secret both peers derive their key from, so it must be generated ahead
     // of time (`duopipe generate-auth-token`) and entered on each device — so
     // `auth_token_file` is optional there.
 
-    // Nostr mode requires a `name`: each peer publishes its node id under this short
+    // Connect mode requires a `name`: each peer publishes its node id under this short
     // identifier, and a dialer types it to look the peer up.
     let peer_name = cfg.name.as_ref().map(|n| n.trim()).filter(|n| !n.is_empty());
     if nostr_discovery_enabled && peer_name.is_none() {
         return Err(TunnelError::config(anyhow::anyhow!(
-            "Nostr mode requires a `name` (short identifier) in the config; a dialer uses it to find this peer."
+            "Connect mode requires a `name` (short identifier) in the config; a dialer uses it to find this peer."
         ))
         .into());
     }
@@ -479,7 +473,7 @@ async fn run_start_peer(
     // mid-session local conflict). `_name_lock` must outlive `run_tui`; dropping it on
     // exit releases the lock. Quick mode (no name) takes no lock.
     // State/lock files are namespaced by the token fingerprint as well as the name.
-    // The lock path runs only in nostr mode, where `expected_token_fingerprint` is
+    // The lock path runs only in connect mode, where `expected_token_fingerprint` is
     // required and present; the eventual token is validated to match it, so this is the
     // same value the publisher derives from the resolved token below.
     let lock_fingerprint = expected_token_fingerprint
@@ -549,20 +543,20 @@ mod tests {
     }
 
     #[test]
-    fn nostr_mode_requires_fingerprint() {
+    fn connect_mode_requires_fingerprint() {
         let cfg = cfg_with_fp(None);
         let err = resolve_expected_fingerprint(&cfg, true, None).unwrap_err();
         assert!(err.to_string().contains("auth_token_fingerprint"));
     }
 
     #[test]
-    fn nostr_mode_rejects_malformed_fingerprint() {
+    fn connect_mode_rejects_malformed_fingerprint() {
         let cfg = cfg_with_fp(Some("nothex"));
         assert!(resolve_expected_fingerprint(&cfg, true, None).is_err());
     }
 
     #[test]
-    fn nostr_mode_returns_fingerprint_when_no_token_yet() {
+    fn connect_mode_returns_fingerprint_when_no_token_yet() {
         // No file/env token: the fingerprint is returned so setup can check a pasted one.
         let cfg = cfg_with_fp(Some("a1b2c3d4"));
         assert_eq!(
@@ -572,14 +566,14 @@ mod tests {
     }
 
     #[test]
-    fn nostr_mode_accepts_matching_token() {
+    fn connect_mode_accepts_matching_token() {
         let token = auth::generate_token();
         let cfg = cfg_with_fp(Some(&auth::token_fingerprint(&token)));
         assert!(resolve_expected_fingerprint(&cfg, true, Some(&token)).is_ok());
     }
 
     #[test]
-    fn nostr_mode_rejects_token_for_different_pairing() {
+    fn connect_mode_rejects_token_for_different_pairing() {
         let token = auth::generate_token();
         let other = auth::generate_token();
         let cfg = cfg_with_fp(Some(&auth::token_fingerprint(&other)));
