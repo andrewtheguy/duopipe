@@ -1,31 +1,31 @@
 # duopipe peer configuration example
 #
-# Usage: duopipe connect -c peer.toml
-#        duopipe connect                  # loads ~/.config/duopipe/peer.toml
+# Usage: duopipe run -c peer.toml
+#        duopipe run                  # loads ~/.config/duopipe/peer.toml
 #
-# This file is read by CONNECT MODE (`duopipe connect`): the listener publishes its
+# This file is read by CONFIG MODE (`duopipe run`): the listener publishes its
 # current ephemeral node id to nostr and a dialer looks it up, so the node id need
 # not be exchanged by hand. The auth token (the nostr rendezvous secret) is OPTIONAL
 # in this file — set 'auth_token_file' below or the DUOPIPE_AUTH_TOKEN env var, or
 # leave both unset and paste it at the setup screen. Either way it must be pre-shared:
 # generate one with `duopipe generate-auth-token` and use the same value on every
 # peer. The other mode is configless (`duopipe quick`): the id and token are
-# ephemeral, nostr is off, and the dialer enters the node id by hand (supply a token
-# there with `duopipe quick --auth-token-file <path>`, or generate/enter it at setup).
+# ephemeral, and setup lets you choose either a rotating PIN over nostr or manual
+# copy-paste of the node id and generated token.
 #
-# `duopipe connect` is interactive and always starts serving inbound peers. There is
-# no startup listen/dial role choice and no dial target in this file: press `c` on
-# the dashboard and type the target peer's `name` to start the single outbound dial
-# session. This file supplies the shared auth token, this peer's own `name`, the
-# single tunnel, relays, tuning, and the nostr relay override.
+# `duopipe run` is interactive and opens idle. There is no startup listen/dial role
+# choice and no dial target in this file: press Shift-L to start/stop listening, then
+# press Shift-C on the dashboard and type the target peer's `name` to start the single
+# outbound dial session. This file supplies the shared auth token, this peer's own
+# `name`, the single tunnel, relays, tuning, and the nostr relay override.
 #
 # Tunnel model: every node always serves inbound peers AND can open one outbound TCP
 # tunnel on demand over its dial session. The [tunnel] table is that single tunnel:
 # it binds a local listener and asks the connected peer to connect out to a remote
 # 'remote_source' (a bare host:port, TCP), bridging the two. It does NOT start
-# automatically — the TUI shows it and you start/stop it with Enter (in test mode
-# only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start on
-# connect). Inbound, this peer serves any number of dialers at once.
+# automatically — the TUI shows it and you start/stop it with `s`/`x` (in test mode
+# only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start once
+# connected). Inbound, this peer serves any number of dialers at once.
 #
 # Trust model: once token auth succeeds the connected peer is fully trusted — it may
 # ask us to connect out to any host:port (there is no source allowlist). Keep the
@@ -36,11 +36,10 @@
 # channel to publish & look up the current node id, keyed off the shared auth_token
 # (see 'nostr_*' below), so a dialer can connect without copying the node id.
 
-# This peer's short, memorable identifier. REQUIRED in connect mode. This peer's
-# always-on serve half publishes its node id under this name; another peer dials it
-# by typing this name. Several peers can share one auth token and be reached by name
-# (duplicate names just mean newest-wins). For the raw node-id flow, use quick mode
-# (`duopipe quick`).
+# This peer's short, memorable identifier. REQUIRED in config mode. When listening,
+# this peer publishes its node id under this name; another peer dials it by typing
+# this name. Several peers can share one auth token and be reached by name (duplicate
+# names just mean newest-wins). For the raw node-id flow, use quick mode (`duopipe quick`).
 name = "web1"
 
 # The shared auth token, presented by both sides (it is also the nostr rendezvous
@@ -54,7 +53,7 @@ name = "web1"
 auth_token_file = "~/.config/duopipe/token.txt"
 
 # The shared token's fingerprint — the first 8 hex digits of its SHA-256. REQUIRED in
-# connect mode, whether or not the token itself is set above. Whatever token is resolved —
+# config mode, whether or not the token itself is set above. Whatever token is resolved —
 # from 'auth_token_file', the DUOPIPE_AUTH_TOKEN env var, or pasted at the setup
 # screen — must match this fingerprint, or duopipe refuses to start. This pins each
 # config to one pairing, so pointing it at the wrong token file (or pasting a token
@@ -98,8 +97,8 @@ auth_token_fingerprint = "a1b2c3d4"
 # connected peer to connect out to 'remote_source' (a bare host:port, TCP); deliver
 # traffic to a local listener bound at 'local_listen'. Optional — in quick mode it is
 # set from the TUI instead. Nothing starts until you connect to a peer and activate it
-# (Enter in the TUI, or DUOPIPE_AUTOSTART_TUNNELS=1 in test mode). The tunnel can also
-# be set (a) or cleared (d) from the dashboard at runtime (while not running).
+# (`s` in the TUI, or DUOPIPE_AUTOSTART_TUNNELS=1 in test mode). The tunnel can also
+# be set (e) or cleared (d) from the dashboard at runtime (while not running).
 # ============================================================================
 [tunnel]
 remote_source = "127.0.0.1:5678"

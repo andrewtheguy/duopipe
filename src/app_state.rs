@@ -82,7 +82,7 @@ pub enum NameConflict {
 }
 
 /// What to dial, as typed at runtime: a full node id (quick manual mode), a peer name
-/// looked up via nostr (connect mode), or a rotating PIN resolved via nostr to the peer's
+/// looked up via nostr (config mode), or a rotating PIN resolved via nostr to the peer's
 /// node id + auth token (quick PIN mode).
 #[derive(Debug, Clone)]
 pub enum DialTarget {
@@ -301,12 +301,12 @@ pub struct AppState {
     /// Display string for the current dial target (`Some` while a session is up or
     /// being established), shown in the header. `None` when idle (serving only).
     dial_target: RwLock<Option<String>>,
-    /// Whether nostr discovery is active (connect mode). Read by the connect prompt to
+    /// Whether nostr discovery is active (config mode). Read by the connect prompt to
     /// decide whether the user types a peer name (true) or a node id (false).
     pub nostr_discovery: bool,
     /// Quick mode's nostr PIN signaling: the listener publishes a rotating PIN carrying its
     /// node id + token, and the connect prompt asks for a PIN instead of a node id. `false`
-    /// in connect mode and in quick manual (copy-paste) mode.
+    /// in config mode and in quick manual (copy-paste) mode.
     pub pin_mode: bool,
     /// The current rotating PIN (canonical form) and the instant it rolls over, set by the
     /// PIN publisher each rotation. Drives the PIN + refresh-countdown header in PIN mode.

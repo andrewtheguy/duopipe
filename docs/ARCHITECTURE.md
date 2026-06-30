@@ -24,9 +24,9 @@ duopipe is a P2P single-TCP-forward tool using iroh for peer discovery, relay fa
 
 Binary: `duopipe`
 
-> **Design Goal:** The project's primary goal is to let a **single user link their own devices** (laptop, homelab box, VPS, …) to reach services across them — for development or homelab purposes — without the hassle and security risk of opening a port. Both ends are expected to be machines the same person owns (or otherwise fully trusts). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe connect` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
+> **Design Goal:** The project's primary goal is to let a **single user link their own devices** (laptop, homelab box, VPS, …) to reach services across them — for development or homelab purposes — without the hassle and security risk of opening a port. Both ends are expected to be machines the same person owns (or otherwise fully trusts). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe run` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
-duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe connect` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, the dashboard opens **idle**; the user presses **`Shift-L`** to start the **on-demand serve half** (and `Shift-L` again to stop it), and the instance also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** its single TCP tunnel and the **server side serves** it; once listening, an instance serves many inbound peers at once while dialing out itself. Within a tunnel, traffic flows in both directions.
+duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, the dashboard opens **idle**; the user presses **`Shift-L`** to start the **on-demand serve half** (and `Shift-L` again to stop it), and the instance also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** its single TCP tunnel and the **server side serves** it; once listening, an instance serves many inbound peers at once while dialing out itself. Within a tunnel, traffic flows in both directions.
 
 There is **no role prompt at startup**: the dashboard opens idle and the serve half is started on demand with `Shift-L` (a toggle — `Shift-L` again stops it), while the dial session is driven independently from the TUI (`Shift-C` to connect, `Shift-D` to disconnect, re-pointable on demand) and works even before listening begins. For tests, the role is single and derived from environment variables (see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated each time the serve half starts, so a stop→start cycle (and every run) mints a new node id.
 
@@ -43,7 +43,7 @@ The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_
 - `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
 - `DUOPIPE_AUTOSTART_TUNNELS=1` — start the configured `[tunnel]` (dial side) on connect.
-- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (in quick mode honored only here in test mode; also valid outside test mode in connect mode).
+- `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (in quick mode honored only here in test mode; also valid outside test mode in config mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
 
@@ -157,7 +157,7 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe connect`): an on-demand serve half (started with `Shift-L`) plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** its single tunnel (`[tunnel]`), running the request listener; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
+Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe run`): an on-demand serve half (started with `Shift-L`) plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** its single tunnel (`[tunnel]`), running the request listener; the connected peer's serve half is a **pure server** for that connection and can serve many inbound dialers at once.
 
 ```mermaid
 graph TB
@@ -379,7 +379,7 @@ graph TB
     end
 
     subgraph "Options"
-        E[auth_token_file — path to the single shared token<br/>auth_token_fingerprint — required in connect mode]
+        E[auth_token_file — path to the single shared token<br/>auth_token_fingerprint — required in config mode]
         G[tunnel {remote_source, local_listen}]
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
@@ -398,7 +398,7 @@ graph TB
     style S fill:#FFF9C4
 ```
 
-The outbound dial target is not a config field. In interactive mode it is entered at runtime from the connect prompt (`Shift-C`): a node id in quick mode or a peer `name` in connect mode. In headless test mode only, `DUOPIPE_PEER_NODE_ID` under `DUOPIPE_TEST_MODE=1` selects the single role (set ⇒ dial, unset ⇒ listen).
+The outbound dial target is not a config field. In interactive mode it is entered at runtime from the connect prompt (`Shift-C`): a node id in quick mode or a peer `name` in config mode. In headless test mode only, `DUOPIPE_PEER_NODE_ID` under `DUOPIPE_TEST_MODE=1` selects the single role (set ⇒ dial, unset ⇒ listen).
 
 ### iroh Credential Mapping
 
@@ -408,16 +408,16 @@ The outbound dial target is not a config field. In interactive mode it is entere
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** always generates a fresh ephemeral token in the interactive setup screen — there is no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it). The generated token is surfaced in the dashboard header for copying once the user starts listening (`Shift-L`). **Connect mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
+Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** always generates a fresh ephemeral token in the interactive setup screen — there is no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it). The generated token is surfaced in the dashboard header for copying once the user starts listening (`Shift-L`). **Config mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
 
 The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, the first 4 bytes of the token string's SHA-256 rendered as 8 lowercase hex digits — in the header once the serve half is listening (gated on `snap.listening`) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret. The same canonical form also namespaces the per-name local state/lock file (`peer_state`): its path is `state-<fingerprint>-<name>.json`, with the `name` used verbatim (safe because `config::validate_name` restricts it to ASCII letters, digits, and `_`), so different pairings (tokens) that share a `name` get distinct, human-readable state files.
 
-**Fingerprint pinning (connect mode):** a connect-mode config must declare `auth_token_fingerprint` (the same 8-hex-digit value) regardless of whether the token itself is in the config. The resolved token — from config, env, or pasted at setup — is checked against it (`auth::fingerprint_matches`): a file/env token is verified in `main::resolve_expected_fingerprint` before the TUI launches (a mismatch is a plain config error), and a pasted token is verified in the setup screen (`submit_token`). This disambiguates configs meant for different pairings, so pointing a config at the wrong token file is caught up front instead of failing as an auth error on connect. Quick mode declares no fingerprint.
+**Fingerprint pinning (config mode):** a config-mode config must declare `auth_token_fingerprint` (the same 8-hex-digit value) regardless of whether the token itself is in the config. The resolved token — from config, env, or pasted at setup — is checked against it (`auth::fingerprint_matches`): a file/env token is verified in `main::resolve_expected_fingerprint` before the TUI launches (a mismatch is a plain config error), and a pasted token is verified in the setup screen (`submit_token`). This disambiguates configs meant for different pairings, so pointing a config at the wrong token file is caught up front instead of failing as an auth error on connect. Quick mode declares no fingerprint.
 
 ```toml
 # peer.toml
 auth_token_file = "/etc/duopipe/auth_token.txt"
-auth_token_fingerprint = "a1b2c3d4"   # required in connect mode; must match the token above
+auth_token_fingerprint = "a1b2c3d4"   # required in config mode; must match the token above
 
 [tunnel]
 remote_source = "127.0.0.1:22"
@@ -426,7 +426,7 @@ local_listen = "127.0.0.1:2222"
 
 ### Configuration Loading Flow
 
-Config files are read by `duopipe connect` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config and takes no options: it always generates its own token, and the dial target is entered interactively.
+Config files are read by `duopipe run` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config and takes no options: it always generates its own token, and the dial target is entered interactively.
 
 ```mermaid
 sequenceDiagram
@@ -437,11 +437,11 @@ sequenceDiagram
 
     CLI->>Main: Parse arguments
 
-    alt duopipe connect (no -c)
+    alt duopipe run (no -c)
         Main->>Config: Load from default path
         Config->>Source: Read ~/.config/duopipe/peer.toml
         Source-->>Config: TOML content
-    else duopipe connect -c <path>
+    else duopipe run -c <path>
         Main->>Config: Load from specified path
         Config->>Source: Read file
         Source-->>Config: TOML content
@@ -646,7 +646,7 @@ sequenceDiagram
 
 ### Node-id discovery (nostr)
 
-Because the node id is ephemeral, **connect mode** (active whenever a config file is loaded) uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Configless **quick** mode offers two signaling choices at setup: a rotating **PIN** over nostr (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous) below) or **manual** copy-paste with nostr off (the dialer enters the node id by hand). The name-based discovery here is connect mode's; it is implemented in `nostr_discovery.rs`:
+Because the node id is ephemeral, **config mode** (active whenever a config file is loaded) uses **nostr** as a side channel so the dialer can find the listener's *current* node id without a manual exchange. Configless **quick** mode offers two signaling choices at setup: a rotating **PIN** over nostr (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous) below) or **manual** copy-paste with nostr off (the dialer enters the node id by hand). The name-based discovery here is config mode's; it is implemented in `nostr_discovery.rs`:
 
 - **Shared author key from the auth token.** Both peers derive the same nostr *author* keypair via `sha256("duopipe:nostr-rendezvous:v1" || auth_token)`. The token both sides share *is* the rendezvous, so discovery only works when it's shared (which the dialer needs anyway, for auth).
 - **Per-peer `d` tag from the `name`.** Each peer is distinguished by its `name`: the `d` tag is `duopipe:nodeid:<sha256("duopipe:peer-id:v1" || auth_token || name)>` (`identifier_dtag`). Salting the hash with the auth token stops a short, low-entropy name from being guessed or enumerated on relays. Several peers can share one auth token and stay individually addressable; duplicate names just clobber (replaceable, newest wins).
@@ -658,11 +658,11 @@ Hermetic tests bypass nostr entirely: when `DUOPIPE_PEER_NODE_ID` is set the dia
 
 ### Quick-mode PIN rendezvous
 
-Quick mode can share its node id **and** auth token through nostr with no copy-paste, via a short rotating **PIN**. Unlike connect-mode discovery (keyed off the shared auth token), here the dialer does *not* yet have the token — the PIN is the only shared secret. PIN format/KDF live in `pin.rs`; the relay record in `nostr_discovery.rs`.
+Quick mode can share its node id **and** auth token through nostr with no copy-paste, via a short rotating **PIN**. Unlike config-mode discovery (keyed off the shared auth token), here the dialer does *not* yet have the token — the PIN is the only shared secret. PIN format/KDF live in `pin.rs`; the relay record in `nostr_discovery.rs`.
 
 - **PIN format.** 8 Crockford-base32 characters (alphabet `0-9A-Z` minus the ambiguous `I L O U`), displayed UPPERCASE and grouped `XXXX-XXXX`. Input is normalized case-insensitively and ignores dashes/spaces (mapping the look-alikes `I`/`L`→`1`, `O`→`0`). ~40 bits. A fresh random PIN is minted per 60-second bucket.
 - **Key from `(PIN, bucket)` via Argon2id.** `pin::derive_key_material` runs Argon2id (64 MiB, t=3) over the canonical PIN with a salt of `"duopipe:pin-rendezvous:v1" || bucket`; `nostr_discovery::pin_keys` turns the 32-byte output into a nostr keypair. The slow, memory-hard KDF raises the cost of brute-forcing the short PIN against a captured record.
-- **Publish (listener).** When quick PIN mode is selected, `run_listen` spawns `run_pin_publisher`: each 60-second bucket it generates a PIN, sets it (plus the rollover deadline) on `AppState` for the header's refresh countdown, and publishes a **regular (stored, non-replaceable) event** — kind `9421`, NIP-44-encrypted `{node_id, token}` content, with a NIP-40 `expiration` a few buckets out so per-bucket records coexist for boundary look-back then self-clean. The lookup key is the **author pubkey** (only a holder of the PIN can derive it); no extra tag is needed. A different kind from connect mode's replaceable 30078 is used deliberately so each bucket's record persists.
+- **Publish (listener).** When quick PIN mode is selected, `run_listen` spawns `run_pin_publisher`: each 60-second bucket it generates a PIN, sets it (plus the rollover deadline) on `AppState` for the header's refresh countdown, and publishes a **regular (stored, non-replaceable) event** — kind `9421`, NIP-44-encrypted `{node_id, token}` content, with a NIP-40 `expiration` a few buckets out so per-bucket records coexist for boundary look-back then self-clean. The lookup key is the **author pubkey** (only a holder of the PIN can derive it); no extra tag is needed. A different kind from config mode's replaceable 30078 is used deliberately so each bucket's record persists.
 - **Display.** The PIN banner is shown like the manual-mode token banner: it **auto-hides after 10 minutes** (the header shows the absolute clock time it will hide), `h` toggles it off/on (re-showing re-arms the timer), and it hides once on the first inbound peer connect. The publisher keeps rotating in the background while hidden, so toggling back on shows the *current* PIN.
 - **Lookup on demand (dialer).** A `DialTarget::Pin` resolves in the dial session: `lookup_pin_record` derives the keypair for the current bucket and its two neighbors (covering the rotation boundary and small clock skew), queries all of them by author in one round-trip, then NIP-44-decrypts the newest matching record to `(node_id, token)`. The dial session then authenticates with that **decrypted token** (carried via a per-session `PeerConfig` clone), not this dialer's own token.
 - **Trust.** Anyone who reads the current PIN within its window can connect (it conveys the token). The 60-second rotation, short record TTL, and Argon2id cost bound the exposure; raising PIN length or KDF parameters tightens it further.
