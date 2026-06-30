@@ -215,15 +215,13 @@ fn submit_start(state: &mut SetupState) -> Step {
     if let Some(token) = state.config_auth_token.clone() {
         // A config/env token is used as-is, no further prompt.
         finalize(state, token, false)
-    } else if state.nostr_discovery {
+    } else {
         // No token supplied: the connect-mode token is a pre-shared secret, so it must be
-        // entered. Quick mode never reaches here (handled below).
+        // entered on the token screen. Quick mode never reaches here — it is only called
+        // from `StartFocus::Start`, which exists only in the connect-mode focus ring;
+        // quick mode starts via `start_quick`.
         state.phase = SetupPhase::TokenSetup;
         Step::Continue
-    } else {
-        // Quick mode always generates a fresh ephemeral token, surfaced in the
-        // dashboard so it can be copied to the other device. There is no token screen.
-        finalize(state, auth::generate_token(), true)
     }
 }
 
