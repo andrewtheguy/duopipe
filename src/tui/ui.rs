@@ -305,7 +305,9 @@ fn render_header(
         Span::raw(format!("{}/{}", snap.streams_used, snap.streams_max)),
     ];
     // Only meaningful once the serve half is up and there is a live endpoint to pair with.
-    if snap.listening && let Some(token) = snap.auth_token.as_deref() {
+    // Suppressed in quick PIN mode: the PIN already carries the token, and the
+    // auto-generated token is identical across paired devices, so the fp is pure noise.
+    if snap.listening && !snap.pin_mode && let Some(token) = snap.auth_token.as_deref() {
         status_line.push(Span::raw("  token fp: "));
         status_line.push(Span::styled(
             crate::auth::token_fingerprint(token),
@@ -317,7 +319,9 @@ fn render_header(
     // point the user at Shift+L. `(pending)` covers the brief window after start before the
     // endpoint reports its id.
     let node_id_line = if snap.listening {
-        vec![Span::raw("node id: "), Span::raw(endpoint)]
+        // Truncated to the same short form as the connected-peers table — the full
+        // 64-char id is visual noise (and not needed to pair in any mode).
+        vec![Span::raw("node id: "), Span::raw(short_id(endpoint))]
     } else {
         vec![Span::styled(
             "not listening — press Shift+L to start",
@@ -1010,6 +1014,8 @@ mod tests {
         snap.auth_token = Some(crate::auth::generate_token());
         snap.current_pin = Some("K7P29QXM".to_string());
         snap.pin_deadline = Some(Instant::now() + std::time::Duration::from_secs(41));
+        let full_id = "f06c35c4091d1a83532599547815186b25ecb75c9edcd53c4359d64cf880e4f7";
+        snap.endpoint_id = Some(full_id.to_string());
 
         let out = render_text(&snap, &UiState::default());
         assert!(out.contains("dial PIN"), "PIN banner shown");
@@ -1017,6 +1023,21 @@ mod tests {
         assert!(out.contains("refreshes in"), "countdown shown");
         // The raw auth-token banner must not appear in PIN mode.
         assert!(!out.contains("auth token:"), "token banner suppressed in PIN mode");
+        // The token fp is redundant noise in PIN mode (the PIN carries the token).
+        assert!(!out.contains("token fp:"), "token fp dropped in PIN mode");
+        // The node id is truncated, not the full 64-char hash.
+        assert!(out.contains("node id: f06c35c4091"), "node id shown truncated");
+        assert!(!out.contains(full_id), "full node id not shown");
+    }
+
+    #[test]
+    fn non_pin_listening_keeps_token_fp() {
+        // Outside PIN mode the fp still lets the user cross-check the shared token.
+        let mut snap = base_snapshot(false, None); // listening = true, pin_mode = false
+        snap.auth_token = Some(crate::auth::generate_token());
+
+        let out = render_text(&snap, &UiState::default());
+        assert!(out.contains("token fp:"), "token fp shown outside PIN mode");
     }
 
     #[test]
