@@ -166,7 +166,7 @@ Generate auth tokens with: `duopipe generate-auth-token`
 
 ### Token Management
 
-When the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. You can also mint tokens ahead of time:
+In configless quick mode, when the listening peer starts without a configured auth token, it **generates one automatically** and displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token
