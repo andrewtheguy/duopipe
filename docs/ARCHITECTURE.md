@@ -339,7 +339,7 @@ graph TB
         B2 --> C{Relay URLs?}
         C -->|Yes| D[Add Custom Relays]
         C -->|No| E[Use Default Relays]
-        D --> F{Relay Only? (config bool)}
+        D --> F{"Relay Only? (config bool)"}
         E --> F
         F -->|Yes| G[clear_ip_transports]
         F -->|No| H[Keep IP + relay transports]
@@ -522,7 +522,7 @@ graph TB
         C --> D[Dial Peer Connects<br/>fixed ALPN mf/2]
         D --> E[Auth Token Validation]
         E --> F{Valid Token?}
-        F -->|Yes| G[Authenticated<br/>requests served (peer trusted)]
+        F -->|Yes| G["Authenticated<br/>requests served (peer trusted)"]
         F -->|No| H[Rejected]
     end
 
