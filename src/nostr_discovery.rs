@@ -214,6 +214,13 @@ pub async fn lookup_node_id(
 // `{node_id}` payload, with a NIP-40 expiration so per-bucket records coexist briefly (for
 // boundary look-back) then self-clean.
 //
+// Encrypting the node id is **defense in depth, not the security boundary**: the node id is not a
+// credential (dialing it still requires passing the in-band PIN auth), and the intended dialer
+// needs the PIN to derive the author key and find the record anyway. The encryption's job is to
+// keep ephemeral node ids off public relays in the clear, so a relay operator or anyone scraping
+// all kind-9421 events *without* the PIN cannot harvest or correlate them. It's free (the
+// PIN-derived keypair already exists), so there's no reason to publish in cleartext.
+//
 // The **auth token is deliberately not in the record**: once the dialer has the node id and
 // dials it, both peers prove they hold the same PIN with an in-band challenge-response over the
 // (QUIC-encrypted, node-id-authenticated) connection — see `crate::pin_auth`. So a captured relay
