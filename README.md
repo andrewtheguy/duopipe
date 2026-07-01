@@ -147,7 +147,9 @@ The iroh identity is **ephemeral** — duopipe generates a fresh identity on eve
 
 ## Authentication
 
-A peer connection is gated by a single pre-shared **auth token**, shared by **both** peers. The dialing peer presents it; the listening peer accepts exactly that one token. The expected setup is the **same token on your own devices**, copied between them over an out-of-band channel you already have (a password manager, an SSH session) — see [Intended use](#overview).
+Most connections are gated by a single pre-shared **auth token**, shared by **both** peers: the dialing peer presents it and the listening peer accepts exactly that one token. This covers **config mode** (a token you generated ahead of time and pre-shared) and quick **manual** mode (a fresh ephemeral token shown to copy by hand). The expected setup is the **same token on your own devices**, copied between them over an out-of-band channel you already have (a password manager, an SSH session) — see [Intended use](#overview).
+
+The exception is quick **PIN** mode, which uses **no token at all**: the rotating PIN both locates the node id and authenticates the connection in-band (see [Quick-mode PIN](#quick-mode-pin)). Everything below about tokens applies to config and quick manual modes.
 
 > **Note:** The QUIC ALPN identifier is a fixed constant (`mf/2`). It is no longer used for access control — authentication is solely via the shared auth token.
 
@@ -166,7 +168,7 @@ Generate auth tokens with: `duopipe generate-auth-token`
 
 ### Token Management
 
-In configless quick mode, when the listening peer starts without a configured auth token, it **generates one automatically** and — once you start listening (`Shift-L`) — displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. You can also mint tokens ahead of time:
+In configless quick **manual** mode, the listening peer has no configured token, so it **generates one automatically** and — once you start listening (`Shift-L`) — displays it in the TUI header alongside the node id. The banner auto-hides after 10 minutes (and once a peer connects); press `h` to hide it sooner or to toggle it back on. (Quick **PIN** mode generates no token — it shows a rotating PIN instead; see [Quick-mode PIN](#quick-mode-pin).) You can also mint tokens ahead of time:
 
 ```bash
 # Generate a valid auth token

@@ -673,7 +673,11 @@ async fn run_listen(
         }
     }
     log::info!("node id: {}", endpoint_id);
-    log::info!("Dial this instance with the node id and auth token.");
+    if config.auth_token.is_some() {
+        log::info!("Dial this instance with the node id and auth token.");
+    } else {
+        log::info!("Dial this instance with the rotating PIN (quick PIN mode).");
+    }
     log::info!("Waiting for peers to connect...");
 
     // Publish the (ephemeral) node id to nostr under this peer's identifier so a peer
@@ -1132,11 +1136,11 @@ async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
                     .nostr_identifier
                     .as_deref()
                     .expect("dial without a node id requires a nostr identifier");
-                // Name discovery is keyed off the shared token, which this path always has.
-                let token = config
-                    .auth_token
-                    .as_deref()
-                    .expect("dial by name requires an auth token");
+                // Name discovery is keyed off the shared token. A missing token here is a
+                // configuration error, not a transient failure, so fail the dial cleanly.
+                let Some(token) = config.auth_token.as_deref() else {
+                    anyhow::bail!("dial by name requires an auth token");
+                };
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     r = crate::nostr_discovery::lookup_node_id(
@@ -1185,10 +1189,9 @@ async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
             Ok(conn) => {
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
-                let token = config
-                    .auth_token
-                    .clone()
-                    .expect("headless dial requires an auth token");
+                let Some(token) = config.auth_token.clone() else {
+                    anyhow::bail!("headless dial requires an auth token");
+                };
                 let auth = AuthMode::DialToken(token);
                 match handle_connection(conn, config.clone(), semaphore.clone(), auth).await {
                     Ok(()) => {

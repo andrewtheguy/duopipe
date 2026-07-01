@@ -211,7 +211,7 @@ sequenceDiagram
     Note over L: User presses Shift-L — serve half creates ephemeral identity
     L->>L: Create iroh Endpoint
     L->>SD: Publish node id + Addresses
-    Note over L: Display node id + token banner/hint in TUI
+    Note over L: Display node id + token/PIN banner/hint in TUI
     L->>RS: Connect to relay
     L->>L: endpoint.accept() loop
 
@@ -234,7 +234,7 @@ sequenceDiagram
     Note over L,D: Encrypted QUIC tunnel established
 
     Note over D,L: Authentication Phase (first bi-stream, positional)
-    D->>L: open_bi() + AuthRequest {token}
+    D->>L: open_bi() + AuthRequest {token} (config/manual); AuthRequest::Pin challenge-response in quick PIN mode
     alt Token Valid
         L-->>D: AuthResponse {accepted: true}
     else Token Invalid
@@ -426,7 +426,7 @@ local_listen = "127.0.0.1:2222"
 
 ### Configuration Loading Flow
 
-Config files are read by `duopipe run` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config and takes no options: it always generates its own token, and the dial target is entered interactively.
+Config files are read by `duopipe run` and use TOML — settings are saved and reusable. The default path is `~/.config/duopipe/peer.toml`; `-c <path>` overrides it. `duopipe quick` reads no config and takes no options: quick **manual** mode generates its own ephemeral token while quick **PIN** mode uses none, and the dial target is entered interactively.
 
 ```mermaid
 sequenceDiagram
@@ -546,7 +546,7 @@ graph TB
 
 ### Token Authentication (iroh Mode)
 
-Access control rests on a single shared auth token. The ALPN is a fixed constant (`mf/2`) and carries no credential. After the QUIC/TLS handshake, the dialing peer must present a valid auth token on the **first bidirectional stream** (positional — this auth stream is the only stream that carries no `StreamHello`) within a 10-second timeout.
+Access control rests on a single shared auth token. (This section covers the token path used by config and quick manual modes; quick **PIN** mode instead runs an in-band PIN challenge-response — see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous).) The ALPN is a fixed constant (`mf/2`) and carries no credential. After the QUIC/TLS handshake, the dialing peer must present a valid auth token on the **first bidirectional stream** (positional — this auth stream is the only stream that carries no `StreamHello`) within a 10-second timeout.
 
 #### Auth Token
 
