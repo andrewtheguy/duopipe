@@ -125,11 +125,11 @@ impl SetupState {
     }
 }
 
-/// Record the resolved credential and finish. `generated` is `true` only for a
-/// freshly generated token (the dashboard then surfaces it for copying); a
-/// config/env or pasted token is `false`.
-fn finalize(state: &mut SetupState, auth_token: String, generated: bool) -> Step {
-    state.auth_token = Some(auth_token);
+/// Record the resolved credential (or `None` for quick PIN mode, which uses no token) and
+/// finish. `generated` is `true` only for a freshly generated token (the dashboard then
+/// surfaces it for copying); a config/env or pasted token — or no token — is `false`.
+fn finalize(state: &mut SetupState, auth_token: Option<String>, generated: bool) -> Step {
+    state.auth_token = auth_token;
     state.token_generated = generated;
     Step::Done(build_resolved(state))
 }
@@ -157,7 +157,7 @@ fn submit_token(state: &mut SetupState) -> Step {
         ));
         return Step::Continue;
     }
-    finalize(state, token, false)
+    finalize(state, Some(token), false)
 }
 
 /// Build the final `ResolvedPeer`. Interactive runs are always `Role::Both` (serve and
@@ -168,7 +168,7 @@ fn build_resolved(state: &SetupState) -> ResolvedPeer {
         role: Role::Both,
         peer_node_id: None,
         peer_identifier: None,
-        auth_token: state.auth_token.clone().unwrap_or_default(),
+        auth_token: state.auth_token.clone(),
         token_generated: state.token_generated,
         // Quick mode only; config mode never sets a PIN choice and ignores this.
         quick_pin: !state.nostr_discovery && state.quick_pin,
@@ -197,17 +197,22 @@ fn prev_start_focus(cur: StartFocus, nostr_discovery: bool) -> StartFocus {
     ring[(i + ring.len() - 1) % ring.len()]
 }
 
-/// Start quick mode with the chosen signaling. Quick mode always mints a fresh ephemeral
-/// token; PIN mode delivers it to the dialer over nostr, manual mode surfaces it in the
-/// dashboard to copy.
+/// Start quick mode with the chosen signaling. **PIN** mode uses no token — the PIN
+/// authenticates the connection in-band — so nothing is generated or shared. **Manual** mode
+/// mints a fresh ephemeral token (or uses a test-mode-supplied one) and surfaces it in the
+/// dashboard to copy out of band.
 fn start_quick(state: &mut SetupState, pin: bool) -> Step {
     state.quick_pin = pin;
+    if pin {
+        // PIN mode: no token at all.
+        return finalize(state, None, false);
+    }
     let token = state
         .config_auth_token
         .clone()
         .unwrap_or_else(auth::generate_token);
     let generated = state.config_auth_token.is_none();
-    finalize(state, token, generated)
+    finalize(state, Some(token), generated)
 }
 
 /// Submit the config-mode start screen: finish with a config/env token, or open the
@@ -215,7 +220,7 @@ fn start_quick(state: &mut SetupState, pin: bool) -> Step {
 fn submit_start(state: &mut SetupState) -> Step {
     if let Some(token) = state.config_auth_token.clone() {
         // A config/env token is used as-is, no further prompt.
-        finalize(state, token, false)
+        finalize(state, Some(token), false)
     } else {
         // No token supplied: the config-mode token is a pre-shared secret, so it must be
         // entered on the token screen. Quick mode never reaches here — it is only called
@@ -588,26 +593,26 @@ mod tests {
                 assert!(r.peer_node_id.is_none());
                 assert!(r.peer_identifier.is_none());
                 assert!(!r.token_generated);
-                assert_eq!(r.auth_token, token);
+                assert_eq!(r.auth_token.as_deref(), Some(token.as_str()));
             }
             _ => panic!("expected Done(Both)"),
         }
     }
 
     #[test]
-    fn quick_start_generates_token_directly() {
-        // Quick mode: the PIN choice is focused first; pressing Enter generates a fresh
-        // token, selects PIN signaling, and finishes immediately (no token-choice screen).
+    fn quick_pin_uses_no_token() {
+        // Quick mode: the PIN choice is focused first; pressing Enter selects PIN signaling
+        // and finishes immediately with **no** token (the PIN authenticates the connection).
         let mut s = SetupState::new(None, None, false, None);
         assert_eq!(s.focus, StartFocus::PinStart);
         match handle_key(key(KeyCode::Enter), &mut s) {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
-                assert!(r.token_generated);
                 assert!(r.quick_pin, "PIN choice selects nostr signaling");
-                assert!(auth::validate_token(&r.auth_token).is_ok());
+                assert!(r.auth_token.is_none(), "PIN mode carries no token");
+                assert!(!r.token_generated, "nothing was generated in PIN mode");
             }
-            _ => panic!("expected Done(Both) with a generated token"),
+            _ => panic!("expected Done(Both) with no token"),
         }
     }
 
@@ -638,7 +643,7 @@ mod tests {
             Step::Done(r) => {
                 assert_eq!(r.role, Role::Both);
                 assert!(!r.token_generated);
-                assert_eq!(r.auth_token, token);
+                assert_eq!(r.auth_token.as_deref(), Some(token.as_str()));
             }
             _ => panic!("expected Done(Both) with the entered token"),
         }
@@ -667,7 +672,7 @@ mod tests {
         handle_key(key(KeyCode::Enter), &mut s); // -> TokenSetup
         type_str(&mut s, &token);
         match handle_key(key(KeyCode::Enter), &mut s) {
-            Step::Done(r) => assert_eq!(r.auth_token, token),
+            Step::Done(r) => assert_eq!(r.auth_token.as_deref(), Some(token.as_str())),
             _ => panic!("expected Done with the matching token"),
         }
     }

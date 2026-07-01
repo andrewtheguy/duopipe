@@ -134,10 +134,11 @@ pub struct PeerConfig {
     /// When true, start every configured tunnel as soon as a connection is up
     /// (set from `DUOPIPE_AUTOSTART_TUNNELS` in test mode; see `DUOPIPE_TEST_MODE`).
     pub autostart_tunnels: bool,
-    /// The shared auth token (presented when dialing, required when listening).
-    /// Also the rendezvous secret for nostr discovery: both peers derive the same
-    /// nostr key from it. **Sensitive - redacted in Debug.**
-    pub auth_token: String,
+    /// The shared auth token (presented when dialing, accepted when listening), and the
+    /// rendezvous secret for nostr node-id discovery. `None` in quick **PIN** mode, which uses
+    /// no token — the PIN authenticates the connection in-band and the listener accepts only PIN
+    /// proofs. **Sensitive - redacted in Debug.**
+    pub auth_token: Option<String>,
     /// Nostr relay URLs used for node-id discovery.
     pub nostr_relays: Vec<String>,
     /// When true, use the nostr side channel: the listener publishes its current
@@ -391,23 +392,27 @@ async fn run_managed_dial_session(
         // in-band after we dial (see the `AuthMode` selection below).
         let resolved: Result<EndpointId> = match &target {
             DialTarget::NodeId(id) => Ok(*id),
-            DialTarget::Name(name) => {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = cancel.cancelled() => return,
-                    r = crate::nostr_discovery::lookup_node_id(
-                        &config.auth_token,
-                        name,
-                        &config.nostr_relays,
-                    ) => match r {
-                        Ok(id) => {
-                            log::info!("Discovered peer '{name}' node id via nostr: {id}");
-                            Ok(id)
-                        }
-                        Err(e) => Err(e.context("nostr node-id lookup failed")),
-                    },
+            // Name discovery is keyed off the shared token (config mode always has one).
+            DialTarget::Name(name) => match config.auth_token.as_deref() {
+                None => Err(anyhow::anyhow!("dialing by name requires an auth token")),
+                Some(token) => {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = cancel.cancelled() => return,
+                        r = crate::nostr_discovery::lookup_node_id(
+                            token,
+                            name,
+                            &config.nostr_relays,
+                        ) => match r {
+                            Ok(id) => {
+                                log::info!("Discovered peer '{name}' node id via nostr: {id}");
+                                Ok(id)
+                            }
+                            Err(e) => Err(e.context("nostr node-id lookup failed")),
+                        },
+                    }
                 }
-            }
+            },
             DialTarget::Pin(pin) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
@@ -475,10 +480,20 @@ async fn run_managed_dial_session(
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
                 // A PIN dial authenticates in-band with the PIN (no token on the wire); every
-                // other target presents this process's own token.
+                // other target presents this process's own token (always present for NodeId/Name).
                 let auth = match &target {
                     DialTarget::Pin(pin) => AuthMode::DialPin(pin.clone()),
-                    _ => AuthMode::DialToken(config.auth_token.clone()),
+                    _ => match config.auth_token.clone() {
+                        Some(token) => AuthMode::DialToken(token),
+                        None => {
+                            log::error!(
+                                "Dial target requires an auth token but none is configured; ending session."
+                            );
+                            config.status.set_conn_status(ConnStatus::Closed);
+                            config.status.set_dial_target(None);
+                            return;
+                        }
+                    },
                 };
                 // handle_connection returns on conn-close or process shutdown; also race
                 // the session cancel so a disconnect/replace tears it down promptly.
@@ -646,11 +661,16 @@ async fn run_listen(
     if config.report_endpoint_id {
         config.status.set_endpoint_id(endpoint_id.to_string());
     }
-    config.status.set_auth_token(config.auth_token.clone());
+    if let Some(token) = &config.auth_token {
+        config.status.set_auth_token(token.clone());
+    }
     if config.announce_endpoint {
-        // Non-interactive mode: surface both on stderr for a test harness.
+        // Non-interactive mode: surface both on stderr for a test harness. Headless test mode
+        // always has a token; quick PIN mode (which has none) never announces.
         eprintln!("node_id: {endpoint_id}");
-        eprintln!("auth_token: {}", config.auth_token);
+        if let Some(token) = &config.auth_token {
+            eprintln!("auth_token: {token}");
+        }
     }
     log::info!("node id: {}", endpoint_id);
     log::info!("Dial this instance with the node id and auth token.");
@@ -660,9 +680,14 @@ async fn run_listen(
     // sharing the auth token can discover it by name without a manual node-id
     // exchange. Runs in the background and republishes periodically; relay failures
     // are logged but non-fatal (peers who already have the node id still connect).
-    let _publisher = match (config.nostr_discovery, config.nostr_identifier.clone()) {
-        (true, Some(identifier)) => Some(spawn_node_id_publisher(PublisherParams {
-            auth_token: config.auth_token.clone(),
+    // Requires a token (the rendezvous secret), so quick PIN mode never publishes here.
+    let _publisher = match (
+        config.nostr_discovery,
+        config.nostr_identifier.clone(),
+        config.auth_token.clone(),
+    ) {
+        (true, Some(identifier), Some(auth_token)) => Some(spawn_node_id_publisher(PublisherParams {
+            auth_token,
             identifier,
             node_id: endpoint_id,
             relays: config.nostr_relays.clone(),
@@ -728,10 +753,11 @@ async fn run_listen(
 
         let config = config.clone();
         let semaphore = semaphore.clone();
-        // Inbound peers authenticate with this process's token, plus (in quick mode) a valid PIN
-        // proof against the recent-bucket keys.
+        // Inbound peers authenticate with this process's token (if any), plus (in quick mode) a
+        // valid PIN proof against the recent-bucket keys. In quick PIN mode there is no token, so
+        // the accepted set is empty and only PIN auth can succeed.
         let auth = AuthMode::Listen {
-            tokens: std::iter::once(config.auth_token.clone()).collect(),
+            tokens: config.auth_token.iter().cloned().collect(),
             pin_cache: pin_cache.clone(),
         };
         connection_tasks.spawn(crate::logging::inherit_source(async move {
@@ -1106,10 +1132,15 @@ async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
                     .nostr_identifier
                     .as_deref()
                     .expect("dial without a node id requires a nostr identifier");
+                // Name discovery is keyed off the shared token, which this path always has.
+                let token = config
+                    .auth_token
+                    .as_deref()
+                    .expect("dial by name requires an auth token");
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     r = crate::nostr_discovery::lookup_node_id(
-                        &config.auth_token,
+                        token,
                         identifier,
                         &config.nostr_relays,
                     ) => match r {
@@ -1154,7 +1185,11 @@ async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
             Ok(conn) => {
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
-                let auth = AuthMode::DialToken(config.auth_token.clone());
+                let token = config
+                    .auth_token
+                    .clone()
+                    .expect("headless dial requires an auth token");
+                let auth = AuthMode::DialToken(token);
                 match handle_connection(conn, config.clone(), semaphore.clone(), auth).await {
                     Ok(()) => {
                         // A real session was served; reset the initial-connect cap so a
@@ -1731,7 +1766,7 @@ mod tests {
             role,
             peer_node_id: None,
             autostart_tunnels: false,
-            auth_token: token.to_string(),
+            auth_token: Some(token.to_string()),
             nostr_relays: vec![],
             nostr_discovery: false,
             nostr_identifier: None,
@@ -1766,7 +1801,7 @@ mod tests {
             role: Role::Both,
             peer_node_id: None,
             autostart_tunnels: true,
-            auth_token: "tok".to_string(),
+            auth_token: Some("tok".to_string()),
             nostr_relays: vec![],
             nostr_discovery: true,
             nostr_identifier: Some("homelab".to_string()),

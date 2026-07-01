@@ -29,13 +29,16 @@ pub struct ResolvedPeer {
     /// Target peer's nostr identifier (nostr-mode dial), looked up at runtime. `None`
     /// for quick mode and for listeners.
     pub peer_identifier: Option<String>,
-    pub auth_token: String,
+    /// The shared auth token, or `None` in quick **PIN** mode, which uses no token at all —
+    /// the PIN authenticates the connection in-band. Always `Some` in config mode and quick
+    /// manual mode.
+    pub auth_token: Option<String>,
     /// `true` when `auth_token` was freshly generated (no token in config/env), so
-    /// the TUI must surface it for the user to copy. `false` when supplied.
+    /// the TUI must surface it for the user to copy. `false` when supplied or absent.
     pub token_generated: bool,
     /// Quick mode only. When true, nostr PIN signaling is used: the listener shares its node
-    /// id and token via a rotating PIN and the dialer types a PIN. When false, the manual
-    /// copy-paste flow is used (node id entered by hand). Always false in config mode and in
-    /// headless test mode.
+    /// id via a rotating PIN and the dialer types a PIN, which also authenticates the connection
+    /// (no token). When false, the manual copy-paste flow is used (node id entered by hand, token
+    /// shared out of band). Always false in config mode and in headless test mode.
     pub quick_pin: bool,
 }

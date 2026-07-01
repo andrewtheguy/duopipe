@@ -402,13 +402,13 @@ The outbound dial target is not a config field. In interactive mode it is entere
 
 ### iroh Credential Mapping
 
-`iroh` mode uses a **single** shared credential, the auth token. The ALPN is a fixed constant (`mf/2`) and carries no credential.
+`iroh` mode uses a **single** shared credential, the auth token — except quick **PIN** mode, which has no token and instead authenticates each connection with an in-band PIN challenge-response (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous)). The ALPN is a fixed constant (`mf/2`) and carries no credential.
 
 | Credential | Env Var | Config Key | Expected Usage |
 |------------|---------|-------------|----------------|
 | **Auth Token** | `DUOPIPE_AUTH_TOKEN` | `auth_token_file` | Connection-level credential validated on the first bi-stream. Both peers use the **same** token: the dial peer **presents** it, the listen peer **accepts** exactly that one value. Also the rendezvous secret for nostr node-id discovery. |
 
-Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** always generates a fresh ephemeral token in the interactive setup screen — there is no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it). The generated token is surfaced in the dashboard header for copying in quick **manual** mode once the user starts listening (`Shift-L`); in quick **PIN** mode the token is never shown or shared — the PIN authenticates the connection in-band instead (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous)). **Config mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
+Token precedence is `DUOPIPE_AUTH_TOKEN` (env) > config `auth_token_file`. A file token is never written inline in the config. **Quick mode** takes no existing-token input (`DUOPIPE_AUTH_TOKEN` is honored only in test mode, where the headless dial side needs it): its **manual** signaling generates a fresh ephemeral token in the setup screen, while its **PIN** signaling uses **no token at all** (the PIN authenticates the connection in-band). The generated token is surfaced in the dashboard header for copying in quick **manual** mode once the user starts listening (`Shift-L`); in quick **PIN** mode the token is never shown or shared — the PIN authenticates the connection in-band instead (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous)). **Config mode** accepts a token from config/env or pasted at setup (validated against its CRC before acceptance), since it is the pre-shared rendezvous secret both peers derive their key from and must be generated ahead of time (`duopipe generate-auth-token`); `auth_token_file` is therefore optional there too — only a `name` and `auth_token_fingerprint` are mandatory.
 
 The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, the first 4 bytes of the token string's SHA-256 rendered as 8 lowercase hex digits — in the header once the serve half is listening (gated on `snap.listening`) and in the `w`-dump. Because the full token is shown only briefly (and never on the dial side), the fingerprint lets the user confirm two devices share the same token without re-revealing the secret. The same canonical form also namespaces the per-name local state/lock file (`peer_state`): its path is `state-<fingerprint>-<name>.json`, with the `name` used verbatim (safe because `config::validate_name` restricts it to ASCII letters, digits, and `_`), so different pairings (tokens) that share a `name` get distinct, human-readable state files.
 
@@ -446,7 +446,7 @@ sequenceDiagram
         Config->>Source: Read file
         Source-->>Config: TOML content
     else duopipe quick
-        Main->>Main: Generate token in setup screen (no config/options)
+        Main->>Main: Setup screen (no config/options); manual mode generates a token, PIN mode uses none
     end
 
     alt Config loaded
@@ -552,7 +552,7 @@ Access control rests on a single shared auth token. The ALPN is a fixed constant
 
 - **Auth Token** (`DUOPIPE_AUTH_TOKEN` env var / `auth_token_file`): A single shared connection-level token, validated on the first bi-stream. Both peers use the **same** value. In code it is a 47-char `i...` token.
 
-1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or, in configless mode, generates an ephemeral one if none is set, displaying it in the TUI).
+1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or, in configless manual mode, generates an ephemeral one and displays it in the TUI; configless **PIN** mode uses no token — the PIN authenticates the connection in-band).
 2. **Dial Peer Configuration**: The dial peer is configured with — or interactively prompted for — the same shared token.
 3. **Protocol Flow**: The dialer opens the first bidirectional stream and sends an `AuthRequest` positionally (no hello). **No tunnel streams are processed until authentication succeeds.**
 4. **Validation**: The listen peer validates the presented token against its single accepted token within a 10-second timeout (`auth_as_listener`).
