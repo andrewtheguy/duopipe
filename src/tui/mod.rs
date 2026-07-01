@@ -102,8 +102,11 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         resolved.quick_pin,
     );
     // Seed the active token now so the header fingerprint is populated from the first
-    // frame (the runtime sets the same value again once it starts — idempotent).
-    state.set_auth_token(resolved.auth_token.clone());
+    // frame (the runtime sets the same value again once it starts — idempotent). Quick PIN
+    // mode has no token, so there is nothing to seed.
+    if let Some(token) = resolved.auth_token.clone() {
+        state.set_auth_token(token);
+    }
     let cfg = build_peer_config(&resolved, &launch, state.clone());
     let mut runtime = tokio::spawn(crate::iroh_mode::run_peer(cfg));
 

@@ -21,6 +21,19 @@
 //! the key derivation is deliberately slow and memory-hard (**Argon2id**): a captured
 //! record resists offline brute-force, and the 60-second rotation plus a short record TTL
 //! bound the exposure window.
+//!
+//! Two independent keys are derived from a PIN, both with the same Argon2id work factor but
+//! **domain-separated** salts (see [`derive_key_material`] and [`derive_auth_key_material`]):
+//! - the *rendezvous* key ([`derive_key_material`], bucketed) locates & decrypts the relay
+//!   record carrying the listener's ephemeral node id, and
+//! - the *auth* key ([`derive_auth_key_material`], **not** bucketed) proves mutual PIN
+//!   possession in-band over the established connection (see `crate::pin_auth`).
+//!
+//! The auth key is deliberately bucket-independent: the dialer types one PIN and must derive
+//! the same auth key regardless of which rotation bucket the listener published under, so it
+//! never has to guess the bucket. The listener instead remembers the last few buckets' PINs.
+//! The **auth token is never published to relays** — only the ephemeral node id is (encrypted
+//! under the rendezvous key); the PIN itself authenticates the connection.
 
 use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -49,9 +62,14 @@ const ARGON2_TIME: u32 = 3;
 /// Argon2id parallelism.
 const ARGON2_LANES: u32 = 1;
 
-/// Domain-separating salt prefix for the PIN key derivation; the time bucket is appended
-/// so each rotation derives an independent key.
+/// Domain-separating salt prefix for the PIN *rendezvous* key derivation; the time bucket
+/// is appended so each rotation derives an independent nostr key (see [`derive_key_material`]).
 const KDF_SALT_DOMAIN: &[u8] = b"duopipe:pin-rendezvous:v1";
+/// Domain-separating salt for the PIN *auth* key derivation ([`derive_auth_key_material`]).
+/// Deliberately carries **no** time bucket so both peers derive the same key from the PIN
+/// string alone, and is distinct from [`KDF_SALT_DOMAIN`] so the auth key can never collide
+/// with a rendezvous key.
+const AUTH_KDF_SALT: &[u8] = b"duopipe:pin-auth:v1";
 
 /// Position-weighted check character over canonical data chars, mirroring
 /// `../secure-send-web`: `sum(index(c) * (i + 1)) mod 32`, mapped back into the alphabet.
@@ -146,24 +164,39 @@ pub fn secs_until_next_bucket() -> u64 {
     BUCKET_SECS - (secs % BUCKET_SECS)
 }
 
-/// Derive 32 bytes of key material from a canonical PIN and a rotation bucket via Argon2id.
-/// Both peers run this on the same `(pin, bucket)` and get identical output, which
-/// `crate::nostr_discovery` turns into the shared nostr keypair.
-pub fn derive_key_material(canonical_pin: &str, bucket: u64) -> Result<[u8; 32]> {
-    let mut salt = Vec::with_capacity(KDF_SALT_DOMAIN.len() + 8);
-    salt.extend_from_slice(KDF_SALT_DOMAIN);
-    salt.extend_from_slice(&bucket.to_be_bytes());
-
+/// Run the shared Argon2id KDF over `canonical_pin` with the given `salt`, producing 32 bytes.
+/// Both key derivations below use identical work factors and differ only in their salt.
+fn argon2_key(canonical_pin: &str, salt: &[u8]) -> Result<[u8; 32]> {
     let params = Params::new(ARGON2_MEM_KIB, ARGON2_TIME, ARGON2_LANES, Some(32))
         .map_err(|e| anyhow::anyhow!("invalid argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut out = [0u8; 32];
     argon2
-        .hash_password_into(canonical_pin.as_bytes(), &salt, &mut out)
+        .hash_password_into(canonical_pin.as_bytes(), salt, &mut out)
         .map_err(|e| anyhow::anyhow!("argon2 key derivation failed: {e}"))
         .context("deriving key material from PIN")?;
     Ok(out)
+}
+
+/// Derive 32 bytes of *rendezvous* key material from a canonical PIN and a rotation bucket via
+/// Argon2id. Both peers run this on the same `(pin, bucket)` and get identical output, which
+/// `crate::nostr_discovery` turns into the shared nostr keypair used to locate & decrypt the
+/// relay record.
+pub fn derive_key_material(canonical_pin: &str, bucket: u64) -> Result<[u8; 32]> {
+    let mut salt = Vec::with_capacity(KDF_SALT_DOMAIN.len() + 8);
+    salt.extend_from_slice(KDF_SALT_DOMAIN);
+    salt.extend_from_slice(&bucket.to_be_bytes());
+    argon2_key(canonical_pin, &salt)
+}
+
+/// Derive 32 bytes of *auth* key material from a canonical PIN via Argon2id, **without** a time
+/// bucket. Both peers run this on the same PIN string and get identical output, which
+/// `crate::pin_auth` turns into the keypair that proves mutual PIN possession in-band. Being
+/// bucket-independent lets the dialer derive the right key without knowing which rotation
+/// bucket the listener published under.
+pub fn derive_auth_key_material(canonical_pin: &str) -> Result<[u8; 32]> {
+    argon2_key(canonical_pin, AUTH_KDF_SALT)
 }
 
 #[cfg(test)]
@@ -275,5 +308,26 @@ mod tests {
         let other_pin = pin_with_checksum("9QXMK7P");
         let other = derive_key_material(&other_pin, 100).unwrap();
         assert_ne!(a, other, "a different pin must derive a different key");
+    }
+
+    #[test]
+    fn auth_key_material_is_deterministic_bucket_independent_and_pin_specific() {
+        let pin = pin_with_checksum("K7P29QX");
+        let a = derive_auth_key_material(&pin).unwrap();
+        let a_again = derive_auth_key_material(&pin).unwrap();
+        assert_eq!(a, a_again, "same pin must derive the same auth key");
+
+        let other = derive_auth_key_material(&pin_with_checksum("9QXMK7P")).unwrap();
+        assert_ne!(a, other, "a different pin must derive a different auth key");
+
+        // Domain separation: the auth key must never equal a rendezvous key for the same pin,
+        // at any bucket.
+        for bucket in [0u64, 100, 12345] {
+            assert_ne!(
+                a,
+                derive_key_material(&pin, bucket).unwrap(),
+                "auth key collided with the rendezvous key at bucket {bucket}"
+            );
+        }
     }
 }

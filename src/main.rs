@@ -13,6 +13,7 @@ mod nostr_discovery;
 mod peer_params;
 mod peer_state;
 mod pin;
+mod pin_auth;
 mod signaling;
 mod tui;
 
@@ -205,7 +206,7 @@ impl TestEnv {
                     role: Role::Dial,
                     peer_node_id: Some(id),
                     peer_identifier: None,
-                    auth_token,
+                    auth_token: Some(auth_token),
                     token_generated: false,
                     quick_pin: false,
                 })
@@ -224,7 +225,7 @@ impl TestEnv {
                     role: Role::Listen,
                     peer_node_id: None,
                     peer_identifier: None,
-                    auth_token,
+                    auth_token: Some(auth_token),
                     token_generated,
                     quick_pin: false,
                 })
