@@ -202,18 +202,23 @@ pub async fn lookup_node_id(
 // Quick-mode PIN rendezvous
 // ============================================================================
 //
-// Quick mode can share its ephemeral node id **and** auth token through nostr without
-// any copy-paste: the listener shows a short PIN (see `crate::pin`) that rotates every
-// 60s. Unlike the node-id discovery above (keyed off the shared auth token), here the
-// dialer does not yet have the token — the PIN *is* the only shared secret. Both sides
-// derive the same nostr keypair from `(pin, bucket)` via Argon2id, so the listener
-// publishes a record under that key and a dialer holding the PIN derives the same key to
-// find and decrypt it. The lookup is by **author key** (only someone with the PIN can
-// derive it); no extra tag is needed.
+// Quick mode shares only the listener's **ephemeral node id** through nostr — never the auth
+// token. The listener shows a short PIN (see `crate::pin`) that rotates every 60s. Unlike the
+// node-id discovery above (keyed off the shared auth token), here the dialer starts with nothing
+// but the PIN. Both sides derive the same nostr keypair from `(pin, bucket)` via Argon2id, so the
+// listener publishes a record under that key and a dialer holding the PIN derives the same key to
+// find and decrypt it. The lookup is by **author key** (only someone with the PIN can derive it);
+// no extra tag is needed.
 //
 // The record is a regular (stored, non-replaceable) event carrying the NIP-44 encrypted
-// `{node_id, token}` payload, with a NIP-40 expiration so per-bucket records coexist
-// briefly (for boundary look-back) then self-clean.
+// `{node_id}` payload, with a NIP-40 expiration so per-bucket records coexist briefly (for
+// boundary look-back) then self-clean.
+//
+// The **auth token is deliberately not in the record**: once the dialer has the node id and
+// dials it, both peers prove they hold the same PIN with an in-band challenge-response over the
+// (QUIC-encrypted, node-id-authenticated) connection — see `crate::pin_auth`. So a captured relay
+// record, even if the PIN is later brute-forced, yields only an already-rotated ephemeral node id,
+// never a reusable credential.
 
 /// Regular (stored, non-replaceable) event kind for PIN rendezvous records. Deliberately
 /// *not* the replaceable 30078 used above, so each 60s bucket's record coexists long
@@ -232,12 +237,12 @@ fn pin_kind() -> Kind {
     Kind::from_u16(PIN_KIND_U16)
 }
 
-/// The payload carried (NIP-44 encrypted) in a PIN rendezvous record: everything a dialer
-/// needs to connect without any copy-paste.
+/// The payload carried (NIP-44 encrypted) in a PIN rendezvous record: the listener's ephemeral
+/// node id. The auth token is *not* here — the PIN authenticates the connection in-band (see
+/// `crate::pin_auth`).
 #[derive(Serialize, Deserialize)]
 struct PinPayload {
     node_id: String,
-    token: String,
 }
 
 /// Derive the nostr keypair for a `(pin, bucket)` pair. Both peers run this on the same
@@ -249,20 +254,18 @@ fn pin_keys(canonical_pin: &str, bucket: u64) -> Result<Keys> {
     Ok(Keys::new(secret))
 }
 
-/// Publish a PIN rendezvous record for the current bucket: the listener's node id and auth
-/// token, NIP-44 self-encrypted under the PIN-derived key, as a stored event that expires
-/// after a few rotation periods.
+/// Publish a PIN rendezvous record for the current bucket: the listener's ephemeral node id,
+/// NIP-44 self-encrypted under the PIN-derived key, as a stored event that expires after a few
+/// rotation periods. The auth token is never included (see `crate::pin_auth`).
 pub async fn publish_pin_record(
     canonical_pin: &str,
     bucket: u64,
     node_id: &EndpointId,
-    token: &str,
     relays: &[String],
 ) -> Result<()> {
     let keys = pin_keys(canonical_pin, bucket)?;
     let payload = serde_json::to_string(&PinPayload {
         node_id: node_id.to_string(),
-        token: token.to_string(),
     })
     .context("serializing PIN payload")?;
     let content = nip44::encrypt(
@@ -287,12 +290,13 @@ pub async fn publish_pin_record(
 
 /// Look up the PIN rendezvous record for `canonical_pin`, searching the current bucket and
 /// its immediate neighbors (covers the rotation boundary and small clock skew). Returns the
-/// decrypted `(node_id, token)`, or `Ok(None)` when no matching record is found (wrong or
-/// expired PIN). All adjacent buckets are queried in a single relay round-trip.
+/// decrypted node id, or `Ok(None)` when no matching record is found (wrong or expired PIN).
+/// All adjacent buckets are queried in a single relay round-trip. The connection is then
+/// authenticated in-band with the same PIN (see `crate::pin_auth`).
 pub async fn lookup_pin_record(
     canonical_pin: &str,
     relays: &[String],
-) -> Result<Option<(EndpointId, String)>> {
+) -> Result<Option<EndpointId>> {
     let current = pin::current_bucket();
     // Search order favors the current bucket, then the previous (the common late-read case),
     // then the next (clock skew where our clock trails the publisher's).
@@ -331,10 +335,7 @@ pub async fn lookup_pin_record(
         let Ok(node_id) = payload.node_id.trim().parse::<EndpointId>() else {
             continue;
         };
-        if crate::auth::validate_token(&payload.token).is_err() {
-            continue;
-        }
-        return Ok(Some((node_id, payload.token)));
+        return Ok(Some(node_id));
     }
     Ok(None)
 }
@@ -434,12 +435,10 @@ mod tests {
         let pin = "K7P29QXM";
         let bucket = 12345;
         let node_id = iroh::SecretKey::generate().public();
-        let token = crate::auth::generate_token();
 
         let keys = pin_keys(pin, bucket).unwrap();
         let payload = serde_json::to_string(&PinPayload {
             node_id: node_id.to_string(),
-            token: token.clone(),
         })
         .unwrap();
         let content = nip44::encrypt(
@@ -449,15 +448,13 @@ mod tests {
             nip44::Version::V2,
         )
         .unwrap();
-        // The ciphertext must not leak the node id or token.
+        // The ciphertext must not leak the node id.
         assert!(!content.contains(&node_id.to_string()));
-        assert!(!content.contains(&token));
 
         // Same pin + bucket recovers the payload.
         let plaintext = nip44::decrypt(keys.secret_key(), &keys.public_key(), &content).unwrap();
         let got: PinPayload = serde_json::from_str(&plaintext).unwrap();
         assert_eq!(got.node_id, node_id.to_string());
-        assert_eq!(got.token, token);
 
         // A different pin derives a different key and cannot decrypt.
         let wrong = pin_keys("9QXMK7P2", bucket).unwrap();

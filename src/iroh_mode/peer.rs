@@ -14,7 +14,7 @@
 //! peer is fully trusted — the acceptor connects out to any `host:port` it
 //! requests (there is no source allowlist).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +49,45 @@ use crate::signaling::{
     decode_stream_ack, decode_stream_hello, encode_auth_request, encode_auth_response,
     encode_stream_ack, encode_stream_hello, read_length_prefixed,
 };
+
+/// How many recent buckets' PIN keys the listener retains for in-band PIN auth. Mirrors the
+/// dialer's adjacent-bucket look-back in `nostr_discovery::lookup_pin_record`.
+const RECENT_PIN_CACHE: usize = 3;
+
+/// Recent PIN auth keypairs (newest first), one per rotation bucket the quick-mode listener has
+/// published. Written by the PIN publisher, read by the listener auth path to verify a dialer's
+/// proof. Cheap to clone (shared handle).
+#[derive(Clone, Default)]
+struct RecentPins(Arc<parking_lot::RwLock<VecDeque<nostr_sdk::Keys>>>);
+
+impl RecentPins {
+    fn push(&self, keys: nostr_sdk::Keys) {
+        let mut g = self.0.write();
+        g.push_front(keys);
+        while g.len() > RECENT_PIN_CACHE {
+            g.pop_back();
+        }
+    }
+
+    fn snapshot(&self) -> Vec<nostr_sdk::Keys> {
+        self.0.read().iter().cloned().collect()
+    }
+}
+
+/// How a connection authenticates. Chosen by the caller from the dial target (outbound) or the
+/// listener's mode (inbound), and consumed by [`handle_connection`].
+enum AuthMode {
+    /// Outbound: present a pre-shared token (connect mode, manual quick mode, headless test).
+    DialToken(String),
+    /// Outbound: prove PIN possession in-band (quick PIN mode).
+    DialPin(String),
+    /// Inbound: accept any of `tokens`; if `pin_cache` is `Some` (quick-mode listener), also
+    /// accept a valid PIN proof against the retained recent-bucket keys.
+    Listen {
+        tokens: HashSet<String>,
+        pin_cache: Option<RecentPins>,
+    },
+}
 
 /// Default maximum concurrent forwarded streams across all tunnels in the session.
 const DEFAULT_MAX_STREAMS: usize = 100;
@@ -113,10 +152,11 @@ pub struct PeerConfig {
     /// `None` outside config mode.
     pub nostr_identifier: Option<String>,
     /// Quick mode's nostr PIN signaling. When true, the listener half publishes a rotating
-    /// PIN record (node id + auth token, encrypted under a PIN-derived key) over
-    /// `nostr_relays`, and the dial manager resolves a [`DialTarget::Pin`] back to those.
-    /// Distinct from `nostr_discovery` (the name-based node-id discovery used by connect
-    /// mode). `false` in config mode and headless test mode.
+    /// PIN record (just the ephemeral node id, encrypted under a PIN-derived key) over
+    /// `nostr_relays`; the dial manager resolves a [`DialTarget::Pin`] to that node id and then
+    /// authenticates the connection in-band with the same PIN (see `crate::pin_auth`) — the auth
+    /// token is never on a relay. Distinct from `nostr_discovery` (the name-based node-id
+    /// discovery used by connect mode). `false` in config mode and headless test mode.
     pub pin_rendezvous: bool,
     /// Whether this config's endpoint owns the node id surfaced in the TUI / published
     /// to nostr. Single roles set `true`; in `Role::Both` only the listen sub-config is
@@ -346,11 +386,11 @@ async fn run_managed_dial_session(
         config.status.set_conn_status(ConnStatus::Connecting);
 
         // Resolve the target each attempt: a nostr name re-resolves so a listener that
-        // restarted with a fresh ephemeral id self-heals on the next try. The optional
-        // second element is an auth-token override: quick PIN mode learns the listener's
-        // token from the PIN record and must present *that* token (not this dialer's own).
-        let resolved: Result<(EndpointId, Option<String>)> = match &target {
-            DialTarget::NodeId(id) => Ok((*id, None)),
+        // restarted with a fresh ephemeral id self-heals on the next try. A PIN resolves to just
+        // the node id — the token is never on the relay; the PIN authenticates the connection
+        // in-band after we dial (see the `AuthMode` selection below).
+        let resolved: Result<EndpointId> = match &target {
+            DialTarget::NodeId(id) => Ok(*id),
             DialTarget::Name(name) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
@@ -362,7 +402,7 @@ async fn run_managed_dial_session(
                     ) => match r {
                         Ok(id) => {
                             log::info!("Discovered peer '{name}' node id via nostr: {id}");
-                            Ok((id, None))
+                            Ok(id)
                         }
                         Err(e) => Err(e.context("nostr node-id lookup failed")),
                     },
@@ -374,9 +414,9 @@ async fn run_managed_dial_session(
                     _ = cancel.cancelled() => return,
                     r = crate::nostr_discovery::lookup_pin_record(pin, &config.nostr_relays) => {
                         match r {
-                            Ok(Some((id, token))) => {
+                            Ok(Some(id)) => {
                                 log::info!("Resolved PIN to peer node id via nostr: {id}");
-                                Ok((id, Some(token)))
+                                Ok(id)
                             }
                             Ok(None) => Err(anyhow::anyhow!(
                                 "no peer found for that PIN (it refreshes every 60s — check the current code on the other device)"
@@ -393,7 +433,7 @@ async fn run_managed_dial_session(
         // node id, which is a separate endpoint in the combined process — so dialing our
         // own published id (a quick-mode paste, or a name that resolves back to us) is
         // caught here as a last line of defense behind the connect prompt's checks.
-        if let Ok((id, _)) = &resolved {
+        if let Ok(id) = &resolved {
             let id_str = id.to_string();
             let is_own_published =
                 config.status.snapshot().endpoint_id.as_deref() == Some(id_str.as_str());
@@ -413,9 +453,9 @@ async fn run_managed_dial_session(
             }
         }
 
-        let (token_override, connect) = match resolved {
-            Ok((id, token_override)) => {
-                let c = tokio::select! {
+        let connect = match resolved {
+            Ok(id) => {
+                tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = cancel.cancelled() => return,
                     c = connect_to_server(
@@ -425,31 +465,25 @@ async fn run_managed_dial_session(
                         config.relay_only,
                         ALPN,
                     ) => c,
-                };
-                (token_override, c)
+                }
             }
-            Err(e) => (None, Err(e)),
+            Err(e) => Err(e),
         };
 
         match connect {
             Ok(conn) => {
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
-                // Quick PIN mode authenticates with the token learned from the PIN record;
-                // every other path uses this process's own token. A per-session config
-                // clone carries the override down to the auth handshake.
-                let session_config = match &token_override {
-                    Some(token) => {
-                        let mut c = (*config).clone();
-                        c.auth_token = token.clone();
-                        Arc::new(c)
-                    }
-                    None => config.clone(),
+                // A PIN dial authenticates in-band with the PIN (no token on the wire); every
+                // other target presents this process's own token.
+                let auth = match &target {
+                    DialTarget::Pin(pin) => AuthMode::DialPin(pin.clone()),
+                    _ => AuthMode::DialToken(config.auth_token.clone()),
                 };
                 // handle_connection returns on conn-close or process shutdown; also race
                 // the session cancel so a disconnect/replace tears it down promptly.
                 let outcome = tokio::select! {
-                    r = handle_connection(conn, session_config, semaphore.clone(), true) => Some(r),
+                    r = handle_connection(conn, config.clone(), semaphore.clone(), auth) => Some(r),
                     _ = cancel.cancelled() => None,
                 };
                 match outcome {
@@ -642,14 +676,18 @@ async fn run_listen(
         _ => None,
     };
 
-    // Quick PIN mode: publish a rotating PIN record (node id + token, encrypted under a
-    // PIN-derived key) so a dialer can connect by typing a short code. Independent of the
+    // Quick PIN mode: publish a rotating PIN record (just the ephemeral node id, encrypted under
+    // a PIN-derived key) so a dialer can connect by typing a short code, and authenticate the
+    // connection in-band with that same PIN. The publisher also records each bucket's PIN auth key
+    // in `recent_pins` so the listener auth path can verify a dialer's proof. Independent of the
     // name-based node-id discovery above; runs only when explicitly enabled.
+    let recent_pins = RecentPins::default();
+    let pin_cache = config.pin_rendezvous.then(|| recent_pins.clone());
     let _pin_publisher = if config.pin_rendezvous {
         Some(PublisherGuard(tokio::spawn(crate::logging::inherit_source(
             run_pin_publisher(
                 endpoint_id,
-                config.auth_token.clone(),
+                recent_pins,
                 config.nostr_relays.clone(),
                 config.status.clone(),
                 listen_shutdown.clone(),
@@ -690,8 +728,14 @@ async fn run_listen(
 
         let config = config.clone();
         let semaphore = semaphore.clone();
+        // Inbound peers authenticate with this process's token, plus (in quick mode) a valid PIN
+        // proof against the recent-bucket keys.
+        let auth = AuthMode::Listen {
+            tokens: std::iter::once(config.auth_token.clone()).collect(),
+            pin_cache: pin_cache.clone(),
+        };
         connection_tasks.spawn(crate::logging::inherit_source(async move {
-            if let Err(e) = handle_connection(conn, config, semaphore, false).await {
+            if let Err(e) = handle_connection(conn, config, semaphore, auth).await {
                 log::warn!("Connection error for {}: {}", remote_id, e);
             }
         }));
@@ -926,7 +970,7 @@ async fn run_node_id_publisher(params: PublisherParams) {
 /// non-fatal (a dialer simply retries on the next code).
 async fn run_pin_publisher(
     node_id: EndpointId,
-    token: String,
+    recent: RecentPins,
     relays: Vec<String>,
     state: Arc<AppState>,
     shutdown: CancellationToken,
@@ -938,9 +982,14 @@ async fn run_pin_publisher(
         // Show the new code right away (deadline = the bucket boundary it rotates on).
         state.set_current_pin(pin.clone(), Instant::now() + Duration::from_secs(remaining));
 
-        match crate::nostr_discovery::publish_pin_record(&pin, bucket, &node_id, &token, &relays)
-            .await
-        {
+        // Record this bucket's PIN auth key so an inbound dialer holding this PIN can be
+        // authenticated in-band, even after the code rotates (the cache retains recent buckets).
+        match crate::pin_auth::derive_auth_keys(&pin) {
+            Ok(keys) => recent.push(keys),
+            Err(e) => log::warn!("Failed to derive PIN auth key: {e:#}"),
+        }
+
+        match crate::nostr_discovery::publish_pin_record(&pin, bucket, &node_id, &relays).await {
             Ok(()) => log::info!("Published rotating PIN to nostr (refreshes in {remaining}s)"),
             Err(e) => log::warn!("Failed to publish PIN to nostr: {e:#}"),
         }
@@ -1105,7 +1154,8 @@ async fn run_dial(config: PeerConfig, semaphore: Arc<Semaphore>) -> Result<()> {
             Ok(conn) => {
                 config.status.set_conn_status(ConnStatus::Connected);
                 log::info!("Connected to peer!");
-                match handle_connection(conn, config.clone(), semaphore.clone(), true).await {
+                let auth = AuthMode::DialToken(config.auth_token.clone());
+                match handle_connection(conn, config.clone(), semaphore.clone(), auth).await {
                     Ok(()) => {
                         // A real session was served; reset the initial-connect cap so a
                         // later transient outage doesn't count against startup.
@@ -1172,21 +1222,29 @@ async fn handle_connection(
     conn: iroh::endpoint::Connection,
     config: Arc<PeerConfig>,
     semaphore: Arc<Semaphore>,
-    is_dialer: bool,
+    auth: AuthMode,
 ) -> Result<()> {
     let remote_id = conn.remote_id();
+    let is_dialer = matches!(auth, AuthMode::DialToken(_) | AuthMode::DialPin(_));
 
     // Phase 1: authenticate. The listener serves any number of peers concurrently,
     // so there is no session binding — authentication is the only gate.
-    if is_dialer {
-        config.status.set_conn_status(ConnStatus::Authenticating);
-        auth_as_dialer(&conn, &config.auth_token).await?;
-        config.status.set_conn_status(ConnStatus::Connected);
-    } else {
-        let accepted: HashSet<String> = std::iter::once(config.auth_token.clone()).collect();
-        auth_as_listener(&conn, &accepted).await?;
-        config.status.add_peer(remote_id.to_string());
-        log::info!("Peer {remote_id} authenticated");
+    match &auth {
+        AuthMode::DialToken(token) => {
+            config.status.set_conn_status(ConnStatus::Authenticating);
+            auth_as_dialer(&conn, token).await?;
+            config.status.set_conn_status(ConnStatus::Connected);
+        }
+        AuthMode::DialPin(pin) => {
+            config.status.set_conn_status(ConnStatus::Authenticating);
+            auth_as_dialer_pin(&conn, pin).await?;
+            config.status.set_conn_status(ConnStatus::Connected);
+        }
+        AuthMode::Listen { tokens, pin_cache } => {
+            auth_as_listener(&conn, tokens, pin_cache.as_ref()).await?;
+            config.status.add_peer(remote_id.to_string());
+            log::info!("Peer {remote_id} authenticated");
+        }
     }
 
     let _path_watcher =
@@ -1351,10 +1409,32 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
     Ok(())
 }
 
-/// Authenticate as the listener.
+/// Authenticate as the dialer using the quick-mode PIN (in-band challenge-response). No token
+/// crosses the wire. The whole exchange is bounded by [`AUTH_TIMEOUT`] and any failure is an
+/// [`ErrorCategory::Auth`] error — fatal for this target, exactly like a wrong token.
+async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<()> {
+    let (mut send, mut recv) = open_bi_with_retry(conn).await?;
+    match tokio::time::timeout(
+        AUTH_TIMEOUT,
+        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin),
+    )
+    .await
+    {
+        Err(_) => return Err(TunnelError::auth(anyhow::anyhow!("PIN auth timed out")).into()),
+        Ok(Err(e)) => return Err(TunnelError::auth(e).into()),
+        Ok(Ok(())) => {}
+    }
+    let _ = send.finish();
+    log::info!("Authenticated with peer via PIN");
+    Ok(())
+}
+
+/// Authenticate as the listener. Accepts either a pre-shared token or (quick mode) a PIN proof;
+/// `pin_cache` holds the recent-bucket PIN keys and is `None` outside quick mode.
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
     auth_tokens: &HashSet<String>,
+    pin_cache: Option<&RecentPins>,
 ) -> Result<()> {
     let remote_id = conn.remote_id();
 
@@ -1367,20 +1447,31 @@ async fn auth_as_listener(
         let request_bytes = read_length_prefixed(&mut recv)
             .await
             .context("Failed to read auth request")?;
-        let request = decode_auth_request(&request_bytes).context("Invalid auth request")?;
-
-        if !is_token_valid(request.auth_token.as_str(), auth_tokens) {
-            log::warn!("Invalid auth token from {}", remote_id);
-            let response = AuthResponse::rejected("Invalid authentication token");
-            send.write_all(&encode_auth_response(&response)?).await?;
-            send.finish()?;
-            anyhow::bail!("Invalid auth token");
+        match decode_auth_request(&request_bytes).context("Invalid auth request")? {
+            AuthRequest::Token { auth_token, .. } => {
+                if !is_token_valid(auth_token.as_str(), auth_tokens) {
+                    log::warn!("Invalid auth token from {}", remote_id);
+                    let response = AuthResponse::rejected("Invalid authentication token");
+                    send.write_all(&encode_auth_response(&response)?).await?;
+                    send.finish()?;
+                    anyhow::bail!("Invalid auth token");
+                }
+                let response = AuthResponse::accepted();
+                send.write_all(&encode_auth_response(&response)?).await?;
+                send.finish()?;
+                Ok::<_, anyhow::Error>(())
+            }
+            AuthRequest::Pin { nonce, .. } => {
+                // Verify the dialer's PIN proof against the recent-bucket keys. An empty candidate
+                // set (this listener isn't in quick mode) yields a clean rejection.
+                let candidates = pin_cache.map(|c| c.snapshot()).unwrap_or_default();
+                crate::pin_auth::listener_handshake(&mut send, &mut recv, &candidates, &nonce)
+                    .await?;
+                let _ = send.finish();
+                log::info!("Peer {remote_id} authenticated via PIN");
+                Ok(())
+            }
         }
-
-        let response = AuthResponse::accepted();
-        send.write_all(&encode_auth_response(&response)?).await?;
-        send.finish()?;
-        Ok::<_, anyhow::Error>(())
     })
     .await;
 
@@ -1777,7 +1868,11 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let incoming = server_ep2.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("accept connection");
-            let _ = handle_connection(conn, server_cfg, test_semaphore(), false).await;
+            let auth = AuthMode::Listen {
+                tokens: std::iter::once(token.to_string()).collect(),
+                pin_cache: None,
+            };
+            let _ = handle_connection(conn, server_cfg, test_semaphore(), auth).await;
         });
 
         // Dialer side: the system under test.
@@ -1787,8 +1882,9 @@ mod tests {
             .expect("dial connect");
         let client_cfg = test_peer_config(Role::Dial, token);
         let client_status = client_cfg.status.clone();
+        let auth = AuthMode::DialToken(token.to_string());
         let client_task =
-            tokio::spawn(handle_connection(client_conn, client_cfg, test_semaphore(), true));
+            tokio::spawn(handle_connection(client_conn, client_cfg, test_semaphore(), auth));
 
         // Wait until the dialer has authenticated (parked on the connection).
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1851,7 +1947,7 @@ mod tests {
             let incoming = server_ep2.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("accept connection");
             let accepted: HashSet<String> = std::iter::once(token.to_string()).collect();
-            auth_as_listener(&conn, &accepted)
+            auth_as_listener(&conn, &accepted, None)
                 .await
                 .expect("listener auth");
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -1870,7 +1966,8 @@ mod tests {
             .connect(server_addr, ALPN)
             .await
             .expect("dial connect");
-        let result = handle_connection(client_conn, client_cfg, test_semaphore(), true).await;
+        let auth = AuthMode::DialToken(token.to_string());
+        let result = handle_connection(client_conn, client_cfg, test_semaphore(), auth).await;
 
         server_task.abort();
         client_ep.close().await;

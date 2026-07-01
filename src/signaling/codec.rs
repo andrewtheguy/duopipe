@@ -126,20 +126,117 @@ impl StreamAck {
     }
 }
 
-/// Authentication request sent by client immediately after iroh connection.
-/// Must be sent on the first bidirectional stream opened by the client.
+/// Authentication request sent by client immediately after iroh connection, on the first
+/// bidirectional stream opened by the client. The `method` tag selects the auth path the
+/// listener runs:
+/// - `Token` — pre-shared auth token (connect mode, manual quick mode, headless test mode).
+/// - `Pin` — quick-mode PIN challenge-response: `nonce` is the dialer's random nonce and the
+///   exchange continues with [`PinChallenge`] / [`PinResponse`] / [`PinConfirm`] on the same
+///   stream (see `crate::pin_auth`). No token crosses the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthRequest {
-    pub version: u16,
-    /// Authentication token for server validation
-    pub auth_token: AuthToken,
+#[serde(tag = "method")]
+pub enum AuthRequest {
+    Token {
+        version: u16,
+        /// Authentication token for server validation.
+        auth_token: AuthToken,
+    },
+    Pin {
+        version: u16,
+        /// The dialer's random challenge nonce (base64url), bound into the proofs.
+        nonce: String,
+    },
 }
 
 impl AuthRequest {
+    /// Token-method request (pre-shared auth token).
     pub fn new(auth_token: impl Into<String>) -> Self {
-        Self {
+        Self::Token {
             version: IROH_MULTI_VERSION,
             auth_token: AuthToken::new(auth_token),
+        }
+    }
+
+    /// PIN-method request carrying the dialer's challenge nonce.
+    pub fn pin(nonce: impl Into<String>) -> Self {
+        Self::Pin {
+            version: IROH_MULTI_VERSION,
+            nonce: nonce.into(),
+        }
+    }
+
+    fn version(&self) -> u16 {
+        match self {
+            AuthRequest::Token { version, .. } | AuthRequest::Pin { version, .. } => *version,
+        }
+    }
+}
+
+/// Listener's reply to a PIN [`AuthRequest`], carrying its own challenge nonce. The dialer
+/// answers with a [`PinResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinChallenge {
+    pub version: u16,
+    /// The listener's random challenge nonce (base64url).
+    pub nonce: String,
+}
+
+impl PinChallenge {
+    pub fn new(nonce: impl Into<String>) -> Self {
+        Self {
+            version: IROH_MULTI_VERSION,
+            nonce: nonce.into(),
+        }
+    }
+}
+
+/// Dialer's proof of PIN possession, in reply to a [`PinChallenge`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinResponse {
+    pub version: u16,
+    /// NIP-44 sealed proof over the two nonces under the PIN-derived key.
+    pub proof: String,
+}
+
+impl PinResponse {
+    pub fn new(proof: impl Into<String>) -> Self {
+        Self {
+            version: IROH_MULTI_VERSION,
+            proof: proof.into(),
+        }
+    }
+}
+
+/// Listener's final PIN-auth verdict. On success it carries the listener's own proof so the
+/// dialer can confirm the listener also holds the PIN (mutual authentication).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinConfirm {
+    pub version: u16,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+}
+
+impl PinConfirm {
+    pub fn accepted(proof: impl Into<String>) -> Self {
+        Self {
+            version: IROH_MULTI_VERSION,
+            accepted: true,
+            reason: None,
+            proof: Some(proof.into()),
+        }
+    }
+
+    /// Create a rejection verdict with the given reason (truncated to
+    /// [`MAX_REJECT_REASON_LENGTH`]).
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        Self {
+            version: IROH_MULTI_VERSION,
+            accepted: false,
+            reason: Some(truncate_reason(reason.into(), MAX_REJECT_REASON_LENGTH)),
+            proof: None,
         }
     }
 }
@@ -286,8 +383,53 @@ pub fn decode_auth_request(data: &[u8]) -> Result<AuthRequest> {
     decode_length_prefixed(
         data,
         IROH_MULTI_VERSION,
-        |r: &AuthRequest| r.version,
+        |r: &AuthRequest| r.version(),
         "AuthRequest",
+    )
+}
+
+/// Encode a PinChallenge as length-prefixed JSON bytes.
+pub fn encode_pin_challenge(msg: &PinChallenge) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, "PinChallenge")
+}
+
+/// Decode a PinChallenge from length-prefixed JSON bytes.
+pub fn decode_pin_challenge(data: &[u8]) -> Result<PinChallenge> {
+    decode_length_prefixed(
+        data,
+        IROH_MULTI_VERSION,
+        |m: &PinChallenge| m.version,
+        "PinChallenge",
+    )
+}
+
+/// Encode a PinResponse as length-prefixed JSON bytes.
+pub fn encode_pin_response(msg: &PinResponse) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, "PinResponse")
+}
+
+/// Decode a PinResponse from length-prefixed JSON bytes.
+pub fn decode_pin_response(data: &[u8]) -> Result<PinResponse> {
+    decode_length_prefixed(
+        data,
+        IROH_MULTI_VERSION,
+        |m: &PinResponse| m.version,
+        "PinResponse",
+    )
+}
+
+/// Encode a PinConfirm as length-prefixed JSON bytes.
+pub fn encode_pin_confirm(msg: &PinConfirm) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, "PinConfirm")
+}
+
+/// Decode a PinConfirm from length-prefixed JSON bytes.
+pub fn decode_pin_confirm(data: &[u8]) -> Result<PinConfirm> {
+    decode_length_prefixed(
+        data,
+        IROH_MULTI_VERSION,
+        |m: &PinConfirm| m.version,
+        "PinConfirm",
     )
 }
 
@@ -549,12 +691,72 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_auth_request_roundtrip() {
+    fn test_auth_request_token_roundtrip() {
         let req = AuthRequest::new("my_secret_token");
         let encoded = encode_auth_request(&req).unwrap();
         let decoded = decode_auth_request(&encoded).unwrap();
+        match decoded {
+            AuthRequest::Token {
+                version,
+                auth_token,
+            } => {
+                assert_eq!(version, IROH_MULTI_VERSION);
+                assert_eq!(auth_token.as_str(), "my_secret_token");
+            }
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_auth_request_pin_roundtrip() {
+        let req = AuthRequest::pin("bm9uY2U");
+        let decoded = decode_auth_request(&encode_auth_request(&req).unwrap()).unwrap();
+        match decoded {
+            AuthRequest::Pin { version, nonce } => {
+                assert_eq!(version, IROH_MULTI_VERSION);
+                assert_eq!(nonce, "bm9uY2U");
+            }
+            other => panic!("expected Pin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_auth_request_wrong_version_rejected() {
+        // Hand-craft a Pin request with a bad version; decode must reject it.
+        let json = br#"{"method":"Pin","version":99,"nonce":"x"}"#;
+        let len = (json.len() as u32).to_be_bytes();
+        let mut buf = Vec::from(len);
+        buf.extend_from_slice(json);
+        let err = decode_auth_request(&buf).unwrap_err();
+        assert!(err.to_string().contains("version mismatch"));
+    }
+
+    #[test]
+    fn test_pin_challenge_response_roundtrip() {
+        let challenge = PinChallenge::new("listener-nonce");
+        let decoded = decode_pin_challenge(&encode_pin_challenge(&challenge).unwrap()).unwrap();
         assert_eq!(decoded.version, IROH_MULTI_VERSION);
-        assert_eq!(decoded.auth_token.as_str(), "my_secret_token");
+        assert_eq!(decoded.nonce, "listener-nonce");
+
+        let response = PinResponse::new("sealed-proof");
+        let decoded = decode_pin_response(&encode_pin_response(&response).unwrap()).unwrap();
+        assert_eq!(decoded.version, IROH_MULTI_VERSION);
+        assert_eq!(decoded.proof, "sealed-proof");
+    }
+
+    #[test]
+    fn test_pin_confirm_roundtrip() {
+        let ok = PinConfirm::accepted("listener-proof");
+        let decoded = decode_pin_confirm(&encode_pin_confirm(&ok).unwrap()).unwrap();
+        assert!(decoded.accepted);
+        assert_eq!(decoded.proof.as_deref(), Some("listener-proof"));
+        assert!(decoded.reason.is_none());
+
+        let rej = PinConfirm::rejected("no matching pin");
+        let decoded = decode_pin_confirm(&encode_pin_confirm(&rej).unwrap()).unwrap();
+        assert!(!decoded.accepted);
+        assert_eq!(decoded.reason.as_deref(), Some("no matching pin"));
+        assert!(decoded.proof.is_none());
     }
 
     #[test]

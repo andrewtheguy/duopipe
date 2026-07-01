@@ -13,6 +13,7 @@ mod nostr_discovery;
 mod peer_params;
 mod peer_state;
 mod pin;
+mod pin_auth;
 mod signaling;
 mod tui;
 
