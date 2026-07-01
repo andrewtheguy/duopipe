@@ -2024,4 +2024,87 @@ mod tests {
             "a plain listener close must return Ok(()), got {result:?}"
         );
     }
+
+    /// Drive the quick-mode PIN handshake over a real iroh connection: the dialer
+    /// proves possession of `dialer_pin` via `auth_as_dialer_pin` (the `DialPin`
+    /// path) while the listener verifies it in `auth_as_listener`'s
+    /// `AuthRequest::Pin` branch, seeded with `listener_pins` in its recent-bucket
+    /// cache (empty ⇒ a non-quick / no-PIN listener). Returns
+    /// `(dialer_result, listener_result)`.
+    async fn run_pin_auth(dialer_pin: &str, listener_pins: &[&str]) -> (Result<()>, Result<()>) {
+        let server_ep = hermetic_endpoint().await;
+        let client_ep = hermetic_endpoint().await;
+
+        let server_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = server_ep.addr();
+                if addr.ip_addrs().next().is_some() {
+                    break addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server direct address ready");
+
+        // Seed the recent-bucket PIN keys the listener verifies proofs against.
+        let recent = RecentPins::default();
+        for p in listener_pins {
+            recent.push(crate::pin_auth::derive_auth_keys(p).expect("derive PIN auth keys"));
+        }
+
+        // Listener: a quick-mode listener accepts no tokens, only PIN proofs. Return the
+        // `conn` alongside the result so it stays alive until the dialer has read the final
+        // confirm frame — production keeps the connection open after auth, so dropping it here
+        // would otherwise race the dialer's last read.
+        let server_ep2 = server_ep.clone();
+        let listener_task = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("accept connection");
+            let res = auth_as_listener(&conn, &HashSet::new(), Some(&recent)).await;
+            (res, conn)
+        });
+
+        let client_conn = client_ep
+            .connect(server_addr, ALPN)
+            .await
+            .expect("dial connect");
+        let dialer_result = auth_as_dialer_pin(&client_conn, dialer_pin).await;
+        let (listener_result, _conn) = listener_task.await.expect("listener task panicked");
+
+        client_ep.close().await;
+        server_ep.close().await;
+        (dialer_result, listener_result)
+    }
+
+    /// Happy path: a dialer presenting a PIN in the listener's recent-bucket cache
+    /// is mutually authenticated through the `AuthRequest::Pin` / `DialPin` branches.
+    #[tokio::test]
+    async fn pin_auth_accepts_valid_proof() {
+        let pin = crate::pin::generate_pin();
+        let (dialer, listener) = run_pin_auth(&pin, &[&pin]).await;
+        assert!(dialer.is_ok(), "dialer should authenticate: {dialer:?}");
+        assert!(listener.is_ok(), "listener should accept: {listener:?}");
+    }
+
+    /// A dialer whose PIN is not among the listener's recent buckets is rejected on
+    /// both sides — the security-critical branch that must never accept a bad PIN.
+    #[tokio::test]
+    async fn pin_auth_rejects_wrong_pin() {
+        let dialer_pin = crate::pin::generate_pin();
+        let listener_pin = crate::pin::generate_pin();
+        let (dialer, listener) = run_pin_auth(&dialer_pin, &[&listener_pin]).await;
+        assert!(dialer.is_err(), "dialer with wrong PIN must be rejected");
+        assert!(listener.is_err(), "listener must reject a wrong PIN");
+    }
+
+    /// A listener with no recent PINs (empty candidate set — e.g. not in quick PIN
+    /// mode) cleanly rejects any PIN proof rather than accepting or panicking.
+    #[tokio::test]
+    async fn pin_auth_rejects_when_no_recent_pins() {
+        let pin = crate::pin::generate_pin();
+        let (dialer, listener) = run_pin_auth(&pin, &[]).await;
+        assert!(dialer.is_err(), "dialer must be rejected with no candidates");
+        assert!(listener.is_err(), "listener with empty cache must reject");
+    }
 }
