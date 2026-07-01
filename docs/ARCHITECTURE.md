@@ -208,7 +208,7 @@ sequenceDiagram
     participant D as Dial Peer
     participant RS as Relay Server
 
-    Note over L: User presses Shift-L; serve half creates ephemeral identity
+    Note over L: User presses Shift-L — serve half creates ephemeral identity
     L->>L: Create iroh Endpoint
     L->>SD: Publish node id + Addresses
     Note over L: Display node id + token banner/hint in TUI
@@ -446,7 +446,7 @@ sequenceDiagram
         Config->>Source: Read file
         Source-->>Config: TOML content
     else duopipe quick
-        Main->>Main: Setup screen (no config/options); manual mode generates a token, PIN mode uses none
+        Main->>Main: Setup screen (no config/options) — manual mode generates a token, PIN mode uses none
     end
 
     alt Config loaded
@@ -456,7 +456,7 @@ sequenceDiagram
         Main->>Main: Apply env overrides (DUOPIPE_AUTH_TOKEN wins)
     end
 
-    Main->>Main: Launch idle TUI; listen starts on Shift-L, dial target entered later
+    Main->>Main: Launch idle TUI — listen starts on Shift-L, dial target entered later
 ```
 
 ### Config Validation
