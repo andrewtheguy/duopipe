@@ -217,8 +217,9 @@ pub async fn lookup_node_id(
 // The **auth token is deliberately not in the record**: once the dialer has the node id and
 // dials it, both peers prove they hold the same PIN with an in-band challenge-response over the
 // (QUIC-encrypted, node-id-authenticated) connection — see `crate::pin_auth`. So a captured relay
-// record, even if the PIN is later brute-forced, yields only an already-rotated ephemeral node id,
-// never a reusable credential.
+// record, even if the PIN is later brute-forced, yields only a node id (never a reusable
+// credential) — and by the time that slow crack finishes the PIN has long since rotated, so it can
+// no longer authenticate a connection.
 
 /// Regular (stored, non-replaceable) event kind for PIN rendezvous records. Deliberately
 /// *not* the replaceable 30078 used above, so each 60s bucket's record coexists long
