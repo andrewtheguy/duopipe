@@ -334,7 +334,14 @@ mod tests {
                 .map(|_| ())
         };
         let (d, l) = tokio::join!(dialer_task, listener_task);
-        assert!(d.is_err(), "dialer must be rejected when the commit is denied");
+        // Match the explicit rejection message rather than just `is_err()`, which would also pass
+        // on an EOF/stream drop — the contract is that the dialer is *told* rejected, not
+        // accepted-then-dropped.
+        let err = d.expect_err("dialer must be rejected when the commit is denied");
+        assert!(
+            err.to_string().contains("PIN authentication rejected"),
+            "dialer must see an explicit PIN rejection, got: {err:#}"
+        );
         assert!(l.is_err(), "listener must reject when the commit is denied");
     }
 
