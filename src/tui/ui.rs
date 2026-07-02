@@ -104,10 +104,10 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     let tunnel_rows = 1u16 + 2; // single tunnel row + header + border
     let [header_area, tunnels_area, _filler, footer_area] = Layout::vertical([
         Constraint::Length(header_height(
+            snap,
             show_token_banner,
             show_pin_banner,
             show_conflict_warning,
-            snap.listening,
         )),
         Constraint::Length(tunnel_rows.clamp(4, 10)),
         Constraint::Min(0),
@@ -141,10 +141,10 @@ fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], u
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let [header_area, logs_area] = Layout::vertical([
         Constraint::Length(header_height(
+            snap,
             show_token_banner,
             show_pin_banner,
             show_conflict_warning,
-            snap.listening,
         )),
         Constraint::Min(3),
     ])
@@ -277,15 +277,21 @@ fn banner_hide_at(showing: bool, ui: &UiState) -> Option<String> {
 }
 
 fn header_height(
+    snap: &AppSnapshot,
     show_token_banner: bool,
     show_pin_banner: bool,
     show_conflict_warning: bool,
-    show_inbound: bool,
 ) -> u16 {
-    // Five content rows (app identity, mode/name, streams/fp, node id, dial line) plus the border.
-    // The token *or* PIN banner adds two rows; the inbound-peer line (shown while listening) one.
-    let base = if show_token_banner || show_pin_banner { 9 } else { 7 };
-    base + u16::from(show_conflict_warning) + u16::from(show_inbound)
+    // Three fixed content rows (app identity, mode/name, streams/fp) plus a 2-row
+    // frame. The remaining rows are direction-committed (see `render_header`): the
+    // listen/node-id line unless dialing, the inbound line while listening, and the
+    // outbound line unless listening. A token *or* PIN banner adds two rows.
+    let dialing = snap.dial_target.is_some();
+    let node_line = u16::from(snap.listening || !dialing);
+    let inbound_line = u16::from(snap.listening);
+    let dial_line = u16::from(dialing || !snap.listening);
+    let banner = if show_token_banner || show_pin_banner { 2 } else { 0 };
+    2 + 3 + node_line + inbound_line + dial_line + banner + u16::from(show_conflict_warning)
 }
 
 /// The header's optional banner state, bundled to keep `render_header`'s signature small.
@@ -354,34 +360,44 @@ fn render_header(
         ));
     }
 
-    // The serve half is started on-demand: before it is up there is no node id to show, so
-    // point the user at Shift+L. `(pending)` covers the brief window after start before the
-    // endpoint reports its id.
-    let node_id_line = if snap.listening {
-        // Truncated to the same short form as the inbound-peer line — the full
-        // 64-char id is visual noise (and not needed to pair in any mode).
-        vec![Span::raw("node id: "), Span::raw(short_id(endpoint))]
-    } else {
-        vec![Span::styled(
-            "not listening — press Shift+L to start",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]
-    };
-
     let mut lines = vec![
         Line::from(app_line),
         Line::from(id_line),
         Line::from(status_line),
-        Line::from(node_id_line),
     ];
-    // Who the serve half is paired with (or waiting/reserved) — inline, since there is only ever
-    // one inbound peer now. Shown only while listening.
+
+    // A run commits to one direction, so the header shows only the relevant side:
+    //   - listening → the node-id + inbound (listener) lines, no outbound line;
+    //   - dialing   → the outbound line, no listen/node-id line;
+    //   - idle      → both prompts, so the user can pick a direction.
+    let dialing = snap.dial_target.is_some();
+
+    // Listen side: the node id (once up) or the Shift+L prompt (idle). A dialer doesn't
+    // care about listening, so this is hidden while a dial session exists.
+    if snap.listening {
+        // Truncated to the same short form as the inbound-peer line — the full
+        // 64-char id is visual noise (and not needed to pair in any mode).
+        lines.push(Line::from(vec![
+            Span::raw("node id: "),
+            Span::raw(short_id(endpoint)),
+        ]));
+    } else if !dialing {
+        lines.push(Line::from(Span::styled(
+            "not listening — press Shift+L to start",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    // Who the serve half is paired with (or waiting/reserved) — shown only while listening.
     if let Some(inbound) = inbound_status_line(snap) {
         lines.push(inbound);
     }
-    lines.push(dial_header_line(snap, show_dial_hint));
+    // Dial side: the outbound status (once dialing) or the Shift+C prompt (idle). A listener
+    // doesn't care about outbound, so this is hidden while listening.
+    if dialing || !snap.listening {
+        lines.push(dial_header_line(snap, show_dial_hint));
+    }
 
     if banners.show_token {
         // Freshly generated token, not yet dismissed: surface it so the dialer can
@@ -1322,6 +1338,37 @@ mod tests {
         assert!(!text.contains("not listening — press Shift+L to start"));
         assert!(text.contains("Shift+L stop listening"));
         assert!(text.contains("h show/hide"));
+    }
+
+    #[test]
+    fn dialer_header_hides_the_listen_line() {
+        // A dialing run only cares about outbound: no "not listening" prompt.
+        let mut snap = base_snapshot(false, None);
+        snap.listening = false;
+        snap.dial_target = Some("peer".to_string());
+        snap.conn_status = ConnStatus::Connected;
+        let text = render_text(&snap, &UiState::default());
+        assert!(text.contains("Outbound → peer"));
+        assert!(!text.contains("not listening — press Shift+L to start"));
+    }
+
+    #[test]
+    fn listener_header_hides_the_outbound_line() {
+        // A listening run only cares about inbound: no "Outbound" line.
+        let snap = base_snapshot(false, None); // listening = true, no dial session
+        let text = render_text(&snap, &UiState::default());
+        assert!(text.contains("node id:"));
+        assert!(!text.contains("Outbound"));
+    }
+
+    #[test]
+    fn idle_header_shows_both_direction_prompts() {
+        // Idle (neither): both prompts appear so the user can pick a direction.
+        let mut snap = base_snapshot(false, None);
+        snap.listening = false;
+        let text = render_text(&snap, &UiState::default());
+        assert!(text.contains("not listening — press Shift+L to start"));
+        assert!(text.contains("Outbound: not connected"));
     }
 
     #[test]
