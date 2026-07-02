@@ -816,14 +816,20 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, _ui: &UiSta
     frame.render_widget(table, area);
 }
 
-/// The SOCKS proxy is symmetric: either side can bind it once paired. Show the
-/// start/stop hints when there is a live authenticated connection (inbound peer or
-/// outbound dial); before that the proxy has no session to tunnel through.
+/// The SOCKS proxy is symmetric: either side can bind it once paired. The advertised
+/// shortcuts track both pairing *and* whether the proxy is running, so they match
+/// `handle_home_key`: before a live pairing there is no session to tunnel through; while
+/// running, `e` (set port) is refused and a second `s` (start) is a no-op, so only `x`
+/// (stop) and `d` (clear) are offered.
 fn socks_title(snap: &AppSnapshot) -> &'static str {
-    if has_live_pairing(snap) {
-        " SOCKS5 Proxy  [s start · x stop · e set · d clear] "
+    if !has_live_pairing(snap) {
+        return " SOCKS5 Proxy  [e set · d clear — pair first] ";
+    }
+    let running = snap.socks.as_ref().is_some_and(|s| s.status.is_running());
+    if running {
+        " SOCKS5 Proxy  [x stop · d clear] "
     } else {
-        " SOCKS5 Proxy  [e set · d clear — pair first] "
+        " SOCKS5 Proxy  [s start · e set · d clear] "
     }
 }
 
@@ -1413,12 +1419,29 @@ mod tests {
         assert!(!idle_text.contains("s start"));
         assert!(idle_text.contains("pair first"));
 
-        // A live outbound session enables start/stop of the local proxy.
+        // A live outbound session, proxy not yet running: offer start/set/clear.
         let mut connected = base_snapshot(false, None);
         connected.listening = false;
         connected.dial_target = Some("peer".to_string());
         connected.conn_status = ConnStatus::Connected;
         let connected_text = render_text(&connected, &UiState::default());
         assert!(connected_text.contains("s start"));
+        assert!(connected_text.contains("e set"));
+
+        // Proxy running: `e` is refused and a second `s` is a no-op, so the title drops both
+        // and offers only stop/clear — matching `handle_home_key`.
+        let mut running = base_snapshot(false, None);
+        running.listening = false;
+        running.dial_target = Some("peer".to_string());
+        running.conn_status = ConnStatus::Connected;
+        running.socks = Some(SocksRow {
+            port: 1080,
+            status: SocksStatus::Listening,
+            detail: "127.0.0.1:1080".to_string(),
+        });
+        let running_text = render_text(&running, &UiState::default());
+        assert!(running_text.contains("x stop"));
+        assert!(!running_text.contains("s start"));
+        assert!(!running_text.contains("e set"));
     }
 }
