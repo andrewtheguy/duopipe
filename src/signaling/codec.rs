@@ -129,6 +129,15 @@ impl StreamAck {
     /// `socks5::REP_*`) and a reason.
     /// The reason will be truncated if it exceeds [`MAX_REJECT_REASON_LENGTH`].
     pub fn rejected(rep: u8, reason: impl Into<String>) -> Self {
+        // A rejection must carry a real SOCKS5 failure code (RFC 1928 `0x01..=0x08`); `0x00`
+        // means success and anything else is out of range. Normalize an invalid value to a
+        // general failure so an impossible `(accepted = false, rep = success)` state can't be
+        // constructed (the decode path enforces the same invariant on the wire).
+        let rep = if (REP_REJECT_MIN..=REP_REJECT_MAX).contains(&rep) {
+            rep
+        } else {
+            REP_REJECT_MIN
+        };
         Self {
             version: IROH_MULTI_VERSION,
             accepted: false,
@@ -137,6 +146,14 @@ impl StreamAck {
         }
     }
 }
+
+/// SOCKS5 REP code for a successful connect (RFC 1928); the only value an accepted
+/// [`StreamAck`] may carry.
+const REP_SUCCESS: u8 = 0x00;
+/// Inclusive range of SOCKS5 REP failure codes (RFC 1928 `0x01..=0x08`); the only values a
+/// rejected [`StreamAck`] may carry.
+const REP_REJECT_MIN: u8 = 0x01;
+const REP_REJECT_MAX: u8 = 0x08;
 
 /// Authentication request sent by client immediately after iroh connection, on the first
 /// bidirectional stream opened by the client. The `method` tag selects the auth path the
@@ -377,12 +394,28 @@ pub fn encode_stream_ack(ack: &StreamAck) -> Result<Vec<u8>> {
 
 /// Decode a StreamAck from length-prefixed JSON bytes.
 pub fn decode_stream_ack(data: &[u8]) -> Result<StreamAck> {
-    decode_length_prefixed(
+    let ack: StreamAck = decode_length_prefixed(
         data,
         IROH_MULTI_VERSION,
         |a: &StreamAck| a.version,
         "StreamAck",
-    )
+    )?;
+    // Enforce the accepted/rep invariant on the wire: an accepted ack must carry REP success
+    // (0x00), and a rejected ack must carry a real SOCKS5 failure code (0x01..=0x08). Reject
+    // impossible states here so they can't be bridged or echoed to the local SOCKS client.
+    if ack.accepted && ack.rep != REP_SUCCESS {
+        anyhow::bail!(
+            "StreamAck accepted but rep=0x{:02x} (must be 0x00)",
+            ack.rep
+        );
+    }
+    if !ack.accepted && !(REP_REJECT_MIN..=REP_REJECT_MAX).contains(&ack.rep) {
+        anyhow::bail!(
+            "StreamAck rejected with invalid rep=0x{:02x} (must be 0x01..=0x08)",
+            ack.rep
+        );
+    }
+    Ok(ack)
 }
 
 /// Encode an AuthRequest as length-prefixed JSON bytes.
@@ -546,6 +579,46 @@ mod tests {
         assert!(!decoded.accepted);
         assert_eq!(decoded.rep, 0x05);
         assert_eq!(decoded.reason.as_deref(), Some("connect refused"));
+    }
+
+    #[test]
+    fn test_stream_ack_rejected_normalizes_invalid_rep() {
+        // A rejection can't carry the success code or an out-of-range value: both normalize to
+        // a general failure so the accepted/rep invariant always holds.
+        assert_eq!(StreamAck::rejected(0x00, "x").rep, 0x01);
+        assert_eq!(StreamAck::rejected(0x09, "x").rep, 0x01);
+        assert_eq!(StreamAck::rejected(0xff, "x").rep, 0x01);
+        // In-range codes are preserved.
+        assert_eq!(StreamAck::rejected(0x08, "x").rep, 0x08);
+    }
+
+    /// Build a length-prefixed StreamAck frame from raw JSON (to forge impossible states).
+    fn framed(json: &[u8]) -> Vec<u8> {
+        let len = (json.len() as u32).to_be_bytes();
+        let mut buf = Vec::from(len);
+        buf.extend_from_slice(json);
+        buf
+    }
+
+    #[test]
+    fn test_decode_stream_ack_rejects_accepted_with_nonzero_rep() {
+        let buf = framed(br#"{"version":7,"accepted":true,"rep":5}"#);
+        let err = decode_stream_ack(&buf).unwrap_err();
+        assert!(err.to_string().contains("accepted but rep"));
+    }
+
+    #[test]
+    fn test_decode_stream_ack_rejects_rejection_with_success_rep() {
+        let buf = framed(br#"{"version":7,"accepted":false,"rep":0}"#);
+        let err = decode_stream_ack(&buf).unwrap_err();
+        assert!(err.to_string().contains("invalid rep"));
+    }
+
+    #[test]
+    fn test_decode_stream_ack_rejects_rejection_with_out_of_range_rep() {
+        let buf = framed(br#"{"version":7,"accepted":false,"rep":9}"#);
+        let err = decode_stream_ack(&buf).unwrap_err();
+        assert!(err.to_string().contains("invalid rep"));
     }
 
     #[test]
