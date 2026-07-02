@@ -43,12 +43,12 @@ There is **no listen/dial choice at startup**. Quick mode runs fully ephemeral (
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In config mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
 
-A peer serves **one inbound peer per listen session** — the first device to authenticate (laptop *or* phone *or* VPS) claims the homelab box until it stops listening — shown in its peer list, while also dialing out itself. Each dial session carries one TCP forward. iroh provides NAT traversal with relay fallback and automatic discovery.
+A peer serves **one inbound peer per listen session** — the first device to authenticate (laptop *or* phone *or* VPS) claims the homelab box until it stops listening — shown inline in its header, while also dialing out itself. Each dial session carries one TCP forward. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
 > **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS); the same auth token lives on each of your machines. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
 > - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth token is per-run too. Move the auth token between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in config mode the node id is then discovered automatically.
-> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, connected peers, and the tunnel's health — and **starts/stops the tunnel by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
+> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, the paired peer, and the tunnel's health — and **starts/stops the tunnel by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
 > - **Trust rests on the shared token.** Once the shared auth token passes, the connected peer is fully trusted — it may ask the serving peer to connect out to **any `host:port`** it requests. Keep the token only on devices you own (or fully trust).
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.

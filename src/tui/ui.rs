@@ -10,9 +10,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use tui_input::Input;
 
 use super::textinput::{INPUT_FIELD_HEIGHT, render_input_field};
-use crate::app_state::{
-    AppSnapshot, ConnStatus, NameConflict, PeerRow, Role, TunnelRow, TunnelStatus,
-};
+use crate::app_state::{AppSnapshot, ConnStatus, NameConflict, Role, TunnelRow, TunnelStatus};
 use crate::config::TunnelEntry;
 use crate::logging::LogLine;
 
@@ -21,7 +19,7 @@ use crate::logging::LogLine;
 /// screen's tunnel navigation.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
-    /// Header + tunnels + connected peers.
+    /// Header (with inline paired-peer status) + tunnels.
     #[default]
     Home,
     /// Header + a full-height log pane.
@@ -115,8 +113,9 @@ pub fn render(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], ui: &UiSt
     }
 }
 
-/// The home screen: header, the tunnel table, and the connected-peers table. Logs
-/// live on their own screen (`l`) so their keys don't fight the tunnel navigation.
+/// The home screen: header (which now carries the single paired-peer status inline) and the
+/// tunnel table. Logs live on their own screen (`l`) so their keys don't fight the tunnel
+/// navigation.
 fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     // Show the freshly generated token in the header until a peer connects or the
     // user dismisses it (both captured by `token_banner_hidden`).
@@ -125,11 +124,14 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
     let hide_at = banner_hide_at(show_token_banner || show_pin_banner, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let tunnel_rows = 1u16 + 2; // single tunnel row + header + border
-    let peer_rows = snap.peers.len().max(1) as u16 + 2;
-    let [header_area, tunnels_area, peers_area, _filler, footer_area] = Layout::vertical([
-        Constraint::Length(header_height(show_token_banner, show_pin_banner, show_conflict_warning)),
+    let [header_area, tunnels_area, _filler, footer_area] = Layout::vertical([
+        Constraint::Length(header_height(
+            show_token_banner,
+            show_pin_banner,
+            show_conflict_warning,
+            snap.listening,
+        )),
         Constraint::Length(tunnel_rows.clamp(4, 10)),
-        Constraint::Length(peer_rows.clamp(3, 8)),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
@@ -150,7 +152,6 @@ fn render_home(frame: &mut Frame, snap: &AppSnapshot, ui: &UiState) {
         true,
     );
     render_tunnels(frame, tunnels_area, snap, ui);
-    render_peers(frame, peers_area, snap);
     render_home_footer(frame, footer_area, snap, ui);
 }
 
@@ -161,7 +162,12 @@ fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], u
     let hide_at = banner_hide_at(show_token_banner || show_pin_banner, ui);
     let show_conflict_warning = matches!(snap.name_conflict, NameConflict::Degraded { .. });
     let [header_area, logs_area] = Layout::vertical([
-        Constraint::Length(header_height(show_token_banner, show_pin_banner, show_conflict_warning)),
+        Constraint::Length(header_height(
+            show_token_banner,
+            show_pin_banner,
+            show_conflict_warning,
+            snap.listening,
+        )),
         Constraint::Min(3),
     ])
     .areas(frame.area());
@@ -179,6 +185,41 @@ fn render_logs_screen(frame: &mut Frame, snap: &AppSnapshot, logs: &[LogLine], u
         false,
     );
     render_logs(frame, logs_area, logs, ui);
+}
+
+/// The inbound-peer status shown inline in the header (replacing the old connected-peers panel):
+/// who this endpoint is paired with, or that it is waiting / reserved. `None` before listening,
+/// where the node-id line already prompts the user to press Shift+L.
+fn inbound_status_line(snap: &AppSnapshot) -> Option<Line<'static>> {
+    if !snap.listening {
+        return None;
+    }
+    let line = match &snap.inbound {
+        Some(p) if p.connected => Line::from(vec![
+            Span::raw("inbound ← "),
+            Span::styled(
+                short_id(&p.remote_id),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "   path: {}   up {}",
+                p.path.describe(),
+                fmt_elapsed(p.connected_since.elapsed())
+            )),
+        ]),
+        Some(p) => Line::from(vec![
+            Span::raw("inbound: "),
+            Span::styled(
+                format!("reserved for {} (disconnected)", short_id(&p.remote_id)),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            "inbound: waiting for a peer",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    Some(line)
 }
 
 /// One-line footer for the home screen carrying the global key hints (the per-pane
@@ -243,11 +284,16 @@ fn banner_hide_at(showing: bool, ui: &UiState) -> Option<String> {
     Some(at.strftime("%H:%M").to_string())
 }
 
-fn header_height(show_token_banner: bool, show_pin_banner: bool, show_conflict_warning: bool) -> u16 {
-    // Five content rows (app identity, mode/name, streams/fp, node id, dial line) plus
-    // the border. The token *or* PIN banner adds two rows.
+fn header_height(
+    show_token_banner: bool,
+    show_pin_banner: bool,
+    show_conflict_warning: bool,
+    show_inbound: bool,
+) -> u16 {
+    // Five content rows (app identity, mode/name, streams/fp, node id, dial line) plus the border.
+    // The token *or* PIN banner adds two rows; the inbound-peer line (shown while listening) one.
     let base = if show_token_banner || show_pin_banner { 9 } else { 7 };
-    base + if show_conflict_warning { 1 } else { 0 }
+    base + u16::from(show_conflict_warning) + u16::from(show_inbound)
 }
 
 /// The header's optional banner state, bundled to keep `render_header`'s signature small.
@@ -320,7 +366,7 @@ fn render_header(
     // point the user at Shift+L. `(pending)` covers the brief window after start before the
     // endpoint reports its id.
     let node_id_line = if snap.listening {
-        // Truncated to the same short form as the connected-peers table — the full
+        // Truncated to the same short form as the inbound-peer line — the full
         // 64-char id is visual noise (and not needed to pair in any mode).
         vec![Span::raw("node id: "), Span::raw(short_id(endpoint))]
     } else {
@@ -337,8 +383,13 @@ fn render_header(
         Line::from(id_line),
         Line::from(status_line),
         Line::from(node_id_line),
-        dial_header_line(snap, show_dial_hint),
     ];
+    // Who the serve half is paired with (or waiting/reserved) — inline, since there is only ever
+    // one inbound peer now. Shown only while listening.
+    if let Some(inbound) = inbound_status_line(snap) {
+        lines.push(inbound);
+    }
+    lines.push(dial_header_line(snap, show_dial_hint));
 
     if banners.show_token {
         // Freshly generated token, not yet dismissed: surface it so the dialer can
@@ -798,57 +849,6 @@ fn tunnel_row(t: &TunnelRow) -> Row<'static> {
     ])
 }
 
-fn render_peers(frame: &mut Frame, area: Rect, snap: &AppSnapshot) {
-    let title = match snap.role {
-        // The listener serves many peers at once; all currently-connected ones show here.
-        // Both runs a listen half too, so it shows the same inbound-peers list.
-        Role::Listen | Role::Both => " Connected peers ",
-        Role::Dial => " Connection ",
-    };
-    let header = Row::new(["REMOTE ID", "SINCE", "PATH"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
-
-    let rows: Vec<Row> = match snap.role {
-        Role::Listen | Role::Both => {
-            if !snap.peers.is_empty() {
-                snap.peers.iter().map(peer_row).collect()
-            } else {
-                vec![Row::new(["", "(waiting for peers)", ""])]
-            }
-        }
-        Role::Dial => {
-            let remote = snap
-                .peers
-                .first()
-                .map(|p| short_id(&p.remote_id))
-                .unwrap_or_else(|| "-".to_string());
-            vec![Row::new(vec![
-                Cell::from(remote),
-                Cell::from(snap.conn_status.label()),
-                Cell::from(snap.path.describe()),
-            ])]
-        }
-    };
-
-    let widths = [
-        Constraint::Length(16),
-        Constraint::Length(16),
-        Constraint::Min(20),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title));
-    frame.render_widget(table, area);
-}
-
-fn peer_row(p: &PeerRow) -> Row<'static> {
-    Row::new(vec![
-        Cell::from(short_id(&p.remote_id)),
-        Cell::from(fmt_elapsed(p.connected_since.elapsed())),
-        Cell::from(p.path.describe()),
-    ])
-}
-
 fn render_logs(frame: &mut Frame, area: Rect, logs: &[LogLine], ui: &UiState) {
     // `logs` is already the right view for the mode (concise ring, or both rings merged
     // for verbose) — the caller picks which snapshot to pass, so render just paints it.
@@ -942,7 +942,7 @@ fn level_color(level: log::Level) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::PathInfo;
+    use crate::app_state::{InboundPeer, PathInfo};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -965,7 +965,7 @@ mod tests {
             path: PathInfo::establishing(),
             dial_target: None,
             name_conflict: crate::app_state::NameConflict::Inactive,
-            peers: Vec::new(),
+            inbound: None,
             tunnel: None,
             streams_used: 0,
             streams_max: 64,
@@ -1176,14 +1176,55 @@ mod tests {
         assert!(!home.contains("Logs ("));
         assert!(home.contains("l logs"));
 
-        // Logs screen: the log pane is present, peers/tunnels are not.
+        // Logs screen: the log pane is present, the tunnels table is not (the header — including
+        // the inline inbound-peer line — is shared by both screens).
         let logs_ui = UiState {
             screen: Screen::Logs,
             ..Default::default()
         };
         let logs = render_text(&snap, &logs_ui);
         assert!(logs.contains("Logs ("));
-        assert!(!logs.contains("Connected peers"));
+        assert!(!logs.contains("SPEC"));
+    }
+
+    #[test]
+    fn header_shows_paired_peer_then_reservation() {
+        let mut snap = base_snapshot(false, None);
+
+        // Listening but unpaired: the header invites a peer.
+        assert!(
+            render_text(&snap, &UiState::default()).contains("waiting for a peer"),
+            "unpaired header must show it is waiting"
+        );
+
+        let id = "abcdef0123456789abcdef";
+        // Paired and connected: the short id shows on the inbound line.
+        snap.inbound = Some(InboundPeer {
+            remote_id: id.to_string(),
+            connected: true,
+            connected_since: Instant::now(),
+            path: PathInfo::establishing(),
+        });
+        let home = render_text(&snap, &UiState::default());
+        assert!(home.contains("inbound"), "connected header must show inbound");
+        assert!(home.contains(&short_id(id)), "must show the paired peer's short id");
+
+        // Disconnected: the endpoint stays reserved for that peer.
+        snap.inbound = Some(InboundPeer {
+            remote_id: id.to_string(),
+            connected: false,
+            connected_since: Instant::now(),
+            path: PathInfo::establishing(),
+        });
+        assert!(
+            render_text(&snap, &UiState::default()).contains("reserved for"),
+            "disconnected header must show the reservation"
+        );
+
+        // Not listening: no inbound line at all.
+        snap.listening = false;
+        let idle = render_text(&snap, &UiState::default());
+        assert!(!idle.contains("reserved for") && !idle.contains("waiting for a peer"));
     }
 
     #[test]

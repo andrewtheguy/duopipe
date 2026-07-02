@@ -1355,7 +1355,7 @@ async fn handle_connection(
             claim,
         } => {
             auth_as_listener(&conn, tokens, pin_cache.as_ref(), claim).await?;
-            config.status.add_peer(remote_id.to_string());
+            config.status.mark_peer_connected(remote_id.to_string());
             log::info!("Peer {remote_id} authenticated");
         }
     }
@@ -1418,7 +1418,7 @@ async fn handle_connection(
     if is_dialer {
         config.status.set_conn_status(ConnStatus::Closed);
     } else {
-        config.status.remove_peer(&remote_id.to_string());
+        config.status.mark_peer_disconnected(&remote_id.to_string());
     }
     tasks.shutdown().await;
     Ok(())
