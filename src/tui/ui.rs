@@ -216,15 +216,17 @@ fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &Ui
         // The show/hide-secret hint only makes sense while listening — there is no node
         // id / PIN / token banner to toggle before the serve half is up. One-pairing rule:
         // while an outbound dial session exists, listening is unavailable, so drop the
-        // Shift+L hint entirely.
+        // Shift+L hint entirely. The dial header line also carries the Shift-D hint, but it
+        // is the trailing span on a long line and truncates on narrow terminals, so the
+        // always-single-line footer repeats the disconnect/reset action here.
         let (listen, secret_hint) = if snap.listening {
             let secret = if snap.pin_mode { "PIN" } else { "token" };
             (
-                "Shift+L stop listening · ".to_string(),
+                "Shift+L stop listening · Shift+D reset · ".to_string(),
                 format!(" · h show/hide {secret}"),
             )
         } else if snap.dial_target.is_some() {
-            (String::new(), String::new())
+            ("Shift+D disconnect · ".to_string(), String::new())
         } else {
             ("Shift+L start listening · ".to_string(), String::new())
         };
@@ -1294,6 +1296,24 @@ mod tests {
         assert!(text.contains("path: establishing…"));
         // An active session offers disconnect (not connect) on the dial header line.
         assert!(text.contains("Shift-D disconnect"));
+    }
+
+    #[test]
+    fn footer_advertises_disconnect_while_dialing() {
+        // While a dial session exists (incl. the Connecting phase) the footer must carry the
+        // disconnect action — the dial header line has it too, but it truncates on narrow
+        // terminals, so the always-single-line footer is the reliable place.
+        let mut snap = base_snapshot(false, None);
+        snap.listening = false;
+        snap.dial_target = Some("homelab".to_string());
+        snap.conn_status = ConnStatus::Connecting;
+
+        let text = render_text(&snap, &UiState::default());
+
+        assert!(
+            text.contains("Shift+D disconnect"),
+            "footer must advertise Shift+D disconnect while dialing"
+        );
     }
 
     #[test]
