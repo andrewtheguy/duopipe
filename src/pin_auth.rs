@@ -162,14 +162,16 @@ where
 /// already been read off the stream (the listener reads it to choose the auth method).
 ///
 /// `candidates` are the PIN auth keypairs for the recent rotation buckets; the dialer's proof is
-/// verified against each. Returns `Ok(())` when one matches (and our proof has been sent), else
-/// sends a rejection and returns `Err`.
+/// verified against each. Returns `Ok(matched_key)` — the candidate key that verified the proof —
+/// when one matches (and our proof has been sent), so the caller can retain it to re-authenticate a
+/// reconnecting peer after the PIN has rotated out of the recent cache. Otherwise sends a rejection
+/// and returns `Err`.
 pub async fn listener_handshake<W, R>(
     send: &mut W,
     recv: &mut R,
     candidates: &[Keys],
     nonce_d: &str,
-) -> Result<()>
+) -> Result<Keys>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -191,7 +193,7 @@ where
         Some(keys) => {
             let proof_l = seal_proof(keys, Direction::Listener, nonce_d, &nonce_l)?;
             write_frame(send, &encode_pin_confirm(&PinConfirm::accepted(proof_l))?).await?;
-            Ok(())
+            Ok((*keys).clone())
         }
         None => {
             write_frame(
@@ -272,7 +274,9 @@ mod tests {
             async move { dialer_handshake(&mut a_write, &mut a_read, &dialer).await };
         let listener_task = async move {
             let nonce_d = read_pin_request(&mut b_read).await?;
-            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d).await
+            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d)
+                .await
+                .map(|_| ())
         };
         tokio::join!(dialer_task, listener_task)
     }
