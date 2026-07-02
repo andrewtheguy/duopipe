@@ -1,18 +1,22 @@
 //! iroh peer runtime: on-demand serving plus on-demand dial sessions.
 //!
-//! Interactive peers run as `Role::Both`: a `Role::Listen` half that serves inbound
-//! peers (started on-demand via Shift+L; idle until then), plus a dial manager that
-//! owns at most one outbound `Role::Dial` session. Within any one connection, only the dialer opens its
-//! single tunnel: the tunnel binds a local listener and, per accepted connection,
-//! asks the connected peer to connect out over TCP to a bare `host:port` source,
-//! bridging the two. The tunnel is activated on demand (the TUI sends start/stop
-//! commands); nothing starts automatically unless `DUOPIPE_AUTOSTART_TUNNELS` is
-//! set (test mode only).
+//! Interactive peers run as `Role::Both`: a `Role::Listen` half that serves an inbound
+//! peer (started on-demand via Shift+L; idle until then), plus a dial manager that
+//! owns at most one outbound `Role::Dial` session. A run holds ONE pairing: listening
+//! and dialing are mutually exclusive (see `AppState::can_dial`/`can_listen`), enforced
+//! in both supervisors as well as the TUI.
+//!
+//! Once paired, the proxy is **symmetric**: each side can bind a loopback-only SOCKS5
+//! proxy whose CONNECTs open one QUIC stream per connection, tagged
+//! [`StreamHello::SocksConnect`], and the *other* side connects out over TCP to that
+//! `host:port` on its own network (domains resolve remotely), bridging the two. The
+//! proxy is activated on demand (the TUI sends start/stop commands); nothing starts
+//! automatically unless `DUOPIPE_AUTOSTART_SOCKS` is set (test mode only).
 //!
 //! Every non-auth stream begins with a [`StreamHello`] so the acceptor can route
 //! it without positional assumptions. Trust model: once token auth passes, the
 //! peer is fully trusted — the acceptor connects out to any `host:port` it
-//! requests (there is no source allowlist).
+//! requests (there is no destination allowlist).
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -30,14 +34,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app_state::{
     AppState, ConnStatus, DialCommand, DialTarget, ListenCommand, ListenStatus, NameCommand,
-    NameConflict, Role, TunnelCommand, TunnelStatus,
+    NameConflict, Role, SocksCommand, SocksStatus,
 };
 use crate::auth::is_token_valid;
-use crate::config::{TransportTuning, TunnelEntry};
+use crate::config::TransportTuning;
 use crate::error::{ErrorCategory, TunnelError};
-use crate::net::{
-    resolve_all_target_addrs, resolve_listen_addrs, try_connect_tcp, tune_tcp_stream,
-};
+use crate::net::{order_by_loopback_preference, try_connect_tcp, tune_tcp_stream};
+use crate::socks5;
+use tokio::net::lookup_host;
 
 use crate::iroh_mode::endpoint::{
     ALPN, connect_to_server, create_client_endpoint, create_server_endpoint, validate_relay_only,
@@ -83,7 +87,13 @@ impl RecentPins {
 /// quick PIN mode, without re-typing a PIN that may since have rotated). A fresh listen session
 /// mints a new endpoint id and a new (empty) claim.
 #[derive(Clone, Default)]
-struct PairClaim(Arc<parking_lot::Mutex<Option<ClaimedPeer>>>);
+struct PairClaim {
+    peer: Arc<parking_lot::Mutex<Option<ClaimedPeer>>>,
+    /// Fires the first time a peer commits the claim. The PIN publisher watches this so it can
+    /// stop rotating/publishing (and clear the displayed code) once paired — no more peers will
+    /// be accepted this session.
+    paired: CancellationToken,
+}
 
 /// The peer that holds a [`PairClaim`], plus the material needed to let it reconnect.
 #[derive(Clone)]
@@ -99,7 +109,13 @@ struct ClaimedPeer {
 impl PairClaim {
     /// Snapshot the current claim (cheap clone) for the pre-auth gate.
     fn peek(&self) -> Option<ClaimedPeer> {
-        self.0.lock().clone()
+        self.peer.lock().clone()
+    }
+
+    /// A token that is cancelled the first time a peer commits the claim, so watchers (the PIN
+    /// publisher) can react to pairing without polling.
+    fn paired_signal(&self) -> CancellationToken {
+        self.paired.clone()
     }
 
     /// Commit a freshly authenticated peer as the pair. Returns `true` if `node_id` now holds the
@@ -107,12 +123,14 @@ impl PairClaim {
     /// already held it (a reconnect/retry). Returns `false` if another node id won the claim first
     /// (a race between two first-time dialers), in which case the caller must reject this peer.
     fn commit(&self, node_id: EndpointId, pin_key: Option<nostr_sdk::Keys>) -> bool {
-        let mut g = self.0.lock();
+        let mut g = self.peer.lock();
         match g.as_ref() {
             Some(c) if c.node_id != node_id => false,
             Some(_) => true,
             None => {
                 *g = Some(ClaimedPeer { node_id, pin_key });
+                // First pairing: signal watchers (the PIN publisher stops here).
+                self.paired.cancel();
                 true
             }
         }
@@ -179,9 +197,9 @@ pub struct PeerConfig {
     /// EndpointId of the peer to dial (required for `Dial`; the dial half's target
     /// for `Both` in quick mode).
     pub peer_node_id: Option<EndpointId>,
-    /// When true, start every configured tunnel as soon as a connection is up
-    /// (set from `DUOPIPE_AUTOSTART_TUNNELS` in test mode; see `DUOPIPE_TEST_MODE`).
-    pub autostart_tunnels: bool,
+    /// When true, start the configured SOCKS5 proxy as soon as a connection is up
+    /// (set from `DUOPIPE_AUTOSTART_SOCKS` in test mode; see `DUOPIPE_TEST_MODE`).
+    pub autostart_socks: bool,
     /// The shared auth token (presented when dialing, accepted when listening), and the
     /// rendezvous secret for nostr node-id discovery. `None` in quick **PIN** mode, which uses
     /// no token — the PIN authenticates the connection in-band and the listener accepts only PIN
@@ -217,7 +235,7 @@ pub struct PeerConfig {
     pub relay_only: bool,
     /// Custom DNS server, or "none" to disable DNS discovery.
     pub dns_server: Option<String>,
-    /// Maximum concurrent forwarded streams across all tunnels (None = default).
+    /// Maximum concurrent proxied streams (None = default).
     pub max_streams: Option<usize>,
     /// Transport layer tuning.
     pub transport: TransportTuning,
@@ -237,7 +255,7 @@ impl std::fmt::Debug for PeerConfig {
         f.debug_struct("PeerConfig")
             .field("role", &self.role.label())
             .field("peer_node_id", &self.peer_node_id)
-            .field("autostart_tunnels", &self.autostart_tunnels)
+            .field("autostart_socks", &self.autostart_socks)
             .field("auth_token", &"[REDACTED]")
             .field("nostr_relays", &self.nostr_relays)
             .field("nostr_discovery", &self.nostr_discovery)
@@ -287,7 +305,6 @@ fn split_serve_dial_config(config: &PeerConfig) -> (PeerConfig, PeerConfig) {
     let mut listen = config.clone();
     listen.role = Role::Listen;
     listen.peer_node_id = None;
-    listen.autostart_tunnels = false;
     // The listen endpoint owns the displayed/published node id.
     listen.report_endpoint_id = true;
 
@@ -373,6 +390,17 @@ async fn run_dial_manager(config: PeerConfig, semaphore: Arc<Semaphore>) -> Resu
             _ = shutdown.cancelled() => break,
             cmd = dial_rx.recv() => match cmd {
                 Ok(DialCommand::Connect(target)) => {
+                    // One-pairing rule (cross-half): refuse to dial while this run is the listening
+                    // side of a pairing. The TUI hides Shift+C in that state; this guards
+                    // test-mode/races. The "no re-point while already dialing" half of the rule is a
+                    // TUI-level gate (`can_dial`) — it must NOT be re-checked here, since the connect
+                    // form optimistically sets `dial_target` before this command is processed.
+                    if config.status.listening() {
+                        log::warn!(
+                            "Refusing to dial: this run is already listening (a run holds one pairing)."
+                        );
+                        continue;
+                    }
                     // Single session: tear down any current one first.
                     if let Some((tok, h)) = current.take() {
                         tok.cancel();
@@ -643,6 +671,14 @@ async fn run_listen_supervisor(config: PeerConfig, semaphore: Arc<Semaphore>) ->
             _ = shutdown.cancelled() => break,
             cmd = listen_rx.recv() => match cmd {
                 Ok(ListenCommand::Start) => {
+                    // One-pairing rule: refuse to start listening while an outbound dial session
+                    // exists. The TUI hides Shift+L in that state; this guards test-mode/races.
+                    if !config.status.can_listen() {
+                        log::warn!(
+                            "Refusing to listen: this run has an active dial session (a run holds one pairing)."
+                        );
+                        continue;
+                    }
                     if current.is_none() {
                         let tok = shutdown.child_token();
                         config.status.set_listen_status(ListenStatus::Listening);
@@ -777,6 +813,12 @@ async fn run_listen(
     // name-based node-id discovery above; runs only when explicitly enabled.
     let recent_pins = RecentPins::default();
     let pin_cache = config.pin_rendezvous.then(|| recent_pins.clone());
+
+    // This serve endpoint pairs with one peer at a time (all modes). The claim is empty until the
+    // first dialer authenticates and lives for this whole listen session — a Shift+L stop tears
+    // `run_listen` down and starts the next session with a fresh endpoint id and a fresh claim.
+    let claim = PairClaim::default();
+
     let _pin_publisher = if config.pin_rendezvous {
         Some(PublisherGuard(tokio::spawn(crate::logging::inherit_source(
             run_pin_publisher(
@@ -785,6 +827,8 @@ async fn run_listen(
                 config.nostr_relays.clone(),
                 config.status.clone(),
                 listen_shutdown.clone(),
+                // Once a peer pairs, stop rotating/publishing PINs — no more peers are accepted.
+                claim.paired_signal(),
             ),
         ))))
     } else {
@@ -794,11 +838,6 @@ async fn run_listen(
     let shutdown = listen_shutdown;
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
-
-    // This serve endpoint pairs with one peer at a time (all modes). The claim is empty until the
-    // first dialer authenticates and lives for this whole listen session — a Shift+L stop tears
-    // `run_listen` down and starts the next session with a fresh endpoint id and a fresh claim.
-    let claim = PairClaim::default();
 
     loop {
         while connection_tasks.try_join_next().is_some() {}
@@ -1075,8 +1114,17 @@ async fn run_pin_publisher(
     relays: Vec<String>,
     state: Arc<AppState>,
     shutdown: CancellationToken,
+    paired: CancellationToken,
 ) {
     loop {
+        // A peer may already have paired (e.g. a reconnect landed before this loop turn). Once
+        // paired, the listener accepts no further peers, so publishing a fresh PIN is pointless
+        // and misleading — clear the header and stop.
+        if paired.is_cancelled() {
+            state.clear_current_pin();
+            break;
+        }
+
         let pin = crate::pin::generate_pin();
         let bucket = crate::pin::current_bucket();
         let remaining = crate::pin::secs_until_next_bucket();
@@ -1096,10 +1144,15 @@ async fn run_pin_publisher(
         }
 
         // Sleep to the next bucket boundary, then rotate. `max(1)` avoids a busy spin if we
-        // happen to land exactly on the boundary.
+        // happen to land exactly on the boundary. Wake early on shutdown or when a peer pairs.
         let sleep_for = Duration::from_secs(crate::pin::secs_until_next_bucket().max(1));
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = paired.cancelled() => {
+                // Paired mid-cycle: drop the now-stale PIN from the header and stop publishing.
+                state.clear_current_pin();
+                break;
+            }
             _ = tokio::time::sleep(sleep_for) => {}
         }
     }
@@ -1367,9 +1420,9 @@ async fn handle_connection(
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
-    // Acceptor side (both roles): accept incoming tunnel requests from the peer and
-    // connect out (the peer is trusted once auth passed — no source allowlist).
-    // Streams are capped by the global semaphore shared across all peers.
+    // Acceptor side (both roles): accept SOCKS connect-out requests from the peer and
+    // connect out (the peer is trusted once auth passed — no destination allowlist).
+    // Streams are capped by the global semaphore.
     {
         let conn = conn.clone();
         let semaphore = semaphore.clone();
@@ -1380,25 +1433,24 @@ async fn handle_connection(
         }));
     }
 
-    // Requester side (dialing side only): a dialer drives a single connection, so it
-    // owns the tunnel table and supervises start/stop of its own tunnels. The serve
-    // half handles many peers at once and initiates no tunnels — there is no single
-    // connection a tunnel could be bound to — so it only runs the acceptor above.
-    if is_dialer {
-        config.status.reset_tunnel_status();
+    // Local SOCKS5 proxy (both roles): the proxy is symmetric — either side may bind its
+    // own loopback proxy and open connect-out streams. Each connection runs a supervisor
+    // that starts/stops the proxy on TUI command.
+    {
+        config.status.reset_socks_status();
         // Subscribe before spawning so an autostart burst cannot race the subscription.
-        let command_rx = config.status.subscribe_commands();
+        let command_rx = config.status.subscribe_socks();
         {
             let conn = conn.clone();
             let semaphore = semaphore.clone();
             let status = config.status.clone();
             tasks.spawn(crate::logging::inherit_source(async move {
-                tunnel_supervisor(conn, semaphore, status, command_rx).await;
+                socks_supervisor(conn, semaphore, status, command_rx).await;
             }));
         }
-        // Optionally autostart the configured tunnel (non-interactive/test mode).
-        if config.autostart_tunnels && config.status.has_tunnel() {
-            config.status.send_command(TunnelCommand::Start);
+        // Optionally autostart the configured proxy (non-interactive/test mode).
+        if config.autostart_socks && config.status.has_socks() {
+            config.status.send_socks_cmd(SocksCommand::Start);
         }
     }
 
@@ -1424,16 +1476,16 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Supervise this peer's single tunnel over one connection. Listens for
-/// [`TunnelCommand`]s and starts/stops the tunnel, tracking a cancellation token
+/// Supervise this peer's local SOCKS5 proxy over one connection. Listens for
+/// [`SocksCommand`]s and starts/stops the proxy, tracking a cancellation token
 /// while it runs so a `Stop` (or the connection closing) frees the bound local
-/// port. The tunnel spec is read live from [`AppState`] so a runtime change is
-/// visible without restarting the supervisor.
-async fn tunnel_supervisor(
+/// port. The port is read live from [`AppState`] so a runtime change is visible
+/// without restarting the supervisor.
+async fn socks_supervisor(
     conn: Arc<iroh::endpoint::Connection>,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
-    mut command_rx: broadcast::Receiver<TunnelCommand>,
+    mut command_rx: broadcast::Receiver<SocksCommand>,
 ) {
     let mut running: Option<CancellationToken> = None;
     // The task signals here when it ends on its own (error/EOF), so the supervisor
@@ -1443,11 +1495,11 @@ async fn tunnel_supervisor(
     loop {
         tokio::select! {
             cmd = command_rx.recv() => match cmd {
-                Ok(TunnelCommand::Start) => {
+                Ok(SocksCommand::Start) => {
                     if running.is_some() {
                         continue; // already running
                     }
-                    let Some(req) = status.tunnel() else { continue };
+                    let Some(port) = status.socks_port() else { continue };
                     let token = CancellationToken::new();
                     running = Some(token.clone());
 
@@ -1457,7 +1509,7 @@ async fn tunnel_supervisor(
                     let done_tx = done_tx.clone();
                     tokio::spawn(crate::logging::inherit_source(async move {
                         let outcome = tokio::select! {
-                            r = run_tunnel(conn.clone(), req, semaphore, status.clone()) => Some(r),
+                            r = run_socks_proxy(conn.clone(), port, semaphore, status.clone()) => Some(r),
                             _ = token.cancelled() => None,
                             // Tie the listener's lifetime to the connection so it
                             // never outlives it (which would leak the bound port).
@@ -1465,24 +1517,25 @@ async fn tunnel_supervisor(
                         };
                         match outcome {
                             Some(Err(e)) => {
-                                status.update_tunnel(TunnelStatus::Error, e.to_string());
-                                log::warn!("Tunnel ended: {}", e);
+                                status.update_socks(SocksStatus::Error, e.to_string());
+                                log::warn!("SOCKS proxy ended: {}", e);
                             }
                             // Stopped, connection closed, or the listen loop ended cleanly.
                             Some(Ok(())) | None => {
-                                status.update_tunnel(TunnelStatus::Idle, String::new());
+                                status.update_socks(SocksStatus::Idle, String::new());
                             }
                         }
+                        status.set_socks_bound(None);
                         let _ = done_tx.send(());
                     }));
                 }
-                Ok(TunnelCommand::Stop) => {
+                Ok(SocksCommand::Stop) => {
                     if let Some(token) = running.take() {
                         token.cancel();
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("Tunnel command channel lagged by {n}");
+                    log::warn!("SOCKS command channel lagged by {n}");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -1694,15 +1747,15 @@ async fn handle_incoming_stream(
     let hello = decode_stream_hello(&hello_bytes).context("Invalid stream hello")?;
 
     match hello {
-        StreamHello::LocalForward { source, .. } => {
+        StreamHello::SocksConnect { host, port, .. } => {
             // The peer is trusted once auth passed, so we connect out to whatever
-            // source it requests — no allowlist check. Streams are still capped by
+            // host:port it requests — no allowlist check. Streams are still capped by
             // the global session permit.
             let Some(permit) = acquire_or_reject(&semaphore, &mut send).await? else {
                 return Ok(());
             };
             let _permit = permit;
-            connect_side(send, recv, &source).await
+            socks_connect_side(send, recv, &host, port).await
         }
     }
 }
@@ -1716,7 +1769,7 @@ async fn acquire_or_reject(
         Ok(permit) => Ok(Some(permit)),
         Err(_) => {
             log::warn!("Session limit reached, rejecting stream");
-            let ack = StreamAck::rejected("Session limit reached");
+            let ack = StreamAck::rejected(socks5::REP_GENERAL_FAILURE, "Session limit reached");
             let _ = send.write_all(&encode_stream_ack(&ack)?).await;
             let _ = send.finish();
             Ok(None)
@@ -1724,15 +1777,46 @@ async fn acquire_or_reject(
     }
 }
 
-/// Connect out over TCP to `dest` (a bare `host:port`) and bridge it with the
-/// stream (acceptor / connect side).
-async fn connect_side(
+/// Resolve `host:port` on THIS side (remote DNS for domains) and connect out over
+/// TCP, then bridge with the stream (acceptor / connect side). On failure, reply
+/// with the mapped SOCKS5 REP code so the opener relays it to its local client.
+async fn socks_connect_side(
     mut send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
-    dest: &str,
+    host: &str,
+    port: u16,
 ) -> Result<()> {
-    let target_addrs = resolve_all_target_addrs(dest).await?;
-    match try_connect_tcp(&target_addrs).await {
+    let dest = format!("{host}:{port}");
+    // Resolve on this peer's network — IP literals (incl. bare IPv6) and domains alike.
+    let resolved = match lookup_host((host, port)).await {
+        Ok(iter) => {
+            let addrs: Vec<SocketAddr> = iter.collect();
+            if addrs.is_empty() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::HostUnreachable,
+                    "no addresses resolved",
+                ))
+            } else {
+                Ok(order_by_loopback_preference(addrs))
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    let addrs = match resolved {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            let ack = StreamAck::rejected(
+                socks5::rep_for_io_error(&e),
+                format!("resolve failed: {e}"),
+            );
+            send.write_all(&encode_stream_ack(&ack)?).await?;
+            let _ = send.finish();
+            anyhow::bail!("Failed to resolve {}: {}", dest, e);
+        }
+    };
+
+    match try_connect_tcp(&addrs).await {
         Ok(tcp_stream) => {
             send.write_all(&encode_stream_ack(&StreamAck::accepted())?)
                 .await?;
@@ -1741,7 +1825,13 @@ async fn connect_side(
             log::info!("<- TCP connection to {} closed", dest);
         }
         Err(e) => {
-            let ack = StreamAck::rejected(format!("connect failed: {}", e));
+            // `try_connect_tcp` returns an anyhow error; map its io kind when present
+            // (usually connection refused) so the client sees a meaningful REP code.
+            let rep = e
+                .downcast_ref::<std::io::Error>()
+                .map(socks5::rep_for_io_error)
+                .unwrap_or(socks5::REP_CONN_REFUSED);
+            let ack = StreamAck::rejected(rep, format!("connect failed: {e}"));
             send.write_all(&encode_stream_ack(&ack)?).await?;
             let _ = send.finish();
             anyhow::bail!("Failed to connect to TCP {}: {}", dest, e);
@@ -1752,56 +1842,74 @@ async fn connect_side(
 }
 
 // ============================================================================
-// Tunnel requests: opener / listen side
+// Local SOCKS5 proxy: opener side
 // ============================================================================
 
-/// Run one tunnel: bind the local `local_listen` address and, for each
-/// incoming connection, open a stream asking the peer to connect out to
-/// `remote_source`. Runs until the listener errors or the caller cancels it
-/// (freeing the bound port).
-async fn run_tunnel(
+/// Timeout for the local SOCKS5 handshake + connect-out ack, so a silent local
+/// client can't pin a stream permit indefinitely before the bridge starts.
+const SOCKS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run the local SOCKS5 proxy over one connection: bind loopback (IPv4 + IPv6) at
+/// `port` (0 = OS-assigned), then per client run the SOCKS5 handshake, open a
+/// connect-out stream, await the ack, reply, and bridge. Runs until it errors or
+/// the caller cancels it (freeing the bound port).
+async fn run_socks_proxy(
     conn: Arc<iroh::endpoint::Connection>,
-    req: TunnelEntry,
+    port: u16,
     semaphore: Arc<Semaphore>,
     status: Arc<AppState>,
 ) -> Result<()> {
-    let hello = StreamHello::local_forward(&req.remote_source);
-    let listen_addrs = resolve_listen_addrs(&req.local_listen)
-        .await
-        .with_context(|| format!("Invalid tunnel listen address '{}'", req.local_listen))?;
-
-    let listeners = bind_tcp_listeners(&listen_addrs, &req.remote_source).await?;
-    status.update_tunnel(TunnelStatus::Listening, req.local_listen.clone());
-    tcp_accept_and_tunnel(conn, listeners, hello, semaphore).await
+    let listeners = bind_socks_listeners(port).await?;
+    // Surface the actually-bound address (with port 0, the OS-assigned port).
+    let bound = listeners
+        .iter()
+        .find_map(|l| l.local_addr().ok())
+        .expect("at least one bound listener");
+    status.update_socks(SocksStatus::Listening, bound.to_string());
+    status.set_socks_bound(Some(bound));
+    socks_accept_loop(conn, listeners, semaphore).await
 }
 
-// ============================================================================
-// Shared listen-side helpers
-// ============================================================================
+/// Bind loopback SOCKS listeners on IPv4 (127.0.0.1) and IPv6 (::1). With `port == 0`
+/// the OS assigns a port to the first bound family and the second reuses it, so both
+/// families share one port. Tolerates one family failing (e.g. no IPv6 loopback).
+async fn bind_socks_listeners(port: u16) -> Result<Vec<TcpListener>> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
-async fn bind_tcp_listeners(listen_addrs: &[SocketAddr], label: &str) -> Result<Vec<TcpListener>> {
-    let mut listeners = Vec::with_capacity(listen_addrs.len());
-    for addr in listen_addrs {
-        match TcpListener::bind(addr).await {
-            Ok(listener) => {
-                log::info!("Listening on TCP {} -> {}", addr, label);
-                listeners.push(listener);
-            }
-            Err(e) => log::warn!("Failed to bind TCP listener on {}: {}", addr, e),
+    let mut listeners = Vec::with_capacity(2);
+    // Bind IPv4 first; if port is 0 the OS picks one and IPv6 reuses it.
+    let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    match TcpListener::bind(v4).await {
+        Ok(l) => {
+            log::info!("SOCKS5 proxy listening on {}", l.local_addr()?);
+            listeners.push(l);
         }
+        Err(e) => log::warn!("Failed to bind SOCKS listener on {}: {}", v4, e),
+    }
+    let v6_port = listeners
+        .first()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(port);
+    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, v6_port));
+    match TcpListener::bind(v6).await {
+        Ok(l) => {
+            log::info!("SOCKS5 proxy listening on {}", l.local_addr()?);
+            listeners.push(l);
+        }
+        Err(e) => log::debug!("Failed to bind SOCKS listener on {}: {}", v6, e),
     }
     if listeners.is_empty() {
-        anyhow::bail!("Failed to bind any TCP listener for {}", label);
+        anyhow::bail!("Failed to bind any loopback SOCKS listener on port {}", port);
     }
     Ok(listeners)
 }
 
-/// Accept TCP connections from the given listeners; per connection open a data
-/// stream (tagged with `hello`) and bridge it.
-async fn tcp_accept_and_tunnel(
+/// Accept local TCP connections from the SOCKS listeners; per connection acquire a
+/// permit and handle the SOCKS5 client.
+async fn socks_accept_loop(
     conn: Arc<iroh::endpoint::Connection>,
     listeners: Vec<TcpListener>,
-    hello: StreamHello,
     semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     use tokio::sync::mpsc;
@@ -1819,7 +1927,7 @@ async fn tcp_accept_and_tunnel(
                             break;
                         }
                     }
-                    Err(e) => log::warn!("Failed to accept TCP connection: {}", e),
+                    Err(e) => log::warn!("Failed to accept SOCKS connection: {}", e),
                 }
             }
         }));
@@ -1831,16 +1939,15 @@ async fn tcp_accept_and_tunnel(
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                log::warn!("Session limit reached, dropping connection from {}", peer);
+                log::warn!("Session limit reached, dropping SOCKS connection from {}", peer);
                 continue;
             }
         };
         let conn = conn.clone();
-        let hello = hello.clone();
         conn_tasks.spawn(crate::logging::inherit_source(async move {
             let _permit = permit;
-            if let Err(e) = open_tcp_data_stream(&conn, hello, tcp_stream).await {
-                log::warn!("Tunnel for {} failed: {}", peer, e);
+            if let Err(e) = handle_socks_client(&conn, tcp_stream).await {
+                log::debug!("SOCKS client {} failed: {}", peer, e);
             }
         }));
         while conn_tasks.try_join_next().is_some() {}
@@ -1851,32 +1958,64 @@ async fn tcp_accept_and_tunnel(
     Ok(())
 }
 
-/// Open a data stream, send the hello, await the ack, then bridge the TCP stream.
-async fn open_tcp_data_stream(
+/// Handle one local SOCKS5 client: negotiate, read the CONNECT target, open a
+/// connect-out stream to the peer, relay the peer's REP to the client, then bridge.
+async fn handle_socks_client(
     conn: &iroh::endpoint::Connection,
-    hello: StreamHello,
-    tcp_stream: TcpStream,
+    mut tcp: TcpStream,
 ) -> Result<()> {
-    let (mut send, mut recv) = open_bi_with_retry(conn).await?;
-    send.write_all(&encode_stream_hello(&hello)?).await?;
-    expect_ack(&mut recv).await?;
-    bridge_streams(recv, send, tcp_stream).await
+    // Bound the whole pre-bridge phase so a stalled client can't hold the permit.
+    let (send, recv, ack) = match tokio::time::timeout(SOCKS_SETUP_TIMEOUT, async {
+        socks5::negotiate_method(&mut tcp).await?;
+        // read_connect_request writes its own SOCKS error replies before erroring.
+        let target = socks5::read_connect_request(&mut tcp).await?;
+        let (mut send, mut recv) = open_bi_with_retry(conn)
+            .await
+            .map_err(|e| std::io::Error::other(format!("open stream: {e}")))?;
+        let hello = StreamHello::socks_connect(target.host(), target.port());
+        let bytes = encode_stream_hello(&hello)
+            .map_err(|e| std::io::Error::other(format!("encode hello: {e}")))?;
+        send.write_all(&bytes).await?;
+        let ack = read_ack(&mut recv)
+            .await
+            .map_err(|e| std::io::Error::other(format!("read ack: {e}")))?;
+        Ok::<_, std::io::Error>((send, recv, ack))
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            // Best-effort: tell the local client the attempt failed before dropping.
+            let _ = socks5::write_reply(&mut tcp, socks5::REP_GENERAL_FAILURE).await;
+            return Err(e.into());
+        }
+        Err(_) => {
+            let _ = socks5::write_reply(&mut tcp, socks5::REP_GENERAL_FAILURE).await;
+            anyhow::bail!("SOCKS setup timed out");
+        }
+    };
+
+    // Relay the peer's connect outcome verbatim into the SOCKS reply.
+    socks5::write_reply(&mut tcp, ack.rep).await?;
+    if !ack.accepted {
+        log::debug!(
+            "Peer refused connect (rep {:#04x}): {}",
+            ack.rep,
+            ack.reason.as_deref().unwrap_or("unknown")
+        );
+        return Ok(());
+    }
+    bridge_streams(recv, send, tcp).await
 }
 
-/// Read a [`StreamAck`] from the stream and fail if it was rejected.
-async fn expect_ack(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
+/// Read a [`StreamAck`] from the stream. Returns the ack (accepted or rejected) so
+/// the caller can relay its REP code; only a transport/decode failure errors.
+async fn read_ack(recv: &mut iroh::endpoint::RecvStream) -> Result<StreamAck> {
     let ack_bytes = tokio::time::timeout(ACK_TIMEOUT, read_length_prefixed(recv))
         .await
         .context("Timed out waiting for stream ack")?
         .context("Failed to read stream ack")?;
-    let ack = decode_stream_ack(&ack_bytes).context("Invalid stream ack")?;
-    if !ack.accepted {
-        anyhow::bail!(
-            "Peer rejected stream: {}",
-            ack.reason.as_deref().unwrap_or("Unknown")
-        );
-    }
-    Ok(())
+    decode_stream_ack(&ack_bytes).context("Invalid stream ack")
 }
 
 #[cfg(test)]
@@ -1896,7 +2035,7 @@ mod tests {
         Arc::new(PeerConfig {
             role,
             peer_node_id: None,
-            autostart_tunnels: false,
+            autostart_socks: false,
             auth_token: Some(token.to_string()),
             nostr_relays: vec![],
             nostr_discovery: false,
@@ -1931,7 +2070,7 @@ mod tests {
         let both = PeerConfig {
             role: Role::Both,
             peer_node_id: None,
-            autostart_tunnels: true,
+            autostart_socks: true,
             auth_token: Some("tok".to_string()),
             nostr_relays: vec![],
             nostr_discovery: true,
@@ -1956,7 +2095,9 @@ mod tests {
         // Listen publishes under its own name and owns the reported node id.
         assert_eq!(listen.nostr_identifier.as_deref(), Some("homelab"));
         assert!(listen.report_endpoint_id);
-        assert!(!listen.autostart_tunnels);
+        // Autostart (test-mode) applies to the symmetric proxy on both halves.
+        assert!(listen.autostart_socks);
+        assert!(dial.autostart_socks);
 
         // The dial half carries no fixed target (it dials runtime requests) and its
         // endpoint id is internal.
@@ -2251,10 +2392,62 @@ mod tests {
 
         let claim = PairClaim::default();
         assert!(claim.peek().is_none(), "starts unclaimed");
+        let paired = claim.paired_signal();
+        assert!(!paired.is_cancelled(), "paired signal is idle before pairing");
         assert!(claim.commit(id_a, None), "first committer wins");
+        assert!(paired.is_cancelled(), "first commit fires the paired signal");
         assert!(claim.commit(id_a, None), "same peer may re-commit (reconnect)");
         assert!(!claim.commit(id_b, None), "a different peer is refused");
         assert_eq!(claim.peek().map(|c| c.node_id), Some(id_a));
+    }
+
+    /// The PIN publisher stops and clears the displayed code the moment a peer pairs: if the
+    /// paired signal is already fired, it must not publish or set a PIN. Fully offline — it
+    /// returns before ever touching a relay.
+    #[tokio::test]
+    async fn pin_publisher_stops_once_paired() {
+        let ep = hermetic_endpoint().await;
+        let node_id = ep.id();
+        ep.close().await;
+
+        let state = AppState::new(
+            Role::Listen,
+            false,
+            LogBuffer::new(16),
+            None,
+            false,
+            None,
+            false,
+        );
+        // Simulate a code already on the header from a prior rotation.
+        state.set_current_pin("test-pin".into(), Instant::now() + Duration::from_secs(60));
+        assert!(state.snapshot().current_pin.is_some());
+
+        // A peer has paired: fire the signal before the publisher runs.
+        let claim = PairClaim::default();
+        assert!(claim.commit(node_id, None));
+        let paired = claim.paired_signal();
+
+        // Publisher must exit promptly (its top-of-loop guard trips) and clear the PIN, without
+        // hanging or reaching the network.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_pin_publisher(
+                node_id,
+                RecentPins::default(),
+                Vec::new(),
+                state.clone(),
+                CancellationToken::new(),
+                paired,
+            ),
+        )
+        .await
+        .expect("publisher returns once paired");
+
+        assert!(
+            state.snapshot().current_pin.is_none(),
+            "paired publisher clears the stale PIN from the header"
+        );
     }
 
     /// Wait until `ep` publishes a direct address, then return it (hermetic endpoints only
@@ -2388,6 +2581,257 @@ mod tests {
 
         client_a.close().await;
         client_b.close().await;
+        server_ep.close().await;
+    }
+
+    // ========================================================================
+    // End-to-end SOCKS5 proxy tests (hermetic, offline)
+    // ========================================================================
+
+    /// A test PeerConfig with a specific SOCKS port + autostart setting.
+    fn test_peer_config_socks(
+        role: Role,
+        token: &str,
+        socks_port: Option<u16>,
+        autostart_socks: bool,
+    ) -> Arc<PeerConfig> {
+        let status = AppState::new(role, false, LogBuffer::new(16), socks_port, false, None, false);
+        Arc::new(PeerConfig {
+            role,
+            peer_node_id: None,
+            autostart_socks,
+            auth_token: Some(token.to_string()),
+            nostr_relays: vec![],
+            nostr_discovery: false,
+            nostr_identifier: None,
+            pin_rendezvous: false,
+            report_endpoint_id: true,
+            relay_urls: vec![],
+            relay_only: false,
+            dns_server: Some("none".to_string()),
+            max_streams: None,
+            transport: TransportTuning::default(),
+            announce_endpoint: false,
+            config_path: None,
+            status,
+        })
+    }
+
+    /// A loopback TCP echo server (echoes each read back). Returns its address and task.
+    async fn spawn_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+        let addr = listener.local_addr().expect("echo addr");
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Do the SOCKS5 no-auth greeting and return the negotiated stream.
+    async fn socks_greet(proxy: SocketAddr) -> TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = TcpStream::connect(proxy).await.expect("connect proxy");
+        s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00], "no-auth method selected");
+        s
+    }
+
+    /// Send a SOCKS5 CONNECT and return the (stream, REP code).
+    async fn socks_connect(proxy: SocketAddr, req_tail: &[u8]) -> (TcpStream, u8) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = socks_greet(proxy).await;
+        let mut req = vec![0x05, 0x01, 0x00];
+        req.extend_from_slice(req_tail);
+        s.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 10];
+        s.read_exact(&mut reply).await.unwrap();
+        (s, reply[1])
+    }
+
+    /// CONNECT tail for an IPv4 target (ATYP 0x01).
+    fn ipv4_tail(addr: SocketAddr) -> Vec<u8> {
+        let SocketAddr::V4(v4) = addr else {
+            panic!("expected IPv4")
+        };
+        let mut t = vec![0x01];
+        t.extend_from_slice(&v4.ip().octets());
+        t.extend_from_slice(&v4.port().to_be_bytes());
+        t
+    }
+
+    /// CONNECT tail for a domain target (ATYP 0x03), resolved on the remote side.
+    fn domain_tail(host: &str, port: u16) -> Vec<u8> {
+        let mut t = vec![0x03, host.len() as u8];
+        t.extend_from_slice(host.as_bytes());
+        t.extend_from_slice(&port.to_be_bytes());
+        t
+    }
+
+    /// Spawn a paired listener+dialer over hermetic endpoints, with the local SOCKS5
+    /// proxy autostarted on one side (`proxy_on_dialer`). Waits for the proxy to bind
+    /// and returns its address plus the endpoints and tasks (kept alive by the caller).
+    #[allow(clippy::type_complexity)]
+    async fn spawn_socks_pair(
+        token: &str,
+        proxy_on_dialer: bool,
+    ) -> (
+        SocketAddr,
+        Endpoint,
+        Endpoint,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let server_ep = hermetic_endpoint().await;
+        let addr = ready_addr(&server_ep).await;
+        let client_ep = hermetic_endpoint().await;
+
+        let (listener_port, dialer_port) = if proxy_on_dialer {
+            (None, Some(0u16))
+        } else {
+            (Some(0u16), None)
+        };
+
+        let server_cfg =
+            test_peer_config_socks(Role::Listen, token, listener_port, listener_port.is_some());
+        let listener_status = server_cfg.status.clone();
+        let server_ep2 = server_ep.clone();
+        let token_s = token.to_string();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming");
+            let conn = incoming.await.expect("accept");
+            let auth = AuthMode::Listen {
+                tokens: std::iter::once(token_s).collect(),
+                pin_cache: None,
+                claim: PairClaim::default(),
+            };
+            let _ = handle_connection(conn, server_cfg, test_semaphore(), auth).await;
+        });
+
+        let client_conn = client_ep.connect(addr, ALPN).await.expect("connect");
+        let client_cfg =
+            test_peer_config_socks(Role::Dial, token, dialer_port, dialer_port.is_some());
+        let dialer_status = client_cfg.status.clone();
+        let auth = AuthMode::DialToken(token.to_string());
+        let client_task = tokio::spawn(async move {
+            let _ = handle_connection(client_conn, client_cfg, test_semaphore(), auth).await;
+        });
+
+        // Wait for the proxy to bind on the chosen side.
+        let proxy_status = if proxy_on_dialer {
+            dialer_status
+        } else {
+            listener_status
+        };
+        let proxy_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(a) = proxy_status.socks_bound() {
+                    break a;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("proxy bound");
+
+        (proxy_addr, server_ep, client_ep, server_task, client_task)
+    }
+
+    /// Forward direction: a SOCKS5 client on the dialer's proxy reaches a service on
+    /// the listener's network, by both IPv4 literal and (remote-resolved) domain.
+    #[tokio::test]
+    async fn socks_forward_dialer_proxy_reaches_listener_network() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (echo_addr, echo_task) = spawn_echo().await;
+        let (proxy, server_ep, client_ep, server_task, client_task) =
+            spawn_socks_pair("socks-fwd-token", true).await;
+
+        // IPv4 CONNECT round-trips a payload.
+        let (mut s, rep) = socks_connect(proxy, &ipv4_tail(echo_addr)).await;
+        assert_eq!(rep, socks5::REP_SUCCESS, "IPv4 CONNECT accepted");
+        s.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping", "echo round-trip over the proxy");
+        drop(s);
+
+        // Domain CONNECT resolves "localhost" on the acceptor (remote DNS) and succeeds.
+        let (mut s, rep) = socks_connect(proxy, &domain_tail("localhost", echo_addr.port())).await;
+        assert_eq!(rep, socks5::REP_SUCCESS, "domain CONNECT accepted (remote DNS)");
+        s.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        server_task.abort();
+        client_task.abort();
+        echo_task.abort();
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// Reverse direction: a SOCKS5 client on the listener's proxy reaches a service on
+    /// the dialer's network — proves the proxy is symmetric and listener-opened
+    /// post-auth streams work.
+    #[tokio::test]
+    async fn socks_reverse_listener_proxy_reaches_dialer_network() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (echo_addr, echo_task) = spawn_echo().await;
+        let (proxy, server_ep, client_ep, server_task, client_task) =
+            spawn_socks_pair("socks-rev-token", false).await;
+
+        let (mut s, rep) = socks_connect(proxy, &ipv4_tail(echo_addr)).await;
+        assert_eq!(rep, socks5::REP_SUCCESS, "reverse CONNECT accepted");
+        s.write_all(b"echo").await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"echo", "reverse echo round-trip");
+
+        server_task.abort();
+        client_task.abort();
+        echo_task.abort();
+        client_ep.close().await;
+        server_ep.close().await;
+    }
+
+    /// A CONNECT to a closed port surfaces REP_CONN_REFUSED to the local client,
+    /// exercising the remote-side error mapping end-to-end.
+    #[tokio::test]
+    async fn socks_connect_refused_maps_to_rep() {
+        // Bind then immediately drop a listener to obtain a very-likely-closed port.
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let (proxy, server_ep, client_ep, server_task, client_task) =
+            spawn_socks_pair("socks-refused-token", true).await;
+
+        let (_s, rep) = socks_connect(proxy, &ipv4_tail(closed)).await;
+        assert_eq!(
+            rep,
+            socks5::REP_CONN_REFUSED,
+            "connect to a closed port maps to REP_CONN_REFUSED"
+        );
+
+        server_task.abort();
+        client_task.abort();
+        client_ep.close().await;
         server_ep.close().await;
     }
 }

@@ -15,6 +15,7 @@ mod peer_state;
 mod pin;
 mod pin_auth;
 mod signaling;
+mod socks5;
 mod tui;
 
 use crate::app_state::{AppState, Role};
@@ -172,20 +173,30 @@ fn resolve_expected_fingerprint(
 struct TestEnv {
     /// `DUOPIPE_PEER_NODE_ID`: present ⇒ Dial that id; absent ⇒ Listen.
     peer_node_id: Option<String>,
-    /// `DUOPIPE_AUTOSTART_TUNNELS`: auto-start all tunnels once connected.
-    autostart_tunnels: bool,
+    /// `DUOPIPE_AUTOSTART_SOCKS`: auto-start the local SOCKS5 proxy once connected.
+    autostart_socks: bool,
+    /// `DUOPIPE_SOCKS_PORT`: seed the local SOCKS5 proxy port (config-free headless).
+    socks_port: Option<u16>,
 }
 
 impl TestEnv {
     /// Read the gate and, if set, every gated var.
-    fn from_env() -> Option<Self> {
+    fn from_env() -> Result<Option<Self>> {
         if !env_truthy("DUOPIPE_TEST_MODE") {
-            return None;
+            return Ok(None);
         }
-        Some(TestEnv {
+        let socks_port = match env_var_opt("DUOPIPE_SOCKS_PORT") {
+            Some(v) => Some(
+                v.parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("DUOPIPE_SOCKS_PORT must be a number 0..=65535"))?,
+            ),
+            None => None,
+        };
+        Ok(Some(TestEnv {
             peer_node_id: env_var_opt("DUOPIPE_PEER_NODE_ID"),
-            autostart_tunnels: env_truthy("DUOPIPE_AUTOSTART_TUNNELS"),
-        })
+            autostart_socks: env_truthy("DUOPIPE_AUTOSTART_SOCKS"),
+            socks_port,
+        }))
     }
 
     /// Resolve the role-dependent peer for this test run. Role is inferred from
@@ -237,21 +248,38 @@ impl TestEnv {
 /// Run a peer headless (no TUI) for non-interactive test mode. Logs go to stderr
 /// via the env logger; the in-memory `AppState` is still created (the runtime
 /// writes status into it) but nothing renders it. Ctrl-C triggers a clean shutdown.
+/// Reject a headless configuration that asks to autostart the SOCKS proxy without a port:
+/// the runtime gates autostart on a configured port, so this would otherwise start nothing.
+fn validate_autostart_socks(autostart_socks: bool, effective_port: Option<u16>) -> Result<()> {
+    if autostart_socks && effective_port.is_none() {
+        anyhow::bail!(
+            "DUOPIPE_AUTOSTART_SOCKS is set but no SOCKS port is configured; set DUOPIPE_SOCKS_PORT (or `socks_port` in the config)."
+        );
+    }
+    Ok(())
+}
+
 async fn run_peer_headless(
     resolved: ResolvedPeer,
     cfg: &PeerConfig,
     relay_urls: Vec<String>,
     relay_only: bool,
-    autostart_tunnels: bool,
+    autostart_socks: bool,
+    socks_port: Option<u16>,
 ) -> Result<()> {
     let logs = logging::LogBuffer::new(LOG_CAPACITY);
     // Headless test mode is single-role and never uses nostr, so the dial-prompt
-    // fields are inert.
+    // fields are inert. The SOCKS port comes from DUOPIPE_SOCKS_PORT, falling back to
+    // the config so a headless harness needs no config file.
+    let effective_socks_port = socks_port.or(cfg.socks_port);
+    // Fail fast: autostart with no port would silently start nothing (the runtime gates
+    // autostart on a configured port), leaving a headless harness with a dead proxy.
+    validate_autostart_socks(autostart_socks, effective_socks_port).map_err(TunnelError::config)?;
     let state = AppState::new(
         resolved.role,
         resolved.token_generated,
         logs,
-        cfg.tunnel.clone(),
+        effective_socks_port,
         false,
         None,
         false,
@@ -259,7 +287,7 @@ async fn run_peer_headless(
     let peer_cfg = iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        autostart_tunnels,
+        autostart_socks,
         auth_token: resolved.auth_token,
         // Headless test mode never uses nostr: the node id is wired directly via
         // DUOPIPE_PEER_NODE_ID, so tests stay hermetic (no live relays).
@@ -327,7 +355,7 @@ async fn run_inner() -> Result<()> {
     // with no TUI, logging to stderr, so it needs no terminal. `DUOPIPE_TEST_MODE`
     // is the single gate for all test-only env vars. Every other command logs to
     // the console as usual.
-    let test_env = TestEnv::from_env();
+    let test_env = TestEnv::from_env().map_err(TunnelError::config)?;
     let is_tui_command = matches!(&command, Command::Quick { .. } | Command::Run { .. });
     let log_buffer = if is_tui_command && test_env.is_none() {
         // The TUI both renders to stdout and reads keyboard input from stdin, so both
@@ -451,7 +479,8 @@ async fn run_start_peer(
             &cfg,
             relay_urls,
             relay_only,
-            test_env.autostart_tunnels,
+            test_env.autostart_socks,
+            test_env.socks_port,
         )
         .await;
     }
@@ -518,7 +547,7 @@ async fn run_start_peer(
     let log_buffer = log_buffer.expect("a TUI command initializes the log buffer");
     let launch = TuiLaunch {
         logs: log_buffer,
-        tunnel: cfg.tunnel.clone(),
+        socks_port: cfg.socks_port,
         relay_urls,
         relay_only,
         dns_server: cfg.dns_server.clone(),
@@ -544,6 +573,15 @@ mod tests {
             auth_token_fingerprint: fp.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn autostart_socks_requires_a_port() {
+        // Autostart with no effective port must fail fast.
+        assert!(validate_autostart_socks(true, None).is_err());
+        // A port from either source, or autostart disabled, is fine.
+        assert!(validate_autostart_socks(true, Some(1080)).is_ok());
+        assert!(validate_autostart_socks(false, None).is_ok());
     }
 
     #[test]

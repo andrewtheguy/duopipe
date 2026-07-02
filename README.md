@@ -1,8 +1,8 @@
 # duopipe
 
-**Cross-platform secure P2P TCP port forwarding with NAT traversal, for linking your own devices — driven by an interactive TUI.**
+**Cross-platform secure P2P access to services on your own devices via a per-device loopback SOCKS5 proxy over NAT-traversing P2P — driven by an interactive TUI.**
 
-Duopipe is for **one person connecting their own devices** — laptop, homelab box, work machine, VPS — so they can reach services on each other without public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted P2P connections between two endpoints **you control**. It is driven through an interactive terminal UI (TUI) launched with `duopipe quick` (configless) or `duopipe run` (config-driven, with node-id discovery), which walks you through connecting your devices and managing tunnels.
+Duopipe is for **one person connecting their own devices** — laptop, homelab box, work machine, VPS — so they can reach services on each other without public IP addresses, open ports, or VPN infrastructure. It establishes direct encrypted P2P connections between two endpoints **you control**. Once two devices are paired, each can run a small **loopback-only SOCKS5 proxy** whose connections tunnel over the P2P link and egress on the *other* device's network. It is driven through an interactive terminal UI (TUI) launched with `duopipe quick` (configless) or `duopipe run` (config-driven, with node-id discovery), which walks you through connecting your devices and starting the proxy.
 
 > [!IMPORTANT]
 > **Project Goal:** This tool lets a **single user link their own devices** to reach services across them — for **development or homelab purposes** — without the hassle and security risk of opening a port. Both ends are expected to be machines you own (or otherwise fully trust). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe run` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
@@ -13,8 +13,8 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 **Features:**
 - **No account or registration required** — Just download and run
 - **No publicly accessible IPs or port forwarding required** — Automatic NAT hole punching
-- **One pair at a time** — A listener pairs with a single dialer per listen session (all modes); the first peer to authenticate claims the endpoint and others are refused until you stop listening. That dial session carries a single TCP forward, with bidirectional traffic
-- **TCP forwarding** — Seamlessly tunnel a single TCP stream per session (UDP is intentionally out of scope — see [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs))
+- **One pairing per run (listen XOR dial)** — A run is *either* the listening side *or* the dialing side of a single pairing, never both. A listener pairs with a single dialer (all modes); the first peer to authenticate claims the endpoint and others are refused until you stop listening
+- **Symmetric SOCKS5 proxy** — Once paired, each device can bind a loopback-only SOCKS5 proxy that tunnels its CONNECTs over the P2P link to egress on the *other* device's network (CONNECT-only, TCP-only; UDP is intentionally out of scope — see [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs))
 - **Cross-platform** — Works on Linux, macOS, and Windows
 - **No root required** — Runs as unprivileged user
 - **End-to-end encryption** via QUIC/TLS 1.3
@@ -23,46 +23,45 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 **Use Cases:**
 - **SSH access** to machines behind NAT/firewalls
 - **Simpler Alternative to SSM For Staging Environment Access Purposes** — Great for ad-hoc access without configuring AWS agents or IAM users. **Note:** Not intended for production; it is not battle-tested for enterprise use and lacks integration with cloud security policies (IAM, auditing).
-- **Remote Desktop** access (RDP/VNC over TCP) without port forwarding
+- **Remote Desktop** access (RDP/VNC over TCP) via the SOCKS5 proxy without port forwarding
 - **Secure Service Exposure** (HTTP servers, databases, etc.) without public infrastructure
 - **Development and Testing** of TCP services across network boundaries
 - **Homelab Networking** — Connecting distributed homelab nodes or accessing local services remotely without complex VPN setups or public IP requirements
-- **Cross-platform Tunneling** for TCP workflows (including Windows endpoints)
+- **Cross-platform proxying** for TCP workflows (including Windows endpoints)
 
 ## Overview
 
-duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each of which opens an interactive terminal UI. The dashboard opens **idle**: press **`Shift-L`** to start listening, and it then pairs with **one inbound peer** over one iroh endpoint and serves its tunnel request (press `Shift-L` again to stop; the first peer to authenticate claims the endpoint for that session, and other peers are refused until you stop). Alongside that, each instance can hold **one outbound dial session** that *it* drives — SSH `-L`–style local forwarding: it binds a local listener and asks the connected peer to connect out to a remote source. Dialing is available immediately, even before listening is started. Each individual connection is one-directional (one requester, one server); your process is just both at once.
+duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each of which opens an interactive terminal UI. The dashboard opens **idle**, and a run then becomes **either** the listening side **or** the dialing side of a single pairing — never both. Press **`Shift-L`** to start listening, and it pairs with **one inbound peer** over one iroh endpoint (press `Shift-L` again to stop; the first peer to authenticate claims the endpoint for that session, and other peers are refused until you stop). Alternatively, press **`Shift-C`** to **dial** a peer. These are **mutually exclusive**: while you are listening, `Shift-C` is refused; while an outbound dial session exists, `Shift-L` is refused. Whichever way the pairing is formed, once it is live **both** paired devices can each run their own loopback SOCKS5 proxy.
 
-> **Note:** v1 forwards a **single TCP stream** per dial session — one `remote_source` reached through one `local_listen`. A single SOCKS5 listener (so one tunnel can reach many destinations) is the planned future direction, modeled on [flextunnel](https://github.com/andrewtheguy/flextunnel). UDP is intentionally out of scope; that role belongs to [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs).
+Once two devices are paired, the tunnel is a **symmetric loopback-only SOCKS5 proxy**: each side can bind a SOCKS5 proxy on `127.0.0.1` (+ `::1`) at a port it chooses, and each proxy's `CONNECT`s tunnel over the existing iroh connection and **egress on the other device's network**. Domains resolve on the remote (exit) side. It is CONNECT-only, no-auth-method, TCP-only ([RFC 1928](https://datatracker.ietf.org/doc/html/rfc1928)) — no BIND, no UDP. UDP is intentionally out of scope; that role belongs to [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs).
 
-There is **no listen/dial choice at startup**. Quick mode runs fully ephemeral (a fresh node id every run) and at setup you pick how to share this device: **PIN** (once listening, the dashboard shows a short code that refreshes every 60s and carries this peer's node id over nostr — the dialer types the PIN, which both fetches the node id and authenticates the connection in-band; **no token exists in this mode**) or **Manual** (no nostr/internet — a fresh ephemeral token is generated and the node id + token are shown to copy by hand). Config mode uses a pre-shared token you generated with `duopipe generate-auth-token`, supplied via config/env or pasted at setup. Then the dashboard opens **idle** — press **`Shift-L`** to start listening (which brings up the node id, the PIN/token, and the nostr/PIN publishers), and `Shift-L` again to stop. Because the iroh identity is ephemeral, a stop→start cycle mints a **new** node id (and, in quick PIN mode, a **new** PIN). To dial a peer, press **`Shift-C`** and type the target — its `name` in config mode, a **PIN** in quick PIN mode, or its **node id** in quick manual mode; press **`Shift-D`** to disconnect. Dialing works even before you start listening. You can disconnect and dial a different peer at any time — one outbound session at a time.
+There is **no listen/dial choice at startup**. Quick mode runs fully ephemeral (a fresh node id every run) and at setup you pick how to share this device: **PIN** (once listening, the dashboard shows a short code that refreshes every 60s and carries this peer's node id over nostr — the dialer types the PIN, which both fetches the node id and authenticates the connection in-band; **no token exists in this mode**) or **Manual** (no nostr/internet — a fresh ephemeral token is generated and the node id + token are shown to copy by hand). Config mode uses a pre-shared token you generated with `duopipe generate-auth-token`, supplied via config/env or pasted at setup. Then the dashboard opens **idle** — press **`Shift-L`** to start listening (which brings up the node id, the PIN/token, and the nostr/PIN publishers), and `Shift-L` again to stop. Because the iroh identity is ephemeral, a stop→start cycle mints a **new** node id (and, in quick PIN mode, a **new** PIN). To dial a peer instead, press **`Shift-C`** and type the target — its `name` in config mode, a **PIN** in quick PIN mode, or its **node id** in quick manual mode; press **`Shift-D`** to disconnect. You can disconnect and dial a different peer at any time — one outbound session at a time — but you cannot dial while listening (or listen while dialing).
 
-- Press **`Shift-L`** to start listening; until you do, the node-id line reads *not listening — press Shift+L to start* and no PIN or token banner is shown. Once listening, the TUI header shows this instance's **node id**. In config and quick **manual** modes it also shows a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token. In quick **PIN** mode it instead shows the **current PIN** (which refreshes every 60s, with a small countdown to the next refresh) — there is no token to match, since the PIN authenticates the connection and no token is shared; in quick **manual** mode it shows the full **auth token** to copy. Either secret **auto-hides after 10 minutes** — the line also shows the absolute clock time it will hide at — and **`h` toggles it off/on at any time** (re-showing re-arms the 10-minute timer). Pressing `Shift-L` again stops listening (and, because the identity is ephemeral, a later restart mints a new node id — and, in quick PIN mode, a new PIN).
-- The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated/entered at setup.
-- The dashboard shows a **single tunnel row** (there is no list to navigate). Press **`s`** to start the tunnel (bind its `local_listen` port and begin forwarding over the dial session) and **`x`** to stop it (freeing the bound port) — starting is its own deliberate key, never `Enter`, so a stray press can't begin forwarding; press **`e`** to open the **set-tunnel** form — two fields only, the remote source (`host:port`) and the local listen (`host:port`), with no protocol picker and no name field (saving only *sets* the spec — it does not start it); press **`d`** (or **`Del`**) to clear the tunnel. (`Shift` drives the serve half and the dial session: **`Shift-L`** start/stop listening, **`Shift-C`** connect, **`Shift-D`** disconnect.)
+- Press **`Shift-L`** to start listening (only available when you are not dialing); until you do, the node-id line reads *not listening — press Shift+L to start* and no PIN or token banner is shown. Once listening, the TUI header shows this instance's **node id**. In config and quick **manual** modes it also shows a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token. In quick **PIN** mode it instead shows the **current PIN** (which refreshes every 60s, with a small countdown to the next refresh) — there is no token to match, since the PIN authenticates the connection and no token is shared; in quick **manual** mode it shows the full **auth token** to copy. Either secret **auto-hides after 10 minutes** — the line also shows the absolute clock time it will hide at — and **`h` toggles it off/on at any time** (re-showing re-arms the 10-minute timer). Pressing `Shift-L` again stops listening (and, because the identity is ephemeral, a later restart mints a new node id — and, in quick PIN mode, a new PIN).
+- The connect prompt validates its input (node id parse, or own-name/own-id rejection) before dialing; the auth token comes from config/env or is generated/entered at setup. Dialing is only available when you are not listening.
+- The dashboard shows a **single SOCKS5 proxy row** (there is no list to navigate). Press **`e`** to open the **set SOCKS5 port** form — a single field, the port `1..=65535`; press **`s`** to start the proxy (bind the loopback-only SOCKS5 listener on that port and route its CONNECTs over the live pairing) and **`x`** to stop it (freeing the bound port) — starting is its own deliberate key, never `Enter`, so a stray press can't open a proxy; press **`d`** (or **`Del`**) to clear the port. The row title reads ` SOCKS5 Proxy  [s start · x stop · e set · d clear] ` once paired, or ` SOCKS5 Proxy  [e set · d clear — pair first] ` before a pairing is live. The proxy is symmetric, so it is available on **both** the listener and the dialer once a connection is live. (`Shift` drives the pairing: **`Shift-L`** start/stop listening, **`Shift-C`** connect, **`Shift-D`** disconnect/reset. `Shift-D` returns either side to idle: it drops a dial session, or — on the listener — stops the serve half and releases the retained pairing claim, so a listener whose paired peer has disconnected can accept a new peer or switch to dialing.)
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In config mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
 
-A peer serves **one inbound peer per listen session** — the first device to authenticate (laptop *or* phone *or* VPS) claims the homelab box until it stops listening — shown inline in its header, while also dialing out itself. Each dial session carries one TCP forward. iroh provides NAT traversal with relay fallback and automatic discovery.
+A peer serves **one inbound peer per listen session** — the first device to authenticate (laptop *or* phone *or* VPS) claims the homelab box until it stops listening — shown inline in its header. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
 > **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS), authenticated by the same **shared auth secret** — a pre-shared **auth token** in config and quick manual modes, or a **rotating PIN** in quick PIN mode. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
 > - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth secret is per-run too. In config and quick manual modes, move the **auth token** between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in config mode the node id is then discovered automatically. In quick **PIN** mode there is nothing to pre-share — the listener shows a rotating PIN that you type on the dialer, which both finds the node id and authenticates the connection in-band.
-> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, the paired peer, and the tunnel's health — and **starts/stops the tunnel by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
-> - **Trust rests on the shared token.** Once the shared auth token passes, the connected peer is fully trusted — it may ask the serving peer to connect out to **any `host:port`** it requests. Keep the token only on devices you own (or fully trust).
+> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, the paired peer, and the proxy's health — and **starts/stops its SOCKS5 proxy by hand**. Nothing tunnels on its own; you decide *whether* to open a proxy and *when*.
+> - **Trust rests on the shared token.** Once the shared auth token passes, the connected peer is fully trusted — its SOCKS5 proxy may ask this device to connect out to **any `host:port`** it names (there is no destination allowlist). Keep the token only on devices you own (or fully trust).
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
 
-### Tunnel requests at a glance
+### The SOCKS5 proxy at a glance
 
-The tunnel is a **request** (SSH `-L`–style, pull direction): the **dialer** declares a single `[tunnel]` in config, and activating it binds a local listener and asks the **listener** peer to connect out to a remote source.
+The tunnel is a **loopback-only SOCKS5 proxy**. Once two devices are paired, each side can bind a SOCKS5 listener on a chosen port; each `CONNECT` it receives is tunneled over the pairing and connected out on the **other** device's network, with domains resolved remotely.
 
-| Field | Meaning |
-|-------|---------|
-| `remote_source` | Origin on the **other** peer to connect out to (a bare `host:port`, TCP only). |
-| `local_listen` | Local address on **this** peer where the tunnel is exposed (`host:port`). |
+| Setting | Meaning |
+|---------|---------|
+| `socks_port` | Local loopback port (`1..=65535`) where **this** device binds its SOCKS5 proxy (`127.0.0.1` + `::1`). Optional; set/started interactively in the TUI. |
 
-To expose one of **your** services, the **other** peer requests it from you — there is no separate "remote forward". Once the shared auth token passes, the connected peer is fully trusted: it may ask the serving side to connect out to **any `host:port`** it names. Nothing forwards until you start the request in the TUI.
+The proxy is **symmetric** — both paired devices can each run their own proxy, and each one reaches the *other* device's network. Once the shared auth token passes, the connected peer is fully trusted: its proxy may ask this side to connect out to **any `host:port`** it names (no destination allowlist). The bind is loopback-only, so only local apps on the proxying device can use it. Nothing tunnels until you start the proxy in the TUI.
 
 ## Installation
 
@@ -164,7 +163,7 @@ The CRC16 checksum detects all single-byte errors in the token payload.
 Generate auth tokens with: `duopipe generate-auth-token`
 
 > [!IMPORTANT]
-> **The token is the sole gate.** Once the connection-level auth token passes, the connected peer is **fully trusted** — when it asks us to connect out to a `host:port`, we honor **any** address it names. Security rests **solely** on the shared token (and on the fact that the tunnel is activated interactively — nothing forwards until you start it). Keep the token only on devices you own (or otherwise fully trust).
+> **The token is the sole gate.** Once the connection-level auth token passes, the connected peer is **fully trusted** — when its SOCKS5 proxy asks us to connect out to a `host:port`, we honor **any** address it names (no allowlist). Security rests **solely** on the shared token (and on the fact that the proxy is loopback-only and activated interactively — nothing tunnels until you start it). Keep the token only on devices you own (or otherwise fully trust).
 
 ### Token Management
 
@@ -185,17 +184,15 @@ The same token is used by **both** sides: the listener accepts it, and the diale
 
 > **Security:** Supply the auth token with `auth_token_file` or the `DUOPIPE_AUTH_TOKEN` environment variable. The token is never written inline in the config file.
 
-A minimal config is essentially the request you can make plus an optional shared token (`peer.toml`):
+A minimal config is essentially an optional shared token plus an optional SOCKS5 port (`peer.toml`):
 ```toml
 auth_token_file = "/etc/duopipe/auth_token.txt"
 
-# The tunnel we can request: bind locally, ask the peer to reach its source.
-[tunnel]
-remote_source = "127.0.0.1:5678"
-local_listen = "127.0.0.1:15678"
+# Loopback-only SOCKS5 proxy port for this device (optional).
+socks_port = 1080
 ```
 
-Listening is started on demand from the TUI (press `Shift-L`); the dial target is chosen **interactively** at runtime (press `Shift-C`), not in the config file. The `[tunnel]` entry is the template for that dial session, started/stopped from the TUI — nothing forwards automatically.
+Listening is started on demand from the TUI (press `Shift-L`), or you dial a peer instead (press `Shift-C`) — the two are mutually exclusive, and the dial target is chosen **interactively** at runtime, not in the config file. The `socks_port` seeds the proxy's port; it is started/stopped from the TUI (`s`/`x`) once a pairing is live — nothing tunnels automatically.
 
 ---
 
@@ -203,77 +200,80 @@ Listening is started on demand from the TUI (press `Shift-L`); the dial target i
 
 ## Architecture
 
-Each iroh connection carries one requested tunnel. The **dialer** *requests* the tunnel: it binds a local listener and asks the **listener** to connect out to a remote source. For example, a request for the listener's SSH server:
+Once two devices are paired, each side can run a loopback-only SOCKS5 proxy whose CONNECTs tunnel over the iroh connection and egress on the *other* device's network. For example, a local SOCKS5 client reaching the peer's SSH server:
 
 ```
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
-| SSH Client      |  TCP   | dialer (request)|  iroh  | listener (serve)|  TCP   | SSH Server      |
-|                 |<------>| listen :2222    |<======>| (trusted peer)  |<------>| source :22      |
-|                 |        |                 |  QUIC  |                 |        |                 |
+| SOCKS5 client   |  TCP   | this device     |  iroh  | peer (exit side)|  TCP   | SSH Server      |
+| (curl/ssh/…)    |<------>| SOCKS5 :1080    |<======>| (trusted peer)  |<------>| host :22        |
+|                 |        | 127.0.0.1 only  |  QUIC  |                 |        | (resolved here) |
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-One connection carries a single TCP request from the dialer, and a serving peer is paired with one dialer per listen session. For that connection the serving side is a pure server — so to reach a service that lives near the *other* box, dial *from* the box that wants to reach it (every node can dial on demand).
+The proxy is symmetric — the paired peer can equally run its own proxy back the other way — and a serving peer is paired with one dialer per listen session. Domains resolve on the exit (peer) side, so use a remote-DNS SOCKS client (`socks5h://`). Each connection is bounded by the shared stream limit (`max_streams`).
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quick Start
 
-duopipe is **interactive-first**: you run `duopipe run` (config-driven, with node-id discovery) on both machines. On each, press `Shift-L` to start listening; you dial the other on demand from the TUI. Tunnel requests, relays, and the auth token come from a config file (and/or env vars); the dial target is chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
+duopipe is **interactive-first**: you run `duopipe run` (config-driven, with node-id discovery) on both machines. On one, press `Shift-L` to start listening; on the other, press `Shift-C` to dial it (a run does one or the other, not both). Once paired, either side can start its loopback SOCKS5 proxy. The SOCKS5 port, relays, and the auth token come from a config file (and/or env vars); the dial target is chosen interactively. For a one-off session with no config, use `duopipe quick` instead (see [CLI Options](#cli-options)).
 
 ### 1. Start both instances
 
-On each machine, point at a config that declares its requests (see [Configuration Files](#configuration-files)) and run:
+On each machine, point at a config (see [Configuration Files](#configuration-files)) and run:
 
 ```bash
 duopipe run -c ./peer.toml
 ```
 
-There is no role prompt — setup just confirms the token and the dashboard opens **idle**; press `Shift-L` to start listening. Each config must set a `name`. The auth token may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to **paste it** — so `auth_token_file` is optional. The token is a pre-shared secret: generate it once with `duopipe generate-auth-token` and use the same value on every peer (config setup does not generate one for you). Once listening, each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header then shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token even after the full token is hidden.
+There is no role prompt — setup just confirms the token and the dashboard opens **idle**; press `Shift-L` to start listening (or `Shift-C` to dial — a run is one or the other). Each config must set a `name`. The auth token may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to **paste it** — so `auth_token_file` is optional. The token is a pre-shared secret: generate it once with `duopipe generate-auth-token` and use the same value on every peer (config setup does not generate one for you). Once listening, each instance publishes its current node id to nostr under its `name` so peers can find it. The TUI header then shows this instance's **node id** and a short **token fingerprint** (the first 8 hex digits of the token's SHA-256) so you can confirm both devices share the same token even after the full token is hidden.
 
 > **Important:** The node id is regenerated on every run (the identity is ephemeral), but in config mode you don't copy it by hand — peers find each other by `name`.
 
 ### 2. Dial a peer
 
-In the TUI on either machine, press **`Shift-C`** and type the **`name`** of the peer you want (e.g. `web1`, which must differ from this instance's own `name`); duopipe resolves it via nostr and connects. Press **`Shift-D`** to disconnect, then `Shift-C` again to dial a different peer. The **auth token** comes from config, `DUOPIPE_AUTH_TOKEN`, or the interactive setup prompt, and is shared by both sides — compare the **token fingerprint** in each header to confirm they match.
+On the machine that is **not** listening, press **`Shift-C`** and type the **`name`** of the peer you want (e.g. `web1`, which must differ from this instance's own `name`); duopipe resolves it via nostr and connects. Press **`Shift-D`** to disconnect, then `Shift-C` again to dial a different peer. The **auth token** comes from config, `DUOPIPE_AUTH_TOKEN`, or the interactive setup prompt, and is shared by both sides — compare the **token fingerprint** in each header to confirm they match. (You cannot dial while listening; a run is one or the other.)
 
-Once connected, the request you start in the TUI flows over that session. For example, a config with:
+Once connected, either side can start its loopback SOCKS5 proxy from the TUI (`s`) on its `socks_port`. For example, a config with:
 
 ```toml
-[tunnel]
-remote_source = "127.0.0.1:5678"
-local_listen = "127.0.0.1:15678"
+socks_port = 1080
 ```
 
-- This makes the **dialing** side listen on `127.0.0.1:15678`; connections are forwarded to `127.0.0.1:5678`, which the **connected peer** connects out to (it is fully trusted once the shared token passes).
-- The direction is per-connection: whoever pressed `c` is the requester. To pull a service the *other* way, dial from the other box (or both dial each other — each instance serves and dials at once).
+- This makes the device bind a SOCKS5 proxy on `127.0.0.1:1080` (loopback only); its CONNECTs tunnel over the pairing and the **connected peer** connects out to whatever host you ask for (it is fully trusted once the shared token passes).
+- The proxy is symmetric: the peer can run its own proxy reaching *this* device's network at the same time — one config carries both halves, since either side may listen-or-dial and each may run a proxy.
 
-The request is started/stopped from the TUI. A single instance serves one paired inbound peer per listen session while holding one outbound dial session.
+The proxy is started/stopped from the TUI (`s`/`x`). A single instance is either the listening or the dialing side of one pairing.
 
-### 3. SSH over a requested tunnel
+### 3. SSH via the SOCKS5 proxy
 
-With a `[tunnel]` of `remote_source = "127.0.0.1:22"`, `local_listen = "127.0.0.1:2222"` (the other peer reaches the SSH server):
+With `socks_port = 1080` and a proxy running, reach the peer's SSH server through the proxy (use a remote-DNS-capable client):
 
 ```bash
-ssh -p 2222 user@127.0.0.1
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@<host-on-peer-network>
 ```
 
-### Bidirectional tunnels — both directions on demand
+Or an HTTP service on the peer (`socks5h://` resolves the hostname on the exit side):
 
-Each individual connection is one-directional: **whoever dialed is the requester, the
-other side serves.** But every instance both serves and dials, so you get both
-directions naturally — just dial from whichever side needs to pull:
+```bash
+curl -x socks5h://127.0.0.1:1080 http://<service-on-peer>/
+```
 
-- `homelab` wants a service on `laptop`: on `homelab` press `Shift-C`, dial `laptop`, and
-  start its `[tunnel]` for that service.
-- `laptop` wants a service on `homelab`: on `laptop` press `Shift-C`, dial `homelab`, and
-  start its request.
+### Both directions on demand
 
-Both can be connected at the same time — each instance's serve half accepts the
-other's inbound dial while its own dial session pulls the other way. Each box's
-`[tunnel]` is what *it* pulls when dialing; when serving, a connected peer that
-passed the shared token may reach any `host:port` it requests — one config carries
-both halves.
+The SOCKS5 proxy is **symmetric**: once paired, each side can run its own loopback proxy
+reaching the *other* device's network. A run is either the listener or the dialer of a
+pairing, but both roles get a proxy:
+
+- `homelab` wants services on `laptop`: pair the two, then on `homelab` start its SOCKS5
+  proxy — its CONNECTs egress on `laptop`.
+- `laptop` wants services on `homelab`: over the *same* pairing, `laptop` starts its own
+  proxy — its CONNECTs egress on `homelab`.
+
+Both proxies can run at the same time over one pairing, each reaching the other side's
+network. Each box's `socks_port` is where *its* local apps connect; when acting as the
+exit side, a connected peer that passed the shared token may reach any `host:port` it
+names — one config carries both halves.
 
 **This does not conflict on nostr.** Each instance publishes its node id under its own
 `name`'s `d` tag (salted with the auth token); dialing only *reads* the target's
@@ -290,7 +290,8 @@ duopipe is meant for interactive use. For automated tests, `DUOPIPE_TEST_MODE=1`
 |---------|---------|
 | `DUOPIPE_TEST_MODE=1` | Run headless (no TUI). Gates the env vars below. |
 | `DUOPIPE_PEER_NODE_ID=<id>` | When **set** ⇒ dial that node id; when **unset** ⇒ listen. |
-| `DUOPIPE_AUTOSTART_TUNNELS=1` | Start the configured `[tunnel]` (dial side) once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_AUTOSTART_SOCKS=1` | Start the local SOCKS5 proxy once connected (nothing auto-starts otherwise). |
+| `DUOPIPE_SOCKS_PORT=<port>` | Seed the SOCKS5 proxy port for config-free headless runs (`0` = OS-assigned). |
 | `DUOPIPE_AUTH_TOKEN=<token>` | The shared auth token. In **quick mode** it is honored **only** in test mode (interactive quick mode always generates its own token); in **config mode** it is also valid outside test mode (see env table below). |
 
 In test mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr**, so a test harness can capture them and wire up the dialer.
@@ -320,7 +321,7 @@ How it works, in two steps that both use the PIN but no token on the wire:
 
 ### run (config-driven mode)
 
-`duopipe run` reads a config file and uses **nostr** for node-id discovery. It requires a **`name`** (this peer's short identifier — ASCII letters, digits, and underscores only) and fails fast if it is missing or malformed. It also requires **`auth_token_fingerprint`** — the 8-hex-digit prefix of the shared token's SHA-256 — whether or not the token itself is in the config; whatever token is finally resolved (file, `DUOPIPE_AUTH_TOKEN`, or pasted at setup) must match it, or duopipe refuses to start. This pins each config to one pairing, so a config pointed at the wrong token file or a token meant for a different pair of devices is caught up front instead of failing as an auth error later. The auth token (the nostr rendezvous secret) may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to paste it, so `auth_token_file` is optional. The token is pre-shared, so generate it once (`duopipe generate-auth-token`, which prints its fingerprint) and use the same value on every peer — config setup does not generate one for you. Requests, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
+`duopipe run` reads a config file and uses **nostr** for node-id discovery. It requires a **`name`** (this peer's short identifier — ASCII letters, digits, and underscores only) and fails fast if it is missing or malformed. It also requires **`auth_token_fingerprint`** — the 8-hex-digit prefix of the shared token's SHA-256 — whether or not the token itself is in the config; whatever token is finally resolved (file, `DUOPIPE_AUTH_TOKEN`, or pasted at setup) must match it, or duopipe refuses to start. This pins each config to one pairing, so a config pointed at the wrong token file or a token meant for a different pair of devices is caught up front instead of failing as an auth error later. The auth token (the nostr rendezvous secret) may come from config `auth_token_file` or `DUOPIPE_AUTH_TOKEN`; if neither is set, setup prompts you to paste it, so `auth_token_file` is optional. The token is pre-shared, so generate it once (`duopipe generate-auth-token`, which prints its fingerprint) and use the same value on every peer — config setup does not generate one for you. The SOCKS5 port, relays, DNS, max-streams, relay-only, and the optional nostr relay override all come from the config. A dialer reaches a peer by typing that peer's `name`, so several peers can share one auth token and be reached individually.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -333,7 +334,8 @@ How it works, in two steps that both use the PIN but no token on the wire:
 | `DUOPIPE_AUTH_TOKEN` | The shared auth token (precedence: above config `auth_token_file`). |
 | `DUOPIPE_TEST_MODE` | Testing only: set to `1` to run headless (no TUI) and enable the test-only env vars below. |
 | `DUOPIPE_PEER_NODE_ID` | Testing only (requires `DUOPIPE_TEST_MODE=1`): when set ⇒ dial that node id; when unset ⇒ listen. |
-| `DUOPIPE_AUTOSTART_TUNNELS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start the dial-side tunnel on connect. |
+| `DUOPIPE_AUTOSTART_SOCKS` | Testing only (requires `DUOPIPE_TEST_MODE=1`): set to `1` to start the local SOCKS5 proxy on connect. |
+| `DUOPIPE_SOCKS_PORT` | Testing only (requires `DUOPIPE_TEST_MODE=1`): seed the SOCKS5 proxy port for config-free headless runs (`0` = OS-assigned). |
 
 ## Configuration Files
 
@@ -345,7 +347,7 @@ Config files are used by `duopipe run`: run it with no flag to load the default 
 
 > **Note:** `relay_only` is a config bool and requires at least one `relay_urls` entry.
 
-`duopipe run` requires a `name` and an `auth_token_fingerprint`; the auth token itself is optional in the config (supply it via `auth_token_file`/`DUOPIPE_AUTH_TOKEN`, or paste it at setup — generate it first with `duopipe generate-auth-token` and pre-share it). The resolved token must match `auth_token_fingerprint`, which pins the config to one pairing. The config holds the tunnel request, the token fingerprint, the optional path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. Listening is started on demand from the TUI (press `Shift-L`); the **dial target** is chosen interactively at runtime (press `Shift-C`), not in the config.
+`duopipe run` requires a `name` and an `auth_token_fingerprint`; the auth token itself is optional in the config (supply it via `auth_token_file`/`DUOPIPE_AUTH_TOKEN`, or paste it at setup — generate it first with `duopipe generate-auth-token` and pre-share it). The resolved token must match `auth_token_fingerprint`, which pins the config to one pairing. The config holds the optional `socks_port`, the token fingerprint, the optional path to the auth token, the peer's `name`, relays, DNS, the optional nostr relay override, and transport tuning. Listening is started on demand from the TUI (press `Shift-L`), or you dial a peer instead (press `Shift-C`) — the two are mutually exclusive, and the **dial target** is chosen interactively at runtime, not in the config.
 
 ### Node-id discovery
 
@@ -374,7 +376,7 @@ The connection-level receive window uses iroh's default. If `send_window` is omi
 
 ### Peer Config Example
 
-The same config shape is used by both peers. Each interactive run starts listening on demand (`Shift-L`); the outbound dial target is chosen later from the dashboard.
+The same config shape is used by both peers. Each interactive run either starts listening on demand (`Shift-L`) or dials a peer (`Shift-C`) — never both; the outbound dial target is chosen from the dashboard.
 
 ```toml
 # Example peer configuration.
@@ -400,10 +402,10 @@ auth_token_fingerprint = "a1b2c3d4"
 dns_server = "https://dns.example.com/pkarr"
 max_streams = 100   # max concurrent forwarded connections across all peers
 
-# Seed tunnel (dial side): bind locally, ask the connected peer to connect out to source.
-[tunnel]
-remote_source = "127.0.0.1:5678"
-local_listen = "127.0.0.1:15678"
+# Loopback-only SOCKS5 proxy port for this device (optional). Once paired, start it
+# from the TUI (`s`); its CONNECTs egress on the peer's network. Symmetric — the
+# peer can run its own proxy back the other way.
+socks_port = 1080
 ```
 
 > [!NOTE]
@@ -451,7 +453,7 @@ Auth token format: `d` + Base64URL-encoded(32 random bytes + CRC16 checksum) = 4
 - The node id is a public key that identifies the listening peer. Because the identity is ephemeral, it changes every run.
 - **Fixed ALPN:** The QUIC protocol identifier is a fixed constant (`mf/2`). It is not used for access control.
 - **Token Authentication:** The dialing peer authenticates immediately after the QUIC connection via a dedicated auth stream, presenting the shared auth token. An invalid token is rejected with an `AuthResponse` and the connection is closed with an error code. See [Architecture: Token Authentication](docs/ARCHITECTURE.md#token-authentication-iroh-mode).
-- **Token is the sole gate:** After auth the connected peer is **fully trusted** — when it requests a tunnel we connect out to **any `host:port`** it names. Security rests solely on the shared token; the request is also activated interactively, so nothing forwards until started. Keep the token only on devices you own (or otherwise fully trust).
+- **Token is the sole gate:** After auth the connected peer is **fully trusted** — its SOCKS5 proxy may ask us to connect out to **any `host:port`** it names (no destination allowlist). Security rests solely on the shared token; the proxy is also loopback-only and activated interactively, so nothing tunnels until you start it and only local apps on the proxying device can use it. Keep the token only on devices you own (or otherwise fully trust).
 - Treat the auth token like a password
 
 ## Exit Codes
@@ -465,17 +467,17 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 | 2 | Configuration error (invalid arguments, bad token format, missing fields) | No — fix configuration |
 | 3 | Authentication failure (token rejected, auth timeout) | No — fix credentials |
 | 10 | Connection establishment failed (timeout, relay failure, peer unreachable) | Only if it worked before |
-| 11 | Connection lost after tunnels were established | Yes — always retry |
+| 11 | Connection lost after the pairing was established | Yes — always retry |
 
 ## How It Works
 
 ### iroh Mode
-1. On startup the dashboard opens idle (no role prompt); the user presses `Shift-L` to start listening, and a fresh identity is generated then. A dial session is started independently from the TUI (`Shift-C`) and is available even before listening begins
+1. On startup the dashboard opens idle (no role prompt); the user presses `Shift-L` to start listening (a fresh identity is generated then) **or** `Shift-C` to dial a peer — the two are mutually exclusive, a run is one or the other
 2. On `Shift-L`, the instance creates an iroh endpoint with discovery services and publishes its address via Pkarr/DNS; its node id is then shown in the TUI header
 3. When dialing, the dial session (given the target's node id, directly or resolved via nostr) reaches the target via discovery
 4. **QUIC handshake:** the connection uses the fixed ALPN constant (`mf/2`); there is no token in the ALPN
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
 6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response
    - *If authentication fails, the connection is closed and the following steps do not occur*
-7. **After auth, the tunnel request:** once authenticated, the **dialer** *requests* the tunnel and the **listener serves** it — connecting out to whatever `host:port` the now-trusted dialer names. A listener pairs with a single dialer per listen session: the first peer to authenticate claims the endpoint (by its node id) and other peers are refused until the session is stopped, but the paired peer may reconnect without re-authenticating.
-8. The requested tunnel is negotiated over the connection; within the tunnel, TCP traffic flows in both directions
+7. **After auth, the pairing is live:** a listener pairs with a single dialer per listen session — the first peer to authenticate claims the endpoint (by its node id) and other peers are refused until the session is stopped, but the paired peer may reconnect without re-authenticating.
+8. **SOCKS5 proxy (symmetric):** either paired device can start a loopback-only SOCKS5 proxy. Each CONNECT it accepts opens a stream tagged `SocksConnect { host, port }`; the trusted peer resolves the host on *its* network, connects out, and bridges — so traffic flows both ways over the tunnel.

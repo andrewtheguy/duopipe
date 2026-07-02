@@ -14,22 +14,24 @@
 # copy-paste of the node id and generated token.
 #
 # `duopipe run` is interactive and opens idle. There is no startup listen/dial role
-# choice and no dial target in this file: press Shift-L to start/stop listening, then
+# choice and no dial target in this file: press Shift-L to start/stop listening, or
 # press Shift-C on the dashboard and type the target peer's `name` to start the single
 # outbound dial session. This file supplies the shared auth token, this peer's own
-# `name`, the single tunnel, relays, tuning, and the nostr relay override.
+# `name`, the SOCKS5 proxy port, relays, tuning, and the nostr relay override.
 #
-# Tunnel model: a node can serve inbound peers AND open one outbound TCP tunnel over
-# its dial session — both start on demand, nothing listens or dials automatically.
-# Press Shift-L to start/stop listening (while listening this peer serves any number
-# of dialers at once); the [tunnel] table is the single outbound tunnel, which binds a
-# local listener and asks the connected peer to connect out to a remote 'remote_source'
-# (a bare host:port, TCP), bridging the two. The tunnel does NOT start automatically
-# either — the TUI shows it and you start/stop it with `s`/`x` (in test mode only, with
-# DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_TUNNELS=1 to auto-start once connected).
+# Pairing model: a run holds ONE dialer↔listener pairing. While listening (Shift-L)
+# this peer cannot dial out, and while dialed out it cannot listen — a device is
+# either the listener or the dialer of a single pairing, never both.
+#
+# Proxy model: once paired, EACH device can bind a local, loopback-only SOCKS5 proxy
+# ('socks_port' below) that tunnels CONNECTs over the pairing to egress on the OTHER
+# device's network (domains resolve on the remote side). The proxy does NOT start
+# automatically — the TUI shows it and you start/stop it with `s`/`x` (in test mode
+# only, with DUOPIPE_TEST_MODE=1, set DUOPIPE_AUTOSTART_SOCKS=1 to auto-start once
+# connected).
 #
 # Trust model: once token auth succeeds the connected peer is fully trusted — it may
-# ask us to connect out to any host:port (there is no source allowlist). Keep the
+# ask us to connect out to any host:port (there is no destination allowlist). Keep the
 # shared token only on devices you own (or otherwise fully trust).
 #
 # Node id: the iroh identity key is always ephemeral (regenerated every run), so a
@@ -93,17 +95,11 @@ auth_token_fingerprint = "a1b2c3d4"
 # dns_server = "https://dns.example.com/pkarr"
 # dns_server = "none"
 
-# ============================================================================
-# The single TCP tunnel this node can open over its outbound dial session: ask the
-# connected peer to connect out to 'remote_source' (a bare host:port, TCP); deliver
-# traffic to a local listener bound at 'local_listen'. Optional — in quick mode it is
-# set from the TUI instead. Nothing starts until you connect to a peer and activate it
-# (`s` in the TUI, or DUOPIPE_AUTOSTART_TUNNELS=1 in test mode). The tunnel can also
-# be set (e) or cleared (d) from the dashboard at runtime (while not running).
-# ============================================================================
-[tunnel]
-remote_source = "127.0.0.1:5678"
-local_listen = "127.0.0.1:15678"
+# Local SOCKS5 proxy port (binds loopback only: 127.0.0.1 and ::1). Once paired,
+# starting the proxy (`s` in the TUI) tunnels SOCKS5 CONNECTs to the connected
+# peer's network. Optional — it can also be set (e) or cleared (d) from the
+# dashboard at runtime (while not running). Nothing starts automatically.
+# socks_port = 1080
 
 # ============================================================================
 # Transport Tuning (Optional)

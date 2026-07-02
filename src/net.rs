@@ -1,9 +1,9 @@
 //! Shared networking utilities for duopipe.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::{TcpStream, lookup_host};
+use tokio::net::TcpStream;
 
 /// Delay between starting connection attempts (Happy Eyeballs style).
 pub const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
@@ -83,88 +83,6 @@ pub fn order_by_loopback_preference(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 // Address Resolution
 // ============================================================================
 
-/// Resolve a target address to all available socket addresses.
-/// Returns all IPv4 and IPv6 addresses for the hostname.
-///
-/// For localhost/loopback addresses, IPv4 is preferred because most local services
-/// bind to 127.0.0.1 only. This avoids the 250ms Happy Eyeballs delay when IPv6
-/// fails on macOS (which returns ::1 before 127.0.0.1 by default).
-///
-/// For non-local addresses, the resolver's native order is preserved (typically
-/// IPv6 first per RFC 6724), allowing Happy Eyeballs to work as designed.
-pub async fn resolve_all_target_addrs(target: &str) -> Result<Vec<SocketAddr>> {
-    let addrs: Vec<SocketAddr> = lookup_host(target)
-        .await
-        .with_context(|| format!("Failed to resolve '{}'", target))?
-        .collect();
-    if addrs.is_empty() {
-        anyhow::bail!("No addresses found for host '{}'", target);
-    }
-
-    Ok(order_by_loopback_preference(addrs))
-}
-
-/// Resolve a listen address to all available socket addresses.
-///
-/// For localhost/loopback, returns BOTH IPv4 (127.0.0.1) and IPv6 (::1) addresses.
-/// This is necessary because dual-stack sockets don't work for loopback addresses -
-/// they are distinct addresses requiring separate listeners.
-///
-/// On macOS, clients connecting to "localhost" try IPv6 (::1) first. If the server
-/// only listens on IPv4 (127.0.0.1), connections fail. Binding to both addresses
-/// ensures compatibility with all clients regardless of their IPv4/IPv6 preference.
-///
-/// For non-loopback hostnames, returns a single address (preferring IPv4).
-pub async fn resolve_listen_addrs(target: &str) -> Result<Vec<SocketAddr>> {
-    // First try direct parse for IP addresses (fast path) - single address
-    if let Ok(addr) = target.parse::<SocketAddr>() {
-        return Ok(vec![addr]);
-    }
-
-    // Resolve hostname
-    let addrs: Vec<SocketAddr> = lookup_host(target)
-        .await
-        .with_context(|| format!("Failed to resolve listen address '{}'", target))?
-        .collect();
-
-    if addrs.is_empty() {
-        anyhow::bail!("No addresses found for listen address '{}'", target);
-    }
-
-    // Check if all resolved addresses are loopback
-    let is_loopback = addrs.iter().all(|a| a.ip().is_loopback());
-
-    if is_loopback {
-        // For loopback, return ALL addresses (both IPv4 and IPv6) with IPv4 first.
-        // Dual-stack sockets don't work for loopback - need separate listeners.
-        let mut sorted = order_by_loopback_preference(addrs);
-        // Deduplicate (in case resolver returns duplicates)
-        sorted.dedup();
-        log::debug!(
-            "Resolved loopback listen address '{}' to {} addresses: {:?}",
-            target,
-            sorted.len(),
-            sorted
-        );
-        Ok(sorted)
-    } else {
-        // For non-loopback, return single address (prefer IPv4)
-        let addr = addrs
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or_else(|| addrs.first())
-            .copied()
-            .expect("no listen addresses available after resolution");
-        log::debug!(
-            "Resolved listen address '{}' to {} (from {} candidates)",
-            target,
-            addr,
-            addrs.len()
-        );
-        Ok(vec![addr])
-    }
-}
-
 // ============================================================================
 // Happy Eyeballs TCP Connection
 // ============================================================================
@@ -218,6 +136,10 @@ pub async fn try_connect_tcp(addrs: &[SocketAddr]) -> Result<TcpStream> {
 
     // Return the first successful connection
     let mut errors: Vec<String> = Vec::new();
+    // Preserve the last underlying io::Error so callers can `downcast_ref::<io::Error>()`
+    // and recover the real `ErrorKind` (e.g. TimedOut, HostUnreachable) for a meaningful
+    // SOCKS5 REP code — a formatted string would collapse every failure to one kind.
+    let mut last_err: Option<std::io::Error> = None;
     while let Some((addr, result)) = rx.recv().await {
         match result {
             Ok(stream) => {
@@ -231,14 +153,17 @@ pub async fn try_connect_tcp(addrs: &[SocketAddr]) -> Result<TcpStream> {
             Err(e) => {
                 log::debug!("Connection attempt to {} failed: {}", addr, e);
                 errors.push(format!("{}: {}", addr, e));
+                last_err = Some(e);
             }
         }
     }
 
-    anyhow::bail!(
-        "Failed to connect to any address:\n  {}",
-        errors.join("\n  ")
-    );
+    let summary = format!("Failed to connect to any address:\n  {}", errors.join("\n  "));
+    match last_err {
+        // Keep the io::Error in the chain (anyhow `downcast_ref` sees through `.context`).
+        Some(err) => Err(anyhow::Error::new(err).context(summary)),
+        None => anyhow::bail!(summary),
+    }
 }
 
 /// Apply best-effort TCP options that help tunnel throughput and latency.
@@ -308,6 +233,24 @@ where
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[tokio::test]
+    async fn try_connect_tcp_preserves_io_error_for_downcast() {
+        // Bind then drop a loopback listener to get a port that refuses connections.
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let err = try_connect_tcp(&[addr]).await.expect_err("closed port refuses");
+        // The underlying io::Error must survive so the SOCKS REP mapping can read its kind
+        // (rather than every failure collapsing to REP_CONN_REFUSED via the fallback).
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("io::Error must be recoverable from the chain");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
 
     #[test]
     fn test_loopback_addresses_prefer_ipv4() {
