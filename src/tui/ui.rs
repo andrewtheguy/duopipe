@@ -843,11 +843,13 @@ fn has_live_pairing(snap: &AppSnapshot) -> bool {
 
 fn socks_row(s: &SocksRow) -> Row<'static> {
     let marker = if s.status.is_running() { "▶" } else { " " };
-    // Show the bound address (from detail) while running, else the configured port.
-    let spec = if s.detail.is_empty() {
-        format!("socks5 127.0.0.1:{}", s.port)
-    } else {
+    // Only a *running* proxy carries a real bound address in `detail`; an Error row's
+    // `detail` holds an error message, so fall back to the configured port there (and for
+    // idle rows) rather than rendering the message as if it were a proxy address.
+    let spec = if s.status.is_running() && !s.detail.is_empty() {
         format!("socks5 {}", s.detail)
+    } else {
+        format!("socks5 127.0.0.1:{}", s.port)
     };
     Row::new(vec![
         Cell::from(format!(" {marker}")),
@@ -1443,5 +1445,27 @@ mod tests {
         assert!(running_text.contains("x stop"));
         assert!(!running_text.contains("s start"));
         assert!(!running_text.contains("e set"));
+    }
+
+    #[test]
+    fn socks_row_error_shows_port_not_error_as_address() {
+        // An Error row's `detail` is an error message, not a bound address: the PROXY column
+        // must fall back to the configured port rather than rendering `socks5 <message>`.
+        let mut snap = base_snapshot(false, None);
+        snap.socks = Some(SocksRow {
+            port: 1080,
+            status: SocksStatus::Error,
+            detail: "bind failed permission denied".to_string(),
+        });
+
+        let text = render_text(&snap, &UiState::default());
+
+        assert!(text.contains("socks5 127.0.0.1:1080"), "spec falls back to the port");
+        assert!(
+            !text.contains("socks5 bind failed"),
+            "the error message must not render as a proxy address"
+        );
+        // The error message still shows in the DETAIL column.
+        assert!(text.contains("bind failed"), "error detail still surfaced");
     }
 }

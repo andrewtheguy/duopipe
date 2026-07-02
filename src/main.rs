@@ -248,6 +248,17 @@ impl TestEnv {
 /// Run a peer headless (no TUI) for non-interactive test mode. Logs go to stderr
 /// via the env logger; the in-memory `AppState` is still created (the runtime
 /// writes status into it) but nothing renders it. Ctrl-C triggers a clean shutdown.
+/// Reject a headless configuration that asks to autostart the SOCKS proxy without a port:
+/// the runtime gates autostart on a configured port, so this would otherwise start nothing.
+fn validate_autostart_socks(autostart_socks: bool, effective_port: Option<u16>) -> Result<()> {
+    if autostart_socks && effective_port.is_none() {
+        anyhow::bail!(
+            "DUOPIPE_AUTOSTART_SOCKS is set but no SOCKS port is configured; set DUOPIPE_SOCKS_PORT (or `socks_port` in the config)."
+        );
+    }
+    Ok(())
+}
+
 async fn run_peer_headless(
     resolved: ResolvedPeer,
     cfg: &PeerConfig,
@@ -260,11 +271,15 @@ async fn run_peer_headless(
     // Headless test mode is single-role and never uses nostr, so the dial-prompt
     // fields are inert. The SOCKS port comes from DUOPIPE_SOCKS_PORT, falling back to
     // the config so a headless harness needs no config file.
+    let effective_socks_port = socks_port.or(cfg.socks_port);
+    // Fail fast: autostart with no port would silently start nothing (the runtime gates
+    // autostart on a configured port), leaving a headless harness with a dead proxy.
+    validate_autostart_socks(autostart_socks, effective_socks_port).map_err(TunnelError::config)?;
     let state = AppState::new(
         resolved.role,
         resolved.token_generated,
         logs,
-        socks_port.or(cfg.socks_port),
+        effective_socks_port,
         false,
         None,
         false,
@@ -558,6 +573,15 @@ mod tests {
             auth_token_fingerprint: fp.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn autostart_socks_requires_a_port() {
+        // Autostart with no effective port must fail fast.
+        assert!(validate_autostart_socks(true, None).is_err());
+        // A port from either source, or autostart disabled, is fine.
+        assert!(validate_autostart_socks(true, Some(1080)).is_ok());
+        assert!(validate_autostart_socks(false, None).is_ok());
     }
 
     #[test]

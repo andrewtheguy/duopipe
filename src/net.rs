@@ -136,6 +136,10 @@ pub async fn try_connect_tcp(addrs: &[SocketAddr]) -> Result<TcpStream> {
 
     // Return the first successful connection
     let mut errors: Vec<String> = Vec::new();
+    // Preserve the last underlying io::Error so callers can `downcast_ref::<io::Error>()`
+    // and recover the real `ErrorKind` (e.g. TimedOut, HostUnreachable) for a meaningful
+    // SOCKS5 REP code — a formatted string would collapse every failure to one kind.
+    let mut last_err: Option<std::io::Error> = None;
     while let Some((addr, result)) = rx.recv().await {
         match result {
             Ok(stream) => {
@@ -149,14 +153,17 @@ pub async fn try_connect_tcp(addrs: &[SocketAddr]) -> Result<TcpStream> {
             Err(e) => {
                 log::debug!("Connection attempt to {} failed: {}", addr, e);
                 errors.push(format!("{}: {}", addr, e));
+                last_err = Some(e);
             }
         }
     }
 
-    anyhow::bail!(
-        "Failed to connect to any address:\n  {}",
-        errors.join("\n  ")
-    );
+    let summary = format!("Failed to connect to any address:\n  {}", errors.join("\n  "));
+    match last_err {
+        // Keep the io::Error in the chain (anyhow `downcast_ref` sees through `.context`).
+        Some(err) => Err(anyhow::Error::new(err).context(summary)),
+        None => anyhow::bail!(summary),
+    }
 }
 
 /// Apply best-effort TCP options that help tunnel throughput and latency.
@@ -226,6 +233,24 @@ where
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[tokio::test]
+    async fn try_connect_tcp_preserves_io_error_for_downcast() {
+        // Bind then drop a loopback listener to get a port that refuses connections.
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let err = try_connect_tcp(&[addr]).await.expect_err("closed port refuses");
+        // The underlying io::Error must survive so the SOCKS REP mapping can read its kind
+        // (rather than every failure collapsing to REP_CONN_REFUSED via the fallback).
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("io::Error must be recoverable from the chain");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
 
     #[test]
     fn test_loopback_addresses_prefer_ipv4() {
