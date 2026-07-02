@@ -2,15 +2,15 @@
 //!
 //! A single symmetric peer config with all keys at the top level.
 //!
-//! Interactive runs always serve inbound peers, and the outbound dial target is
-//! chosen later from the dashboard, not in the config. The optional `[tunnel]`
-//! table is the single TCP forward this node can open over its outbound dial
-//! session: it names a remote `host:port` source on the connected peer and a
-//! local listener address where traffic is delivered. The seed is activated
-//! interactively (nothing starts automatically). Once a connected peer passes
-//! token auth it is trusted to request any `host:port` source from us (there is
-//! no source allowlist). `validate()` checks address formats at parse time. The
-//! single `auth_token` is the shared secret used by both sides.
+//! Interactive runs pair on demand (the outbound dial target is chosen from the
+//! dashboard, not in the config). The optional `socks_port` seeds the local
+//! SOCKS5 proxy port: once paired, this node can bind a loopback-only SOCKS5
+//! proxy on that port whose CONNECTs egress on the connected peer's network.
+//! The proxy is started interactively (nothing starts automatically). Once a
+//! connected peer passes token auth it is trusted to request a connect-out to
+//! any `host:port` from us (there is no destination allowlist). `validate()`
+//! checks address formats at parse time. The single `auth_token` is the shared
+//! secret used by both sides.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -24,13 +24,12 @@ use std::path::{Path, PathBuf};
 #[derive(Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
-    /// The single TCP tunnel this node can open over its outbound dial session.
-    /// Asks the connected peer to connect out to a remote `remote_source`
-    /// (`host:port`); traffic is delivered to a local `local_listen` address.
-    /// Activated interactively — nothing starts automatically. Optional: in
-    /// configless (`quick`) mode it is set from the TUI instead.
+    /// Local SOCKS5 proxy port (binds loopback only: 127.0.0.1/::1). Once
+    /// paired, the proxy tunnels CONNECTs to the connected peer's network.
+    /// Optional seed; set or changed from the TUI. Started interactively —
+    /// nothing starts automatically.
     #[serde(default)]
-    pub tunnel: Option<TunnelEntry>,
+    pub socks_port: Option<u16>,
     pub relay_urls: Option<Vec<String>>,
     /// Force all traffic through the relay server (disables direct P2P).
     /// Requires at least one entry in `relay_urls`.
@@ -62,17 +61,6 @@ pub struct PeerConfig {
     /// Transport layer tuning (congestion control, buffer sizes).
     #[serde(default)]
     pub transport: TransportTuning,
-}
-
-/// The single TCP tunnel: ask the peer to connect out to `remote_source` and
-/// deliver the traffic to a local listener bound at `local_listen`.
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct TunnelEntry {
-    /// Remote origin on the peer to connect out to (`host:port`, TCP).
-    pub remote_source: String,
-    /// Local address to listen on (`host:port`) where traffic is delivered.
-    pub local_listen: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,112 +138,6 @@ pub struct TransportTuning {
 // Validation Helpers
 // ============================================================================
 
-/// Validate that a string is a strict bare `host:port` address. Accepts exactly one of:
-/// an IPv4 literal (`127.0.0.1:8000`), a bracketed IPv6 literal (`[::1]:8000`), or a
-/// DNS hostname (`host.example:8000`), each followed by a port in `1..=65535`.
-///
-/// Rejects URL-shaped values — a scheme like `tcp://`, a path, userinfo (`@`), a
-/// query/fragment, or any whitespace — and bare (unbracketed) IPv6. A lenient
-/// right-split used to wave these through (e.g. `tcp://127.0.0.1:8000` parsed as host
-/// `tcp://127.0.0.1`), so the typo only surfaced as a connection reset at dial time;
-/// catch it here instead.
-fn validate_host_port(value: &str, field_name: &str) -> Result<()> {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    let invalid = |reason: &str| {
-        anyhow::anyhow!(
-            "{field_name} '{value}' is not a valid host:port ({reason}). Use a bare \
-             address like 127.0.0.1:8000, [::1]:8000, or host.example:8000 — no scheme, \
-             path, or spaces."
-        )
-    };
-
-    if value.is_empty() {
-        return Err(invalid("empty"));
-    }
-    // Reject URL syntax outright: scheme separators, paths, userinfo, query/fragment,
-    // and any whitespace.
-    if value.contains('/')
-        || value.contains('@')
-        || value.contains('?')
-        || value.contains('#')
-        || value.contains(char::is_whitespace)
-    {
-        return Err(invalid("contains scheme, path, userinfo, or whitespace"));
-    }
-
-    // Split host from port, then validate each.
-    let (host, port_str, bracketed) = if let Some(rest) = value.strip_prefix('[') {
-        // Bracketed IPv6: [addr]:port
-        let close = rest
-            .find(']')
-            .ok_or_else(|| invalid("unterminated '[' in IPv6 address"))?;
-        let host = &rest[..close];
-        let port = rest[close + 1..]
-            .strip_prefix(':')
-            .ok_or_else(|| invalid("expected ':port' after ']'"))?;
-        if host.parse::<Ipv6Addr>().is_err() {
-            return Err(invalid("invalid IPv6 address inside brackets"));
-        }
-        (host, port, true)
-    } else {
-        // Unbracketed: exactly one ':' separating host and port.
-        let mut it = value.rsplitn(2, ':');
-        let port = it.next().expect("rsplitn yields at least one element");
-        let host = it.next().ok_or_else(|| invalid("missing port"))?;
-        if host.contains(':') {
-            return Err(invalid("bracket IPv6 addresses as [addr]:port"));
-        }
-        (host, port, false)
-    };
-
-    // Port: 1..=65535 (u16 rejects out-of-range and non-numeric; 0 is meaningless here).
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| invalid("port must be a number in 1..=65535"))?;
-    if port == 0 {
-        return Err(invalid("port must be in 1..=65535"));
-    }
-
-    // Host: the bracketed branch already validated the IPv6 literal; otherwise it must
-    // be an IPv4 literal or a DNS hostname.
-    if bracketed {
-        return Ok(());
-    }
-    if host.is_empty() {
-        return Err(invalid("missing host"));
-    }
-    if host.parse::<Ipv4Addr>().is_ok() {
-        return Ok(());
-    }
-    validate_hostname(host).map_err(|reason| invalid(&reason))?;
-    Ok(())
-}
-
-/// Validate a DNS hostname: dot-separated labels, each 1–63 chars of ASCII letters,
-/// digits, or `-` (not at a label edge), total length ≤ 253. Returns a short reason
-/// string on failure so the caller can wrap it in the field-specific message.
-fn validate_hostname(host: &str) -> std::result::Result<(), String> {
-    if host.len() > 253 {
-        return Err("hostname is longer than 253 characters".into());
-    }
-    for label in host.split('.') {
-        if label.is_empty() {
-            return Err("hostname has an empty label".into());
-        }
-        if label.len() > 63 {
-            return Err("hostname label is longer than 63 characters".into());
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err("hostname label must not start or end with '-'".into());
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err("hostname may contain only letters, digits, '-', and '.'".into());
-        }
-    }
-    Ok(())
-}
-
 /// Validate that a string is a well-formed URL whose scheme is in `allowed_schemes`
 /// and that has a non-empty host. Used for the relay / DNS URL config fields, where a
 /// bare hostname or a wrong/missing scheme is a common mistake — `relay_urls` fails
@@ -292,14 +174,6 @@ fn validate_url(
         Some(h) if !h.is_empty() => Ok(()),
         _ => Err(invalid("missing host")),
     }
-}
-
-/// Validate the single tunnel's address formats: both `remote_source` and
-/// `local_listen` are bare `host:port`.
-pub fn validate_tunnel_spec(tunnel: &TunnelEntry) -> Result<()> {
-    validate_host_port(&tunnel.remote_source, "tunnel.remote_source")?;
-    validate_host_port(&tunnel.local_listen, "tunnel.local_listen")?;
-    Ok(())
 }
 
 /// Max length of a peer `name` (keeps the verbatim state-file path well under
@@ -392,9 +266,7 @@ impl PeerConfig {
     /// headless test role is resolved from env vars, so neither is part of the
     /// config or checked here.
     pub fn validate(&self) -> Result<()> {
-        if let Some(tunnel) = &self.tunnel {
-            validate_tunnel_spec(tunnel)?;
-        }
+        // `socks_port` is a plain u16 (0 = auto-assign) — nothing to validate.
         validate_transport_tuning(&self.transport, "transport")?;
         // A name is only required in config mode (checked at startup), but if one is
         // set it must be a valid identifier — it is used verbatim in the state path.
@@ -584,10 +456,7 @@ mod tests {
     fn parses_toml_config() {
         let toml = r#"
 max_streams = 100
-
-[tunnel]
-remote_source = "127.0.0.1:5678"
-local_listen = "127.0.0.1:15678"
+socks_port = 1080
 
 [transport]
 congestion_controller = "bbr"
@@ -595,9 +464,7 @@ receive_window = 67108864
 "#;
         let cfg: PeerConfig = toml::from_str(toml).expect("config TOML should parse");
         assert_eq!(cfg.max_streams, Some(100));
-        let tunnel = cfg.tunnel.as_ref().expect("a single tunnel");
-        assert_eq!(tunnel.remote_source, "127.0.0.1:5678");
-        assert_eq!(tunnel.local_listen, "127.0.0.1:15678");
+        assert_eq!(cfg.socks_port, Some(1080));
         assert_eq!(
             cfg.transport.congestion_controller,
             CongestionController::Bbr
@@ -608,31 +475,24 @@ receive_window = 67108864
     }
 
     #[test]
-    fn rejects_tunnel_array() {
-        // The multi-tunnel `[[tunnel]]` array no longer parses; only a single
-        // `[tunnel]` table is accepted.
+    fn socks_port_is_optional() {
+        let cfg: PeerConfig = toml::from_str("max_streams = 10\n").unwrap();
+        assert_eq!(cfg.socks_port, None);
+    }
+
+    #[test]
+    fn rejects_tunnel_table() {
+        // Port forwarding was replaced by the SOCKS5 proxy; an old `[tunnel]`
+        // table must fail loudly rather than being silently ignored.
         let toml = r#"
-[[tunnel]]
+[tunnel]
 remote_source = "127.0.0.1:5678"
 local_listen = "127.0.0.1:15678"
 "#;
         assert!(
             toml::from_str::<PeerConfig>(toml).is_err(),
-            "a [[tunnel]] array should fail to parse"
+            "a [tunnel] table should fail to parse"
         );
-    }
-
-    #[test]
-    fn rejects_remote_source_missing_port() {
-        // Sources are bare host:port now; a value with no port is rejected.
-        let cfg = peer_config(PeerConfig {
-            tunnel: Some(TunnelEntry {
-                remote_source: "127.0.0.1".into(),
-                local_listen: "127.0.0.1:15678".into(),
-            }),
-            ..Default::default()
-        });
-        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -668,75 +528,6 @@ tcp = ["127.0.0.0/8"]
             Err(e) => e.to_string(),
         };
         assert!(err.contains("recieve_window"), "error was: {err}");
-    }
-
-    #[test]
-    fn validates_tunnel_address_formats() {
-        let cfg = peer_config(PeerConfig {
-            tunnel: Some(TunnelEntry {
-                remote_source: "127.0.0.1:5678".into(),
-                local_listen: "127.0.0.1:15678".into(),
-            }),
-            ..Default::default()
-        });
-        assert!(cfg.validate().is_ok());
-
-        let bad_listen = peer_config(PeerConfig {
-            tunnel: Some(TunnelEntry {
-                remote_source: "127.0.0.1:5678".into(),
-                local_listen: "127.0.0.1".into(), // missing port
-            }),
-            ..Default::default()
-        });
-        assert!(bad_listen.validate().is_err());
-    }
-
-    #[test]
-    fn host_port_accepts_valid_forms() {
-        for ok in [
-            "127.0.0.1:8000",
-            "0.0.0.0:1",
-            "1.2.3.4:65535",
-            "[::1]:8080",
-            "[::]:443",
-            "[2001:db8::1]:22",
-            "localhost:8000",
-            "host.example.com:443",
-            "a-b.c:53",
-        ] {
-            assert!(
-                validate_host_port(ok, "field").is_ok(),
-                "expected '{ok}' to be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn host_port_rejects_scheme_path_and_malformed() {
-        for bad in [
-            "tcp://127.0.0.1:8000", // scheme — the original bug
-            "http://x/y:80",        // scheme + path
-            "127.0.0.1:8000/path",  // trailing path
-            "user@127.0.0.1:8000",  // userinfo
-            "127.0.0.1:8000?x=1",   // query
-            "127.0.0.1",            // missing port
-            "127.0.0.1:",           // empty port
-            "127.0.0.1:0",          // port 0
-            "127.0.0.1:70000",      // port out of range
-            "127.0.0.1:abc",        // non-numeric port
-            "::1:8080",             // bare (unbracketed) IPv6
-            "[::1]8080",            // missing ':' after ']'
-            "[zzzz]:80",            // invalid IPv6 literal
-            "host .example:80",     // whitespace
-            "-bad.example:80",      // label starts with '-'
-            ":8000",                // missing host
-            "",                     // empty
-        ] {
-            assert!(
-                validate_host_port(bad, "field").is_err(),
-                "expected '{bad}' to be rejected"
-            );
-        }
     }
 
     #[test]

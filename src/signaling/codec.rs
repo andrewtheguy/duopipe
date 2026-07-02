@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Version 6: single TCP LocalForward stream kind; `source` is a bare `host:port`
-/// (no scheme), UDP support removed.
-pub const IROH_MULTI_VERSION: u16 = 6;
+/// Version 7: SOCKS5 CONNECT stream kind (`SocksConnect { host, port }`) replaces
+/// LocalForward; `StreamAck` carries a SOCKS5 REP code for the connect outcome.
+pub const IROH_MULTI_VERSION: u16 = 7;
 
 /// Maximum length for rejection reason to prevent excessively large messages.
 pub const MAX_REJECT_REASON_LENGTH: usize = 512;
@@ -74,24 +74,30 @@ impl std::ops::Deref for AuthToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum StreamHello {
-    /// Request data stream. The opener listens locally and wants the acceptor to
-    /// connect out over TCP to `source` (a bare `host:port`, e.g. "127.0.0.1:22").
-    /// The acceptor (trusting the peer once auth passed) replies with a
-    /// [`StreamAck`] and, on a successful connect, bridges traffic.
-    LocalForward { version: u16, source: String },
+    /// A SOCKS5 CONNECT relayed from the opener's local proxy: the acceptor
+    /// connects out over TCP to `host:port` on ITS network (a domain `host`
+    /// resolves on the acceptor's side). The acceptor (trusting the peer once
+    /// auth passed) replies with a [`StreamAck`] and, on a successful connect,
+    /// bridges traffic.
+    SocksConnect {
+        version: u16,
+        host: String,
+        port: u16,
+    },
 }
 
 impl StreamHello {
-    pub fn local_forward(source: impl Into<String>) -> Self {
-        StreamHello::LocalForward {
+    pub fn socks_connect(host: impl Into<String>, port: u16) -> Self {
+        StreamHello::SocksConnect {
             version: IROH_MULTI_VERSION,
-            source: source.into(),
+            host: host.into(),
+            port,
         }
     }
 
     fn version(&self) -> u16 {
         match self {
-            StreamHello::LocalForward { version, .. } => *version,
+            StreamHello::SocksConnect { version, .. } => *version,
         }
     }
 }
@@ -102,6 +108,9 @@ impl StreamHello {
 pub struct StreamAck {
     pub version: u16,
     pub accepted: bool,
+    /// SOCKS5 REP code for the connect outcome (0x00 = success). The opener
+    /// echoes it verbatim into its local SOCKS5 reply.
+    pub rep: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -111,16 +120,19 @@ impl StreamAck {
         Self {
             version: IROH_MULTI_VERSION,
             accepted: true,
+            rep: 0x00,
             reason: None,
         }
     }
 
-    /// Create a rejection ack with the given reason.
+    /// Create a rejection ack carrying a SOCKS5 REP code (callers pass
+    /// `socks5::REP_*`) and a reason.
     /// The reason will be truncated if it exceeds [`MAX_REJECT_REASON_LENGTH`].
-    pub fn rejected(reason: impl Into<String>) -> Self {
+    pub fn rejected(rep: u8, reason: impl Into<String>) -> Self {
         Self {
             version: IROH_MULTI_VERSION,
             accepted: false,
+            rep,
             reason: Some(truncate_reason(reason.into(), MAX_REJECT_REASON_LENGTH)),
         }
     }
@@ -504,14 +516,19 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_hello_local_forward_roundtrip() {
-        let hello = StreamHello::local_forward("127.0.0.1:22");
+    fn test_stream_hello_socks_connect_roundtrip() {
+        let hello = StreamHello::socks_connect("example.internal", 22);
         let encoded = encode_stream_hello(&hello).unwrap();
         let decoded = decode_stream_hello(&encoded).unwrap();
         match decoded {
-            StreamHello::LocalForward { version, source } => {
+            StreamHello::SocksConnect {
+                version,
+                host,
+                port,
+            } => {
                 assert_eq!(version, IROH_MULTI_VERSION);
-                assert_eq!(source, "127.0.0.1:22");
+                assert_eq!(host, "example.internal");
+                assert_eq!(port, 22);
             }
         }
     }
@@ -521,12 +538,14 @@ mod tests {
         let ack = StreamAck::accepted();
         let decoded = decode_stream_ack(&encode_stream_ack(&ack).unwrap()).unwrap();
         assert!(decoded.accepted);
+        assert_eq!(decoded.rep, 0x00);
         assert!(decoded.reason.is_none());
 
-        let rej = StreamAck::rejected("connect failed");
+        let rej = StreamAck::rejected(0x05, "connect refused");
         let decoded = decode_stream_ack(&encode_stream_ack(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
-        assert_eq!(decoded.reason.as_deref(), Some("connect failed"));
+        assert_eq!(decoded.rep, 0x05);
+        assert_eq!(decoded.reason.as_deref(), Some("connect refused"));
     }
 
     #[test]
@@ -646,9 +665,10 @@ mod tests {
 
     #[test]
     fn test_decode_stream_hello_wrong_version() {
-        let bad = StreamHello::LocalForward {
+        let bad = StreamHello::SocksConnect {
             version: IROH_MULTI_VERSION + 1,
-            source: "127.0.0.1:22".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
         };
         let json = serde_json::to_vec(&bad).unwrap();
         let len = (json.len() as u32).to_be_bytes();
@@ -662,7 +682,7 @@ mod tests {
     fn test_decode_rejects_trailing_bytes() {
         // A valid frame with extra bytes appended must be rejected, not silently
         // truncated to the framed length.
-        let mut buf = encode_stream_hello(&StreamHello::local_forward("127.0.0.1:22")).unwrap();
+        let mut buf = encode_stream_hello(&StreamHello::socks_connect("127.0.0.1", 22)).unwrap();
         // Sanity: the clean frame decodes.
         assert!(decode_stream_hello(&buf).is_ok());
         buf.extend_from_slice(b"trailing");
@@ -681,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_encode_stream_hello_exceeds_max_size() {
-        let hello = StreamHello::local_forward("x".repeat(MAX_SOURCE_MESSAGE_SIZE));
+        let hello = StreamHello::socks_connect("x".repeat(MAX_SOURCE_MESSAGE_SIZE), 80);
         let err = encode_stream_hello(&hello).unwrap_err();
         assert!(err.to_string().contains("too large"));
     }

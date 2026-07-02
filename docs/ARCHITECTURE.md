@@ -20,21 +20,21 @@ This document provides a comprehensive overview of the duopipe architecture, inc
 
 ## System Overview
 
-duopipe is a P2P single-TCP-forward tool using iroh for peer discovery, relay fallback, and encrypted QUIC transport. Each dial session carries one TCP forward — groundwork for a future single SOCKS5 listener (modeled on flextunnel). UDP is intentionally out of scope and lives in a separate project (`../tunnel-rs`).
+duopipe is a P2P SOCKS5-proxy tool using iroh for peer discovery, relay fallback, and encrypted QUIC transport. Once two devices are paired, each side can bind a loopback-only SOCKS5 proxy whose CONNECTs tunnel over the connection to reach services on the *other* device's network (modeled on flextunnel). UDP is intentionally out of scope and lives in a separate project (`../tunnel-rs`).
 
 Binary: `duopipe`
 
 > **Design Goal:** The project's primary goal is to let a **single user link their own devices** (laptop, homelab box, VPS, …) to reach services across them — for development or homelab purposes — without the hassle and security risk of opening a port. Both ends are expected to be machines the same person owns (or otherwise fully trusts). It is **not** meant for production setups, multi-user/multi-tenant access, or to be performant at scale. It is meant for **interactive use** (`duopipe quick` / `duopipe run` and the TUI); the non-interactive env-var override is a **test-mode-only** workaround (`DUOPIPE_TEST_MODE=1`), not a supported automation interface.
 
-duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, the dashboard opens **idle**; the user presses **`Shift-L`** to start the **on-demand serve half** (and `Shift-L` again to stop it), and the instance also holds one **on-demand outbound dial session**. Within any one connection the **dialer requests** its single TCP tunnel and the **server side serves** it; once listening, an instance serves one paired inbound peer per listen session while dialing out itself. Within a tunnel, traffic flows in both directions.
+duopipe runs as a single peer binary, launched in one of two interactive modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each opening a ratatui TUI. There is no separate "server" and "client" binary mode. Interactively, the dashboard opens **idle**; the user presses **`Shift-L`** to start the **on-demand serve half**, OR presses **`Shift-C`** to dial a peer. A run holds **one pairing**: listening and dialing are mutually exclusive (a run is either the listener or the dialer of a single pairing, never both). Once paired, **each** side can bind its own loopback-only SOCKS5 proxy that reaches services on the *other* device's network; traffic on a proxied connection flows in both directions.
 
-There is **no role prompt at startup**: the dashboard opens idle and the serve half is started on demand with `Shift-L` (a toggle — `Shift-L` again stops it), while the dial session is driven independently from the TUI (`Shift-C` to connect, `Shift-D` to disconnect, re-pointable on demand) and works even before listening begins. For tests, the role is single and derived from environment variables (see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated each time the serve half starts, so a stop→start cycle (and every run) mints a new node id.
+There is **no role prompt at startup**: the dashboard opens idle. `Shift-L` starts/stops the serve half (unavailable while a dial session exists); `Shift-C`/`Shift-D` connect/disconnect the dial session (unavailable while listening). For tests, the role is single and derived from environment variables (see [Non-interactive mode](#non-interactive-mode-testing)). The iroh identity is **ephemeral** — a fresh identity is generated each time the serve half starts, so a stop→start cycle (and every run) mints a new node id.
 
-Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that joins a `run_listen_supervisor` (the serve half, started on-demand when the user presses Shift+L — it idles until then) with a `run_dial_manager` (the dial session manager) over a shared `AppState` and stream semaphore. The supervisor brings up `run_listen` under a child cancellation token on a `ListenCommand::Start` and tears it down on `Stop`. The serve half and the dial session use separate iroh endpoints; the listen endpoint owns the displayed/published node id. Single-role `Role::Listen`/`Role::Dial` exist only for the headless test path (and still auto-listen).
+Internally the interactive runtime is `Role::Both`: a `run_serve_and_dial` that joins a `run_listen_supervisor` (the serve half, started on-demand when the user presses Shift+L — it idles until then) with a `run_dial_manager` (the dial session manager) over a shared `AppState` and stream semaphore. The two halves use separate iroh endpoints, but the one-pairing rule makes them mutually exclusive at runtime: `run_dial_manager` refuses to connect while listening and `run_listen_supervisor` refuses to start while a dial session exists (both gate on `AppState::can_dial`/`can_listen`, matching the TUI). The supervisor brings up `run_listen` under a child cancellation token on a `ListenCommand::Start` and tears it down on `Stop`. The listen endpoint owns the displayed/published node id. Single-role `Role::Listen`/`Role::Dial` exist only for the headless test path (and still auto-listen).
 
-Config declares the single **tunnel request** (the dial target is chosen interactively at runtime, not here):
+Config declares the local **SOCKS5 proxy port** (the dial target is chosen interactively at runtime, not here):
 
-- **`[tunnel]`** (`remote_source`, `local_listen`): the template for the dial session. The dialing side binds a local listener at `local_listen`; each accepted local connection asks the **connected peer** to connect out to `remote_source` (a bare `host:port`), then bridges the two. Activated on demand (TUI `s`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode) — nothing forwards automatically.
+- **`socks_port`** (optional `u16`): the local, loopback-only (127.0.0.1 + ::1) port the SOCKS5 proxy binds once paired. The proxy is **symmetric** — either side can run its own. A local app pointed at the proxy issues SOCKS5 CONNECTs; each opens one QUIC stream and the *connected peer* connects out over TCP on its own network (domains resolve on that remote side), then bridges. CONNECT-only, no-auth-method, TCP-only (RFC 1928; no BIND/UDP). Activated on demand (TUI `s`, or `DUOPIPE_AUTOSTART_SOCKS=1` in test mode) — nothing binds automatically.
 
 #### Non-interactive mode (testing)
 
@@ -42,7 +42,8 @@ The project is meant for interactive use, but for automated tests `DUOPIPE_TEST_
 
 - `DUOPIPE_TEST_MODE=1` — run headless; required to enable the vars below.
 - `DUOPIPE_PEER_NODE_ID=<id>` — when set ⇒ dial that node id; when unset ⇒ listen.
-- `DUOPIPE_AUTOSTART_TUNNELS=1` — start the configured `[tunnel]` (dial side) on connect.
+- `DUOPIPE_AUTOSTART_SOCKS=1` — start the local SOCKS5 proxy on connect.
+- `DUOPIPE_SOCKS_PORT=<port>` — seed the local SOCKS5 proxy port for config-free headless runs (0 = OS-assigned).
 - `DUOPIPE_AUTH_TOKEN=<token>` — the shared auth token (in quick mode honored only here in test mode; also valid outside test mode in config mode).
 
 In this mode the listener prints `node_id: <id>` and `auth_token: <token>` to **stderr** so a test harness can capture them and wire up the dialer.
@@ -83,6 +84,7 @@ graph LR
         D[iroh_mode/endpoint.rs<br/>iroh endpoint setup]
         E2[auth.rs<br/>Auth token]
         F[signaling/codec.rs<br/>Stream framing & messages]
+        S[socks5.rs<br/>Local SOCKS5 edge RFC 1928]
     end
 
     A --> T
@@ -95,6 +97,7 @@ graph LR
     C --> D
     C --> E2
     C --> F
+    C --> S
 
     style A fill:#E3F2FD
     style C fill:#E8F5E9
@@ -157,7 +160,7 @@ graph LR
 
 ### Architecture Overview
 
-Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe run`): an on-demand serve half (started with `Shift-L`) plus one on-demand outbound dial session. Within any one connection, the dial session establishes the QUIC connection and **requests** its single tunnel (`[tunnel]`), running the request listener; the connected peer's serve half is a **pure server** for that connection and pairs with one inbound dialer per listen session.
+Both ends run the same interactive peer runtime (`duopipe quick` or `duopipe run`): an on-demand serve half (started with `Shift-L`) OR one on-demand outbound dial session — a run is one or the other (one pairing per run). Connection setup is asymmetric (a dialer establishes the QUIC connection to a listener), but once auth passes the roles are symmetric for data: **either** side may bind a local SOCKS5 proxy and open connect-out streams, and **either** side accepts and bridges the peer's streams.
 
 ```mermaid
 graph TB
@@ -169,10 +172,10 @@ graph TB
         E[Relay Server]
     end
 
-    subgraph "Requester Side of One Connection"
+    subgraph "Dialer Side of One Connection"
         F[on-demand dial session]
         G[iroh Endpoint<br/>ephemeral node id]
-        H[Request Listener<br/>for the active tunnel]
+        H[Local SOCKS5 proxy<br/>loopback bind]
         I[Discovery<br/>Pkarr/DNS]
         J[Relay Server]
     end
@@ -199,7 +202,7 @@ graph TB
 
 ### Connection Establishment Flow
 
-Connection setup is asymmetric (dialer + acceptor), and the tunnel model remains asymmetric for that connection: after auth, the dialer opens request streams for its single tunnel and the listener accepts and bridges them. An interactive process gets bidirectional use by also having its own independent dial session.
+Connection setup is asymmetric (dialer + acceptor), but the proxy model is **symmetric**: after auth, either side may bind a local SOCKS5 proxy and open connect-out streams, and either side accepts and bridges the peer's streams. A run is either the listener or the dialer of the single pairing.
 
 ```mermaid
 sequenceDiagram
@@ -244,57 +247,59 @@ sequenceDiagram
         L->>L: Close connection (error code 2)
     end
 
-    Note over D,L: After auth, the dialer requests its single tunnel
-    D->>L: open_bi() + StreamHello::LocalForward{source}
-    L-->>D: StreamAck + bridged traffic, or rejection
+    Note over D,L: After auth, a local SOCKS5 CONNECT opens one stream
+    D->>L: open_bi() + StreamHello::SocksConnect{host, port}
+    L-->>D: StreamAck{rep} + bridged traffic, or rejection
 ```
 
 ### Stream Dispatch (StreamHello)
 
-The **auth stream is the only stream that does not carry a hello** — it is positional (the first bi-stream the dialer opens). Every *other* bidirectional stream begins with a self-describing [`StreamHello`] frame written by the stream **opener**, so the **acceptor** can route it without positional assumptions. There is now a single non-auth stream kind: `StreamHello::LocalForward { source }`, a tunnel request.
+The **auth stream is the only stream that does not carry a hello** — it is positional (the first bi-stream the dialer opens). Every *other* bidirectional stream begins with a self-describing [`StreamHello`] frame written by the stream **opener**, so the **acceptor** can route it without positional assumptions. There is a single non-auth stream kind: `StreamHello::SocksConnect { host, port }`, one relayed SOCKS5 CONNECT.
 
 ```mermaid
 graph TB
     A[accept_bi: new stream] --> B[Read StreamHello<br/>HELLO_TIMEOUT 10s]
-    B --> C{LocalForward source}
+    B --> C{SocksConnect host, port}
 
     C --> D[Acquire session permit]
-    D --> E[Connect out to source over TCP<br/>bare host:port]
-    E --> F[Reply StreamAck, bridge]
+    D --> E[Resolve host:port on THIS side<br/>remote DNS, then TCP connect out]
+    E --> F[Reply StreamAck rep, bridge]
 
     style B fill:#FFF9C4
     style F fill:#C8E6C9
 ```
 
-A single global `Semaphore` (default `max_streams = 100`), shared across all connected peers, bounds concurrent forwarded **data** streams in both directions (surfaced in the TUI as the `streams` gauge). The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. If the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
+A single global `Semaphore` (default `max_streams = 100`) bounds concurrent proxied **data** streams in both directions (surfaced in the TUI as the `streams` gauge). The auth stream does not consume a permit. A timeout (`HELLO_TIMEOUT`) guards the `StreamHello` read so a stalled opener cannot pin a permit. If the limit is reached the acceptor replies with a rejecting `StreamAck` instead of bridging.
 
-### Request Data Flow
+### SOCKS5 Data Flow
 
-A peer activates its request: it binds the local `local_listen` address and, per incoming connection, opens a stream tagged `StreamHello::LocalForward { source }`. The acceptor connects out over TCP to `source` (a bare `host:port`), replies `StreamAck`, then bridges. The request starts/stops on demand (TUI `s`/`x`, or `DUOPIPE_AUTOSTART_TUNNELS=1` in test mode); stopping it cancels its task and frees the bound port.
+A peer starts its local proxy: it binds a loopback-only listener (127.0.0.1 + ::1) at `socks_port`. Per local SOCKS5 client it performs the RFC 1928 handshake (no-auth, CONNECT only), then opens a stream tagged `StreamHello::SocksConnect { host, port }`. The acceptor resolves `host` on **its own** network (domains resolve remotely), connects out over TCP, replies `StreamAck { rep }` carrying a SOCKS5 reply code, and bridges. The opener relays that `rep` verbatim into its local SOCKS5 reply. The proxy starts/stops on demand (TUI `s`/`x`, or `DUOPIPE_AUTOSTART_SOCKS=1` in test mode); stopping it cancels its task and frees the bound port.
 
 ```mermaid
 sequenceDiagram
-    participant App as Local App
-    participant O as Requester (binds listen)
+    participant App as Local App (SOCKS5)
+    participant O as Proxy side (binds loopback)
     participant P as Peer (acceptor)
-    participant T as Source Service
+    participant T as Destination Service
 
-    App->>O: connect to local listener
-    O->>P: open_bi() + StreamHello::LocalForward{source}
+    App->>O: SOCKS5 greeting + CONNECT host:port
+    O->>P: open_bi() + StreamHello::SocksConnect{host, port}
     alt connect ok
-        P->>T: connect out to source
-        P-->>O: StreamAck{accepted: true}
+        P->>T: resolve + connect out (remote DNS)
+        P-->>O: StreamAck{accepted: true, rep: 0x00}
+        O-->>App: SOCKS5 reply 0x00
         Note over O,P: bridge_streams() copies both directions
     else connect failed
-        P-->>O: StreamAck{accepted: false, reason}
+        P-->>O: StreamAck{accepted: false, rep}
+        O-->>App: SOCKS5 reply with mapped rep code
     end
 ```
 
-The request's listener is owned by a task with its own `CancellationToken`; a `Stop` command (or the connection closing) cancels it, dropping the `TcpListener` and aborting in-flight bridged connections, which frees the bound port.
+The proxy listener is owned by a task with its own `CancellationToken`; a `Stop` command (or the connection closing) cancels it, dropping the `TcpListener` and aborting in-flight bridged connections, which frees the bound port.
 
-### TCP Tunnel Data Flow
+### Stream Data Flow
 
-TCP bridging uses `bridge_streams()` (`iroh_mode/helpers.rs`). The "opener" is the requesting peer that accepted the local connection; the "connect side" is the peer that dials the source.
+TCP bridging uses `bridge_streams()` (`iroh_mode/helpers.rs`). The "opener" is the proxy side that accepted the local SOCKS5 connection; the "connect side" is the peer that resolves and dials the destination.
 
 ```mermaid
 graph LR
@@ -380,7 +385,7 @@ graph TB
 
     subgraph "Options"
         E[auth_token_file — path to the single shared token<br/>auth_token_fingerprint — required in config mode]
-        G[tunnel {remote_source, local_listen}]
+        G[socks_port — local SOCKS5 proxy port]
         H[max_streams]
         I[relay_urls / relay_only / dns_server]
         J[transport<br/>cc + window sizes]
@@ -419,9 +424,7 @@ The TUI displays a short **token fingerprint** — `auth::token_fingerprint`, th
 auth_token_file = "/etc/duopipe/auth_token.txt"
 auth_token_fingerprint = "a1b2c3d4"   # required in config mode; must match the token above
 
-[tunnel]
-remote_source = "127.0.0.1:22"
-local_listen = "127.0.0.1:2222"
+socks_port = 1080   # local SOCKS5 proxy port (loopback only), started on demand
 ```
 
 ### Configuration Loading Flow
@@ -465,9 +468,9 @@ sequenceDiagram
 graph TB
     A[Load Config] --> F{Check fields}
 
-    F --> I{Request address valid?}
+    F --> I{socks_port in range?}
 
-    I -->|No| J[Error: bad request address]
+    I -->|No| J[Error: bad socks_port]
     I -->|Yes| K[Validation Success]
 
     style J fill:#FFCCBC
@@ -522,7 +525,7 @@ graph TB
         C --> D[Dial Peer Connects<br/>fixed ALPN mf/2]
         D --> E[Auth Token Validation]
         E --> F{Valid Token?}
-        F -->|Yes| G["Authenticated<br/>requests served (peer trusted)"]
+        F -->|Yes| G["Authenticated<br/>proxy streams served (peer trusted)"]
         F -->|No| H[Rejected]
     end
 
@@ -537,8 +540,8 @@ graph TB
 **Your own devices, coordinated out-of-band.** duopipe is built for **one person linking devices they own** (laptop ↔ homelab box ↔ VPS) — not a public service or multi-tenant gateway. (Two parties who fully trust each other can use it too, but that is not the primary design point.) Several design choices follow directly from this assumption:
 
 - **Out-of-band credential exchange.** In config and quick manual modes the shared **auth token** is the same value placed on each of your devices, moved over a side channel you already have (a password manager, an existing SSH session, a synced secrets store). The ephemeral node id changes every run, but in config mode it no longer needs hand-copying: it is published to and looked up from nostr, keyed off that same shared token (see [Node-id discovery](#node-id-discovery-nostr)). Quick **PIN** mode shares nothing out of band — the rotating PIN (shown on the listener, typed on the dialer) both locates the node id and authenticates the connection in-band (see [Quick-mode PIN rendezvous](#quick-mode-pin-rendezvous)).
-- **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, the paired peer, and tunnel health — and starts/stops its tunnel manually. Coordination of *what* to expose and *when* is done by you (one person across your screens), not automatically.
-- **Trust assumed between your devices.** Because the dialer can *request* a tunnel of the listener once authenticated, the shared auth secret — the **auth token** in config and quick manual modes, or the rotating **PIN** in quick PIN mode — should only ever be exposed to endpoints you control. Once that secret passes, the connected peer is **fully trusted**: the acceptor will connect out to **any `host:port`** it requests. Security rests **solely** on the shared secret plus the interactive activation.
+- **Interactive, operator-driven runtime.** Each device runs the TUI and watches shared status — connection state, the paired peer, and proxy health — and starts/stops its SOCKS5 proxy manually. Coordination of *what* to reach and *when* is done by you (one person across your screens), not automatically.
+- **Trust assumed between your devices.** Because either side's proxy can ask the peer to connect out once authenticated, the shared auth secret — the **auth token** in config and quick manual modes, or the rotating **PIN** in quick PIN mode — should only ever be exposed to endpoints you control. Once that secret passes, the connected peer is **fully trusted**: the acceptor will connect out to **any `host:port`** the peer's proxy asks for. Security rests **solely** on the shared secret plus the interactive activation; the proxy itself binds loopback-only, so only local apps on the proxying device can drive it.
 
 **One pair per listen session (serve half).** The serve half pairs with a **single dialer** over its one iroh endpoint, for **all** modes (token and quick PIN) — this is the project's intent: one user linking their own devices, one pair at a time. The first peer to authenticate **claims** the endpoint by its node id (`PairClaim` in `iroh_mode/peer.rs`, held for the lifetime of one `run_listen`, i.e. one Shift+L Start→Stop); any *other* node id is then refused during auth (a clean rejection, not a silent drop) until the session is stopped. The claim is deliberately **not** released when the paired peer disconnects, so that peer — and only that peer — can reconnect without re-authenticating:
 
@@ -547,7 +550,7 @@ graph TB
 
 A fresh listen session (Shift+L stop→start) mints a new ephemeral node id and a new, empty claim, so a different device can then pair. The pairing is surfaced inline in the TUI header (`AppState::mark_peer_connected` / `mark_peer_disconnected`, held as a single `InboundPeer`) — connected, or **reserved for `<node id>`** while the paired peer is disconnected — rather than in a multi-row peer list, since there is only ever one peer. `InboundPeer` refcounts the peer's live connections (`active_conns`), so a brief reconnect overlap (a new connection authenticating before the previous one finishes closing) never flickers to "disconnected"; the peer reads as disconnected only once its last connection is gone.
 
-**Dialer requests, listener serves.** Connection setup is asymmetric, and so is the tunnel model: the **dialer** initiates its single tunnel, while the **listener is a pure server** — it runs only the acceptor loop and initiates none of its own. A request asks the listener to connect out to a `source`; once the connection has authenticated, the listener connects out to whatever `host:port` the peer requests — the authenticated peer is fully trusted. The tunnel is activated on demand from the dialer's TUI; nothing forwards until started. To reach a service that lives near the *other* box, dial *from* the box that wants to reach it — every node can dial on demand. Only grant a peer the token if you trust it to reach any host this machine can route to.
+**Symmetric proxy, one pairing.** Connection setup is asymmetric (a dialer connects to a listener), but the proxy is symmetric: **either** side can bind its loopback-only SOCKS5 proxy and open connect-out streams, and **either** side accepts and connects out for the peer. Once authenticated, a side connects out to whatever `host:port` the peer's proxy asks for — the authenticated peer is fully trusted. A run holds one pairing (listening and dialing are mutually exclusive). The proxy binds only on `127.0.0.1`/`::1` and is activated on demand from the TUI; nothing binds until started. To reach a service on the *other* box, run your local SOCKS5 proxy and point an app at it. Only grant a peer the token if you trust it to reach any host each machine can route to.
 
 ### Token Authentication (iroh Mode)
 
@@ -559,11 +562,11 @@ Access control rests on a single shared auth token. (This section covers the tok
 
 1. **Listen Peer Configuration**: The listen peer is configured with the shared auth token (or, in configless manual mode, generates an ephemeral one and displays it in the TUI; configless **PIN** mode uses no token — the PIN authenticates the connection in-band).
 2. **Dial Peer Configuration**: The dial peer is configured with — or interactively prompted for — the same shared token.
-3. **Protocol Flow**: The dialer opens the first bidirectional stream and sends an `AuthRequest` positionally (no hello). **No tunnel streams are processed until authentication succeeds.**
+3. **Protocol Flow**: The dialer opens the first bidirectional stream and sends an `AuthRequest` positionally (no hello). **No data streams are processed until authentication succeeds.**
 4. **Validation**: The listen peer validates the presented token against its single accepted token within a 10-second timeout (`auth_as_listener`).
 5. **Rejection**: An invalid token is rejected with an `AuthResponse` containing the rejection reason, and the connection is closed with an error code.
 
-This validation prevents unauthorized peers from holding open connections or opening tunnel streams.
+This validation prevents unauthorized peers from holding open connections or opening data streams.
 
 ```mermaid
 sequenceDiagram
@@ -580,7 +583,7 @@ sequenceDiagram
     alt Token is valid
         A-->>L: true
         L->>D: AuthResponse {accepted: true}
-        Note over L,D: Connection authenticated — requests served (peer trusted)
+        Note over L,D: Connection authenticated — proxy streams served (peer trusted)
     else Token is invalid
         A-->>L: false
         L->>D: AuthResponse {accepted: false, reason}
@@ -591,7 +594,7 @@ sequenceDiagram
         Note over L,D: Connection closed (auth timeout)
     end
 
-    Note over D,L: After auth, dialer opens StreamHello-tagged request streams
+    Note over D,L: After auth, either side opens StreamHello-tagged SocksConnect streams
 ```
 
 ### Token Security Notes (iroh Mode)
@@ -686,15 +689,15 @@ The PIN crypto round-trips and the full challenge-response handshake are unit-te
 
 ### Signaling Protocol (signaling/codec.rs)
 
-The signaling protocol is `IROH_MULTI_VERSION = 6`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
+The signaling protocol is `IROH_MULTI_VERSION = 7`. All control messages are **length-prefixed JSON**: a `u32` big-endian length followed by the JSON body (capped at 16 KB). Each message embeds a `version` field that is validated on decode.
 
 | Message | Direction | Carried On | Purpose |
 |---------|-----------|------------|---------|
 | `AuthRequest` / `AuthResponse` | dialer → listener / reply | first bi-stream (positional, no hello) | Connection-level token auth. |
-| `StreamHello::LocalForward { source }` | requester → acceptor | first frame of a request data stream | Asks the acceptor to connect out over TCP to `source` (a bare `host:port`) and bridge. |
-| `StreamAck { accepted, reason }` | acceptor → requester | per data stream | Acceptance reply once the acceptor connects out (or fails). |
+| `StreamHello::SocksConnect { host, port }` | opener → acceptor | first frame of a proxy data stream | Asks the acceptor to resolve+connect out over TCP to `host:port` on its own network (remote DNS) and bridge. |
+| `StreamAck { accepted, rep, reason }` | acceptor → opener | per data stream | Acceptance reply carrying a SOCKS5 reply code (`rep`) that the opener relays into its local SOCKS5 reply. |
 
-### TCP Tunneling Architecture
+### SOCKS5 Tunneling Architecture
 
 ```mermaid
 graph TB
@@ -712,8 +715,8 @@ graph TB
 
     subgraph "Connect Side (dials target)"
         H[Read StreamHello]
-        I[Connect out to source]
-        J[StreamAck + Async Read/Write]
+        I[Resolve + connect out to host:port]
+        J[StreamAck rep + Async Read/Write]
     end
     
     D --> E
@@ -751,7 +754,7 @@ The `iroh::Endpoint` provides:
 - `run_dial_manager` — interactive-only manager for the single outbound session. It reuses one client endpoint, idles until a `DialCommand::Connect`, and replaces or disconnects the active session on dashboard commands.
 - `run_dial` — headless test path for a fixed target: `create_client_endpoint` + `connect_to_server`, wrapped in a reconnect loop with exponential backoff (capped at 30s). Auth failures are fatal and stop the loop.
 
-`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then runs an `accept_loop` (incoming requests from the peer, each then connects out over TCP — the peer is trusted post-auth — capped by the global semaphore). The **dialer** additionally drives its single tunnel (`run_tunnel`), starting/stopping it on `TunnelCommand`s from the TUI under a `CancellationToken`; the **listener** runs only the acceptor (it is a pure server). In test mode, `DUOPIPE_AUTOSTART_TUNNELS=1` starts the dial-side tunnel on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
+`handle_connection` authenticates (`auth_as_dialer` / `auth_as_listener`), then — on **both** sides, since the proxy is symmetric — runs an `accept_loop` (incoming `SocksConnect` streams from the peer, each resolved and connected out over TCP; the peer is trusted post-auth, capped by the global semaphore) alongside a `socks_supervisor` that starts/stops the local SOCKS5 proxy (`run_socks_proxy`) on `SocksCommand`s from the TUI under a `CancellationToken`. In test mode, `DUOPIPE_AUTOSTART_SOCKS=1` starts the local proxy on connect. Everything is torn down when `conn.closed()` resolves; the listener also drops the peer from its list.
 
 ---
 
@@ -811,7 +814,7 @@ has its own internal reconnect loop; the process only exits on fatal errors.
 |------|----------|---------|
 | 0 | Success | Normal termination |
 | 1 | General error | Unexpected/uncategorized failures |
-| 2 | Configuration | Missing/invalid node id, invalid token format, bad request address |
+| 2 | Configuration | Missing/invalid node id, invalid token format, bad socks_port |
 | 3 | Authentication | Token rejected by peer, auth response timeout |
 | 10 | Connection failed | Relay timeout, endpoint offline, peer unreachable |
 | 11 | Connection lost | QUIC connection closed after tunnel was established |
@@ -835,9 +838,10 @@ Retry guidance:
 
 | Feature | Support |
 |---------|---------|
-| Bidirectional tunnel | **Yes** — the dialer requests its single TCP tunnel; the listener serves it, and the tunnel carries traffic both ways |
-| Multi-Stream | **Yes** — many concurrent forwarded data streams per connection (`max_streams`) |
-| Single TCP forward | **Yes** — one `[tunnel]` (`remote_source` / `local_listen`) per dial session; groundwork for a future single SOCKS5 listener |
+| Symmetric SOCKS5 proxy | **Yes** — once paired, each side can bind a loopback-only SOCKS5 proxy reaching the other device's network |
+| Bidirectional | **Yes** — either side may run its proxy and open connect-out streams; each proxied connection carries traffic both ways |
+| Multi-Stream | **Yes** — many concurrent proxied data streams per connection (`max_streams`) |
+| SOCKS5 scope | CONNECT only, no-auth method, ATYP ipv4/ipv6/domain (remote DNS); no BIND, no UDP ASSOCIATE (RFC 1928 subset) |
 | UDP forwarding | **No** — intentionally out of scope; lives in a separate project (`../tunnel-rs`) |
 | Encryption | QUIC/TLS 1.3 |
 | Platform | Linux, macOS, Windows |

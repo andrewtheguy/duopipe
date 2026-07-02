@@ -6,6 +6,7 @@
 //! `parking_lot` locks are safe inside async tasks. The session gauge reads the
 //! live [`Semaphore`] so it can never drift from the real limiter.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,20 +15,19 @@ use parking_lot::RwLock;
 use tokio::sync::{Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::TunnelEntry;
 use crate::logging::LogBuffer;
 
-/// Capacity of the tunnel-command broadcast channel (commands are tiny; this
+/// Capacity of the SOCKS-command broadcast channel (commands are tiny; this
 /// only bounds how far a lagging connection supervisor may fall behind).
-const TUNNEL_COMMAND_CAPACITY: usize = 64;
+const SOCKS_COMMAND_CAPACITY: usize = 64;
 const DIAL_COMMAND_CAPACITY: usize = 16;
 const NAME_COMMAND_CAPACITY: usize = 8;
 const LISTEN_COMMAND_CAPACITY: usize = 8;
 
-/// A request to start or stop this peer's single tunnel. Sent by the TUI,
+/// A request to start or stop this peer's local SOCKS5 proxy. Sent by the TUI,
 /// consumed by the connection supervisor.
 #[derive(Debug, Clone, Copy)]
-pub enum TunnelCommand {
+pub enum SocksCommand {
     Start,
     Stop,
 }
@@ -211,45 +211,40 @@ pub enum ListenStatus {
     Listening,
 }
 
-/// Lifecycle status of a configured tunnel.
+/// Lifecycle status of the local SOCKS5 proxy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TunnelStatus {
-    /// Configured but not started (or stopped).
+pub enum SocksStatus {
+    /// Port configured but the proxy is not started (or stopped).
     Idle,
-    /// Local listener is bound and the tunnel is active.
+    /// The local loopback listener is bound and proxying.
     Listening,
-    /// The tunnel failed (bind error, peer rejection, etc.).
+    /// The proxy failed (bind error, etc.).
     Error,
 }
 
-impl TunnelStatus {
+impl SocksStatus {
     pub fn label(self) -> &'static str {
         match self {
-            TunnelStatus::Idle => "Idle",
-            TunnelStatus::Listening => "Listening",
-            TunnelStatus::Error => "Error",
+            SocksStatus::Idle => "Idle",
+            SocksStatus::Listening => "Listening",
+            SocksStatus::Error => "Error",
         }
     }
 
-    /// Whether the tunnel is currently running (toggling it should stop it).
+    /// Whether the proxy is currently running (toggling it should stop it).
     pub fn is_running(self) -> bool {
-        matches!(self, TunnelStatus::Listening)
+        matches!(self, SocksStatus::Listening)
     }
 }
 
-/// The single configured tunnel and its current status, as rendered by the TUI.
+/// The configured SOCKS5 proxy and its current status, as rendered by the TUI.
 #[derive(Clone)]
-pub struct TunnelRow {
-    /// Human-readable "LISTEN <- SOURCE" description.
-    pub spec: String,
-    pub status: TunnelStatus,
-    /// Bound address or rejection/error reason.
+pub struct SocksRow {
+    /// Configured local port (0 = auto-assign; see `detail` for the bound address).
+    pub port: u16,
+    pub status: SocksStatus,
+    /// Bound address or error reason.
     pub detail: String,
-}
-
-/// Human-readable "LISTEN <- SOURCE" description for a tunnel.
-fn tunnel_spec_label(entry: &TunnelEntry) -> String {
-    format!("{} <- {}", entry.local_listen, entry.remote_source)
 }
 
 /// The single inbound peer the serve half is paired with this listen session. duopipe pairs one
@@ -297,19 +292,22 @@ pub struct AppState {
     /// authenticates). Retained through a disconnect as the endpoint's reservation and cleared only
     /// when the serve half stops. The dial session tracks its own outbound path separately via `path`.
     inbound: RwLock<Option<InboundPeer>>,
-    /// The single configured tunnel spec (`None` until set from config or the TUI).
-    /// The supervisor reads it on `Start`; the TUI sets/clears it.
-    tunnel: RwLock<Option<TunnelEntry>>,
-    /// Current status of the single tunnel.
-    tunnel_status: RwLock<TunnelStatus>,
-    /// Bound address or rejection/error reason for the single tunnel.
-    tunnel_detail: RwLock<String>,
+    /// The configured local SOCKS5 proxy port (`None` until set from config or the
+    /// TUI). The supervisor reads it on `Start`; the TUI sets/clears it.
+    socks_port: RwLock<Option<u16>>,
+    /// Current status of the local SOCKS5 proxy.
+    socks_status: RwLock<SocksStatus>,
+    /// Bound address or error reason for the local SOCKS5 proxy.
+    socks_detail: RwLock<String>,
+    /// The proxy's actually-bound loopback address while it is running (`None`
+    /// otherwise). With port 0 this is where the OS-assigned port surfaces.
+    socks_bound: RwLock<Option<SocketAddr>>,
     /// Live stream limiter; `used = max - available_permits()`. One global cap on
-    /// concurrent forwarded streams across all tunnels and all connected peers.
+    /// concurrent proxied streams across both directions.
     semaphore: RwLock<Option<Arc<Semaphore>>>,
     streams_max: RwLock<usize>,
-    /// Broadcast channel for tunnel start/stop commands (TUI -> connection supervisor).
-    tunnel_tx: broadcast::Sender<TunnelCommand>,
+    /// Broadcast channel for SOCKS start/stop commands (TUI -> connection supervisor).
+    socks_tx: broadcast::Sender<SocksCommand>,
     /// Broadcast channel for dial connect/disconnect commands (TUI -> dial manager).
     dial_tx: broadcast::Sender<DialCommand>,
     /// Broadcast channel for serve-half start/stop commands (TUI -> listen supervisor).
@@ -346,12 +344,12 @@ impl AppState {
         role: Role,
         token_generated: bool,
         logs: Arc<LogBuffer>,
-        tunnel: Option<TunnelEntry>,
+        socks_port: Option<u16>,
         nostr_discovery: bool,
         own_name: Option<String>,
         pin_mode: bool,
     ) -> Arc<Self> {
-        let (tunnel_tx, _) = broadcast::channel(TUNNEL_COMMAND_CAPACITY);
+        let (socks_tx, _) = broadcast::channel(SOCKS_COMMAND_CAPACITY);
         let (dial_tx, _) = broadcast::channel(DIAL_COMMAND_CAPACITY);
         let (name_tx, _) = broadcast::channel(NAME_COMMAND_CAPACITY);
         let (listen_tx, _) = broadcast::channel(LISTEN_COMMAND_CAPACITY);
@@ -364,12 +362,13 @@ impl AppState {
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
             inbound: RwLock::new(None),
-            tunnel: RwLock::new(tunnel),
-            tunnel_status: RwLock::new(TunnelStatus::Idle),
-            tunnel_detail: RwLock::new(String::new()),
+            socks_port: RwLock::new(socks_port),
+            socks_status: RwLock::new(SocksStatus::Idle),
+            socks_detail: RwLock::new(String::new()),
+            socks_bound: RwLock::new(None),
             semaphore: RwLock::new(None),
             streams_max: RwLock::new(0),
-            tunnel_tx,
+            socks_tx,
             dial_tx,
             listen_tx,
             listen_status: RwLock::new(ListenStatus::Stopped),
@@ -386,15 +385,15 @@ impl AppState {
         })
     }
 
-    /// Subscribe to tunnel commands. Each connection supervisor subscribes once;
+    /// Subscribe to SOCKS commands. Each connection supervisor subscribes once;
     /// only commands sent after subscribing are delivered (so reconnects start clean).
-    pub fn subscribe_commands(&self) -> broadcast::Receiver<TunnelCommand> {
-        self.tunnel_tx.subscribe()
+    pub fn subscribe_socks(&self) -> broadcast::Receiver<SocksCommand> {
+        self.socks_tx.subscribe()
     }
 
-    /// Send a tunnel command to any active connection supervisor(s).
-    pub fn send_command(&self, cmd: TunnelCommand) {
-        let _ = self.tunnel_tx.send(cmd);
+    /// Send a SOCKS command to any active connection supervisor(s).
+    pub fn send_socks_cmd(&self, cmd: SocksCommand) {
+        let _ = self.socks_tx.send(cmd);
     }
 
     /// Subscribe to dial commands. The dial manager subscribes once at startup.
@@ -489,6 +488,25 @@ impl AppState {
         *self.dial_target.write() = target;
     }
 
+    /// Whether an outbound dial session exists (connecting, connected, or backing off).
+    pub fn dial_session_active(&self) -> bool {
+        self.dial_target.read().is_some()
+    }
+
+    /// One-pairing rule: dialing out is allowed only while this run is not the
+    /// listening side of a pairing. Strict exclusivity — listening at all (even
+    /// before a peer pairs in) blocks dialing, so there is no window where an
+    /// inbound pairing lands mid-dial.
+    pub fn can_dial(&self) -> bool {
+        !self.listening()
+    }
+
+    /// One-pairing rule, the other direction: listening may start only while no
+    /// outbound dial session exists.
+    pub fn can_listen(&self) -> bool {
+        !self.dial_session_active()
+    }
+
     /// Record the current rotating PIN (canonical form) and the instant it rolls over,
     /// for the PIN + refresh-countdown header. Set by the PIN publisher each rotation.
     pub fn set_current_pin(&self, pin: String, deadline: Instant) {
@@ -496,22 +514,22 @@ impl AppState {
         *self.pin_deadline.write() = Some(deadline);
     }
 
-    /// Start the single tunnel's listener. A no-op when no tunnel is configured; the
+    /// Start the local SOCKS5 proxy. A no-op when no port is configured; the
     /// supervisor ignores a redundant Start if it is already running.
-    pub fn start_tunnel(&self) {
-        if self.tunnel.read().is_none() {
+    pub fn start_socks(&self) {
+        if self.socks_port.read().is_none() {
             return;
         }
-        self.send_command(TunnelCommand::Start);
+        self.send_socks_cmd(SocksCommand::Start);
     }
 
-    /// Stop the single tunnel's listener. A no-op when no tunnel is configured; the
+    /// Stop the local SOCKS5 proxy. A no-op when no port is configured; the
     /// supervisor ignores a Stop if it is not running.
-    pub fn stop_tunnel(&self) {
-        if self.tunnel.read().is_none() {
+    pub fn stop_socks(&self) {
+        if self.socks_port.read().is_none() {
             return;
         }
-        self.send_command(TunnelCommand::Stop);
+        self.send_socks_cmd(SocksCommand::Stop);
     }
 
     pub fn set_endpoint_id(&self, id: String) {
@@ -583,50 +601,61 @@ impl AppState {
         }
     }
 
-    /// Reset the tunnel's status to `Idle` (clearing any detail) on each
-    /// (re)connection. The spec itself persists across reconnects.
-    pub fn reset_tunnel_status(&self) {
-        *self.tunnel_status.write() = TunnelStatus::Idle;
-        self.tunnel_detail.write().clear();
+    /// Reset the proxy's status to `Idle` (clearing any detail and bound address)
+    /// on each (re)connection. The configured port persists across reconnects.
+    pub fn reset_socks_status(&self) {
+        *self.socks_status.write() = SocksStatus::Idle;
+        self.socks_detail.write().clear();
+        *self.socks_bound.write() = None;
     }
 
-    /// The single tunnel spec, cloned (used by the connection supervisor on `Start`).
-    pub fn tunnel(&self) -> Option<TunnelEntry> {
-        self.tunnel.read().clone()
+    /// The configured SOCKS5 port (used by the connection supervisor on `Start`).
+    pub fn socks_port(&self) -> Option<u16> {
+        *self.socks_port.read()
     }
 
-    /// Whether a tunnel is configured.
-    pub fn has_tunnel(&self) -> bool {
-        self.tunnel.read().is_some()
+    /// Whether a SOCKS5 port is configured.
+    pub fn has_socks(&self) -> bool {
+        self.socks_port.read().is_some()
     }
 
-    /// Whether the tunnel is currently running (used to gate the set/clear actions).
-    pub fn tunnel_running(&self) -> bool {
-        self.tunnel_status.read().is_running()
+    /// Whether the proxy is currently running (used to gate the set/clear actions).
+    pub fn socks_running(&self) -> bool {
+        self.socks_status.read().is_running()
     }
 
-    /// Set (or replace) the single tunnel, resetting its status to `Idle`. The caller
-    /// guarantees it is not running. No `Start` is sent here.
-    pub fn set_tunnel(&self, entry: TunnelEntry) {
-        *self.tunnel.write() = Some(entry);
-        *self.tunnel_status.write() = TunnelStatus::Idle;
-        self.tunnel_detail.write().clear();
+    /// Set (or replace) the SOCKS5 port, resetting the status to `Idle`. The caller
+    /// guarantees the proxy is not running. No `Start` is sent here.
+    pub fn set_socks_port(&self, port: u16) {
+        *self.socks_port.write() = Some(port);
+        self.reset_socks_status();
     }
 
-    /// Remove the tunnel from the session (config is never touched). If it is
-    /// running, a `Stop` is broadcast first so the supervisor cancels its task and
-    /// frees the bound local port.
-    pub fn clear_tunnel(&self) {
-        self.send_command(TunnelCommand::Stop);
-        *self.tunnel.write() = None;
-        *self.tunnel_status.write() = TunnelStatus::Idle;
-        self.tunnel_detail.write().clear();
+    /// Remove the SOCKS5 port from the session (config is never touched). If the
+    /// proxy is running, a `Stop` is broadcast first so the supervisor cancels its
+    /// task and frees the bound local port.
+    pub fn clear_socks(&self) {
+        self.send_socks_cmd(SocksCommand::Stop);
+        *self.socks_port.write() = None;
+        self.reset_socks_status();
     }
 
-    /// Update the tunnel's status/detail.
-    pub fn update_tunnel(&self, status: TunnelStatus, detail: impl Into<String>) {
-        *self.tunnel_status.write() = status;
-        *self.tunnel_detail.write() = detail.into();
+    /// Update the proxy's status/detail.
+    pub fn update_socks(&self, status: SocksStatus, detail: impl Into<String>) {
+        *self.socks_status.write() = status;
+        *self.socks_detail.write() = detail.into();
+    }
+
+    /// Record (or clear) the proxy's actually-bound loopback address.
+    pub fn set_socks_bound(&self, addr: Option<SocketAddr>) {
+        *self.socks_bound.write() = addr;
+    }
+
+    /// The proxy's bound loopback address while running (`None` otherwise). Used by
+    /// tests to learn the OS-assigned port when binding with port 0.
+    #[cfg(test)]
+    pub fn socks_bound(&self) -> Option<SocketAddr> {
+        *self.socks_bound.read()
     }
 
     /// Take an owned snapshot for rendering (releases all locks before returning).
@@ -638,10 +667,10 @@ impl AppState {
             .as_ref()
             .map(|s| streams_max.saturating_sub(s.available_permits()))
             .unwrap_or(0);
-        let tunnel = self.tunnel.read().as_ref().map(|entry| TunnelRow {
-            spec: tunnel_spec_label(entry),
-            status: *self.tunnel_status.read(),
-            detail: self.tunnel_detail.read().clone(),
+        let socks = self.socks_port.read().map(|port| SocksRow {
+            port,
+            status: *self.socks_status.read(),
+            detail: self.socks_detail.read().clone(),
         });
         AppSnapshot {
             role: self.role,
@@ -660,7 +689,7 @@ impl AppState {
             dial_target: self.dial_target.read().clone(),
             name_conflict: self.name_conflict.read().clone(),
             inbound: self.inbound.read().clone(),
-            tunnel,
+            socks,
             streams_used,
             streams_max,
         }
@@ -693,8 +722,8 @@ pub struct AppSnapshot {
     /// The single inbound peer paired this listen session, or `None`. `connected == false` means it
     /// is currently disconnected but the endpoint stays reserved for it.
     pub inbound: Option<InboundPeer>,
-    /// The single configured tunnel's row, or `None` when none is set.
-    pub tunnel: Option<TunnelRow>,
+    /// The configured SOCKS5 proxy's row, or `None` when no port is set.
+    pub socks: Option<SocksRow>,
     pub streams_used: usize,
     pub streams_max: usize,
 }
@@ -704,65 +733,90 @@ mod tests {
     use super::*;
     use crate::logging::LogBuffer;
 
-    fn req(src: &str, listen: &str) -> TunnelEntry {
-        TunnelEntry {
-            remote_source: src.into(),
-            local_listen: listen.into(),
-        }
-    }
-
     #[test]
-    fn config_tunnel_seeded_into_snapshot_at_construction() {
-        // A configured tunnel must be visible (Idle) in the dashboard from launch.
-        let seed = Some(req("127.0.0.1:5678", "127.0.0.1:15678"));
-        let state = AppState::new(Role::Both, false, LogBuffer::new(16), seed, false, None, false);
-        assert!(state.has_tunnel());
-        let row = state.snapshot().tunnel.expect("tunnel row present");
-        assert_eq!(row.spec, "127.0.0.1:15678 <- 127.0.0.1:5678");
-        assert_eq!(row.status, TunnelStatus::Idle);
-    }
-
-    #[test]
-    fn set_and_clear_tunnel() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
-        assert!(!state.has_tunnel());
-        assert!(state.snapshot().tunnel.is_none());
-
-        state.set_tunnel(req("127.0.0.1:22", "127.0.0.1:2222"));
-        assert!(state.has_tunnel());
-        let got = state.tunnel().expect("tunnel present");
-        assert_eq!(got.remote_source, "127.0.0.1:22");
-        let row = state.snapshot().tunnel.expect("row present");
-        assert_eq!(row.spec, "127.0.0.1:2222 <- 127.0.0.1:22");
-        assert_eq!(row.status, TunnelStatus::Idle);
-
-        // Replacing in place keeps a single tunnel.
-        state.set_tunnel(req("127.0.0.1:80", "127.0.0.1:8080"));
-        assert_eq!(state.tunnel().unwrap().remote_source, "127.0.0.1:80");
-
-        state.clear_tunnel();
-        assert!(!state.has_tunnel());
-        assert!(state.snapshot().tunnel.is_none());
-    }
-
-    #[test]
-    fn update_tunnel_reflects_in_snapshot() {
-        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
-        state.set_tunnel(req("127.0.0.1:22", "127.0.0.1:2222"));
-
-        state.update_tunnel(TunnelStatus::Listening, "127.0.0.1:2222");
-        assert!(state.tunnel_running());
-        let row = state.snapshot().tunnel.expect("row present");
-        assert_eq!(row.status, TunnelStatus::Listening);
-        assert_eq!(row.detail, "127.0.0.1:2222");
-
-        // A (re)connection resets the status back to Idle.
-        state.reset_tunnel_status();
-        assert!(!state.tunnel_running());
-        assert_eq!(
-            state.snapshot().tunnel.expect("row present").status,
-            TunnelStatus::Idle
+    fn config_socks_port_seeded_into_snapshot_at_construction() {
+        // A configured SOCKS port must be visible (Idle) in the dashboard from launch.
+        let state = AppState::new(
+            Role::Both,
+            false,
+            LogBuffer::new(16),
+            Some(1080),
+            false,
+            None,
+            false,
         );
+        assert!(state.has_socks());
+        let row = state.snapshot().socks.expect("socks row present");
+        assert_eq!(row.port, 1080);
+        assert_eq!(row.status, SocksStatus::Idle);
+    }
+
+    #[test]
+    fn set_and_clear_socks_port() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
+        assert!(!state.has_socks());
+        assert!(state.snapshot().socks.is_none());
+
+        state.set_socks_port(1080);
+        assert!(state.has_socks());
+        assert_eq!(state.socks_port(), Some(1080));
+        let row = state.snapshot().socks.expect("row present");
+        assert_eq!(row.port, 1080);
+        assert_eq!(row.status, SocksStatus::Idle);
+
+        // Replacing in place keeps a single port.
+        state.set_socks_port(1081);
+        assert_eq!(state.socks_port(), Some(1081));
+
+        state.clear_socks();
+        assert!(!state.has_socks());
+        assert!(state.snapshot().socks.is_none());
+    }
+
+    #[test]
+    fn update_socks_reflects_in_snapshot() {
+        let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
+        state.set_socks_port(1080);
+
+        state.update_socks(SocksStatus::Listening, "127.0.0.1:1080");
+        state.set_socks_bound(Some("127.0.0.1:1080".parse().unwrap()));
+        assert!(state.socks_running());
+        assert_eq!(state.socks_bound(), Some("127.0.0.1:1080".parse().unwrap()));
+        let row = state.snapshot().socks.expect("row present");
+        assert_eq!(row.status, SocksStatus::Listening);
+        assert_eq!(row.detail, "127.0.0.1:1080");
+
+        // A (re)connection resets the status back to Idle and drops the bound addr.
+        state.reset_socks_status();
+        assert!(!state.socks_running());
+        assert!(state.socks_bound().is_none());
+        assert_eq!(
+            state.snapshot().socks.expect("row present").status,
+            SocksStatus::Idle
+        );
+    }
+
+    #[test]
+    fn pairing_gates_enforce_listen_xor_dial() {
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, false);
+        // Idle: both directions available.
+        assert!(state.can_dial());
+        assert!(state.can_listen());
+
+        // Listening blocks dialing (even before an inbound peer pairs).
+        state.set_listen_status(ListenStatus::Listening);
+        assert!(!state.can_dial());
+        assert!(state.can_listen());
+        state.clear_listen();
+        assert!(state.can_dial());
+
+        // An outbound dial session blocks listening.
+        state.set_dial_target(Some("peer".into()));
+        assert!(state.dial_session_active());
+        assert!(!state.can_listen());
+        assert!(state.can_dial());
+        state.set_dial_target(None);
+        assert!(state.can_listen());
     }
 
     #[test]

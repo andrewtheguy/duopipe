@@ -10,8 +10,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use tui_input::Input;
 
 use super::textinput::{INPUT_FIELD_HEIGHT, render_input_field};
-use crate::app_state::{AppSnapshot, ConnStatus, NameConflict, Role, TunnelRow, TunnelStatus};
-use crate::config::TunnelEntry;
+use crate::app_state::{AppSnapshot, ConnStatus, NameConflict, Role, SocksRow, SocksStatus};
 use crate::logging::LogLine;
 
 /// Which top-level screen the dashboard is showing. Logs live on their own screen
@@ -37,8 +36,8 @@ pub struct UiState {
     /// `Warn` churn flagged `verbose_only`); otherwise only the concise view. Toggled
     /// with `v` on the logs screen.
     pub verbose: bool,
-    /// When `Some`, the set-tunnel modal is open and captures all keystrokes.
-    pub add_form: Option<AddTunnelForm>,
+    /// When `Some`, the set-SOCKS-port modal is open and captures all keystrokes.
+    pub add_form: Option<SocksForm>,
     /// When `Some`, the "connect to peer" modal is open and captures all keystrokes.
     pub connect_form: Option<ConnectForm>,
     /// Whether the generated-secret banner (manual-mode auth token or quick-mode PIN) is
@@ -56,43 +55,22 @@ pub struct UiState {
     pub quit_armed: bool,
 }
 
-/// Which field the set-tunnel modal is currently editing. Both fields are bare
-/// `host:port` text inputs.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AddField {
-    #[default]
-    RemoteSource,
-    LocalListen,
-}
-
-/// In-progress entry for the set-tunnel modal (modal state). Used both to set a
-/// fresh tunnel and to replace the current one (only allowed while it is not
-/// running). Both fields hold a bare `host:port`.
+/// In-progress entry for the set-SOCKS-port modal (modal state). Used both to set a
+/// fresh port and to replace the current one (only allowed while the proxy is not
+/// running). The single field holds a decimal port (1..=65535).
 #[derive(Default)]
-pub struct AddTunnelForm {
-    pub field: AddField,
-    pub remote_source: Input,
-    pub local_listen: Input,
+pub struct SocksForm {
+    pub port: Input,
     /// Inline validation error from the last failed submit; cleared on next keypress.
     pub error: Option<String>,
 }
 
-impl AddTunnelForm {
-    /// Build a form pre-filled from `entry`'s current spec (replace in place).
-    pub fn edit(entry: &TunnelEntry) -> Self {
+impl SocksForm {
+    /// Build a form pre-filled with the current port (replace in place).
+    pub fn edit(port: u16) -> Self {
         Self {
-            field: AddField::RemoteSource,
-            remote_source: Input::new(entry.remote_source.clone()),
-            local_listen: Input::new(entry.local_listen.clone()),
+            port: Input::new(port.to_string()),
             error: None,
-        }
-    }
-
-    /// The text input for the field currently being edited.
-    pub fn active_mut(&mut self) -> Option<&mut Input> {
-        match self.field {
-            AddField::RemoteSource => Some(&mut self.remote_source),
-            AddField::LocalListen => Some(&mut self.local_listen),
         }
     }
 }
@@ -236,14 +214,21 @@ fn render_home_footer(frame: &mut Frame, area: Rect, snap: &AppSnapshot, ui: &Ui
         "press Esc again to quit".to_string()
     } else {
         // The show/hide-secret hint only makes sense while listening — there is no node
-        // id / PIN / token banner to toggle before the serve half is up.
+        // id / PIN / token banner to toggle before the serve half is up. One-pairing rule:
+        // while an outbound dial session exists, listening is unavailable, so drop the
+        // Shift+L hint entirely.
         let (listen, secret_hint) = if snap.listening {
             let secret = if snap.pin_mode { "PIN" } else { "token" };
-            ("Shift+L stop listening", format!(" · h show/hide {secret}"))
+            (
+                "Shift+L stop listening · ".to_string(),
+                format!(" · h show/hide {secret}"),
+            )
+        } else if snap.dial_target.is_some() {
+            (String::new(), String::new())
         } else {
-            ("Shift+L start listening", String::new())
+            ("Shift+L start listening · ".to_string(), String::new())
         };
-        format!("{listen} · l logs · w dump{secret_hint} · Esc Esc quit")
+        format!("{listen}l logs · w dump{secret_hint} · Esc Esc quit")
     };
     let para = Paragraph::new(Line::from(Span::styled(
         text,
@@ -566,7 +551,9 @@ fn dial_hint(connected: bool) -> Span<'static> {
 fn dial_header_line(snap: &AppSnapshot, show_hint: bool) -> Line<'static> {
     let Some(target) = snap.dial_target.as_deref() else {
         let mut spans = vec![Span::raw(dial_text(snap))];
-        if show_hint {
+        // One-pairing rule: dialing is unavailable while listening, so hide the
+        // connect hint in that state (Shift+C is refused by the runtime too).
+        if show_hint && !snap.listening {
             spans.push(dial_hint(false));
         }
         return Line::from(spans);
@@ -587,19 +574,19 @@ fn dial_header_line(snap: &AppSnapshot, show_hint: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Modal for setting the single tunnel at runtime. Two text fields are rendered
-/// as standard bordered input boxes; the active one owns the terminal cursor.
-pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
+/// Modal for setting the local SOCKS5 proxy port at runtime. One text field
+/// rendered as a standard bordered input box; it owns the terminal cursor.
+pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &SocksForm) {
     let error_rows = if form.error.is_some() { 2 } else { 0 };
     let area = centered(
         frame.area(),
-        92,
-        2 + 2 + INPUT_FIELD_HEIGHT * 2 + 1 + 2 + error_rows + 1,
+        84,
+        2 + 2 + INPUT_FIELD_HEIGHT + 1 + 2 + error_rows + 1,
     );
     frame.render_widget(Clear, area);
     let panel = Block::default()
         .borders(Borders::ALL)
-        .title(" set tunnel ");
+        .title(" set SOCKS5 port ");
     frame.render_widget(panel, area);
 
     let inner = area.inner(Margin {
@@ -608,7 +595,6 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
     });
     let mut constraints = vec![
         Constraint::Length(2),
-        Constraint::Length(INPUT_FIELD_HEIGHT),
         Constraint::Length(INPUT_FIELD_HEIGHT),
         Constraint::Length(1),
         Constraint::Length(2),
@@ -625,7 +611,7 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         chunks[i],
         vec![
             Line::from(Span::styled(
-                "Set tunnel",
+                "Set SOCKS5 proxy port",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -634,36 +620,14 @@ pub fn render_add_tunnel_dialog(frame: &mut Frame, form: &AddTunnelForm) {
         ],
     );
     i += 1;
-    render_input_field(
-        frame,
-        chunks[i],
-        "Remote source",
-        &form.remote_source,
-        form.field == AddField::RemoteSource,
-    );
+    render_input_field(frame, chunks[i], "Local port", &form.port, true);
     i += 1;
-    render_input_field(
-        frame,
-        chunks[i],
-        "Local listen",
-        &form.local_listen,
-        form.field == AddField::LocalListen,
-    );
-    i += 1;
+    i += 1; // spacer before hint
     render_modal_line(
         frame,
         chunks[i],
         Line::from(Span::styled(
-            "remote_source: host:port (TCP, on the peer)   local_listen: host:port (here)",
-            Style::default().fg(Color::DarkGray),
-        )),
-    );
-    i += 1;
-    render_modal_line(
-        frame,
-        chunks[i],
-        Line::from(Span::styled(
-            "↑/↓ move field · Enter on local_listen sets (s to start) · Esc cancel",
+            "binds 127.0.0.1/::1 · Enter set (s to start) · Esc cancel",
             Style::default().fg(Color::DarkGray),
         )),
     );
@@ -802,17 +766,11 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, _ui: &UiState) {
-    let header = Row::new(["", "SPEC", "STATUS", "DETAIL"])
+    let header = Row::new(["", "PROXY", "STATUS", "DETAIL"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    // A pure listen-only half initiates no tunnel of its own, so its table stays
-    // empty; the combined node's dial half drives the single tunnel.
-    let empty_msg = match snap.role {
-        Role::Listen => "(serving peers — this side initiates no tunnel)",
-        Role::Dial | Role::Both => "(no tunnel set — press e)",
-    };
-    let rows: Vec<Row> = match &snap.tunnel {
-        None => vec![Row::new(["", empty_msg, "", ""])],
-        Some(t) => vec![tunnel_row(t)],
+    let rows: Vec<Row> = match &snap.socks {
+        None => vec![Row::new(["", "(no SOCKS5 port set — press e)", "", ""])],
+        Some(s) => vec![socks_row(s)],
     };
     let widths = [
         Constraint::Length(3),
@@ -820,39 +778,48 @@ fn render_tunnels(frame: &mut Frame, area: Rect, snap: &AppSnapshot, _ui: &UiSta
         Constraint::Length(10),
         Constraint::Percentage(30),
     ];
-    let title = tunnel_title(snap);
+    let title = socks_title(snap);
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(table, area);
 }
 
-fn tunnel_title(snap: &AppSnapshot) -> &'static str {
-    match snap.role {
-        Role::Listen => " Tunnel ",
-        Role::Dial | Role::Both if has_connected_dial(snap) => {
-            " Outbound Tunnel  [s start · x stop · e set · d clear] "
-        }
-        // Without a dial session the tunnel can be set but not started; the connect
-        // hint lives on the dial header line above, not here.
-        Role::Dial | Role::Both => " Outbound Tunnel  [e set · d clear] ",
+/// The SOCKS proxy is symmetric: either side can bind it once paired. Show the
+/// start/stop hints when there is a live authenticated connection (inbound peer or
+/// outbound dial); before that the proxy has no session to tunnel through.
+fn socks_title(snap: &AppSnapshot) -> &'static str {
+    if has_live_pairing(snap) {
+        " SOCKS5 Proxy  [s start · x stop · e set · d clear] "
+    } else {
+        " SOCKS5 Proxy  [e set · d clear — pair first] "
     }
 }
 
-fn has_connected_dial(snap: &AppSnapshot) -> bool {
-    snap.dial_target.is_some() && snap.conn_status == ConnStatus::Connected
+/// Whether a live authenticated connection exists in either direction (so the local
+/// SOCKS proxy would have a session to tunnel through).
+fn has_live_pairing(snap: &AppSnapshot) -> bool {
+    let dial_up = snap.dial_target.is_some() && snap.conn_status == ConnStatus::Connected;
+    let inbound_up = snap.inbound.as_ref().is_some_and(|p| p.connected());
+    dial_up || inbound_up
 }
 
-fn tunnel_row(t: &TunnelRow) -> Row<'static> {
-    let marker = if t.status.is_running() { "▶" } else { " " };
+fn socks_row(s: &SocksRow) -> Row<'static> {
+    let marker = if s.status.is_running() { "▶" } else { " " };
+    // Show the bound address (from detail) while running, else the configured port.
+    let spec = if s.detail.is_empty() {
+        format!("socks5 127.0.0.1:{}", s.port)
+    } else {
+        format!("socks5 {}", s.detail)
+    };
     Row::new(vec![
         Cell::from(format!(" {marker}")),
-        Cell::from(t.spec.clone()),
+        Cell::from(spec),
         Cell::from(Span::styled(
-            t.status.label(),
-            Style::default().fg(tunnel_color(t.status)),
+            s.status.label(),
+            Style::default().fg(socks_color(s.status)),
         )),
-        Cell::from(t.detail.clone()),
+        Cell::from(s.detail.clone()),
     ])
 }
 
@@ -929,11 +896,11 @@ fn conn_color(status: &ConnStatus) -> Color {
     }
 }
 
-fn tunnel_color(status: TunnelStatus) -> Color {
+fn socks_color(status: SocksStatus) -> Color {
     match status {
-        TunnelStatus::Listening => Color::Green,
-        TunnelStatus::Idle => Color::DarkGray,
-        TunnelStatus::Error => Color::Red,
+        SocksStatus::Listening => Color::Green,
+        SocksStatus::Idle => Color::DarkGray,
+        SocksStatus::Error => Color::Red,
     }
 }
 
@@ -973,7 +940,7 @@ mod tests {
             dial_target: None,
             name_conflict: crate::app_state::NameConflict::Inactive,
             inbound: None,
-            tunnel: None,
+            socks: None,
             streams_used: 0,
             streams_max: 64,
         }
@@ -1147,15 +1114,25 @@ mod tests {
 
     #[test]
     fn config_idle_dashboard_shows_mode_name_and_idle_dial() {
-        let snap = base_snapshot(true, Some("web1"));
+        // Not listening: the one-pairing rule allows dialing, so the connect hint shows.
+        let mut snap = base_snapshot(true, Some("web1"));
+        snap.listening = false;
 
         let text = render_text(&snap, &UiState::default());
 
         assert!(text.contains("mode: config"));
         assert!(text.contains("name: web1"));
         assert!(text.contains("Outbound: not connected"));
-        // The connect control hint lives on the dial header line, not the Tunnels box.
+        // The connect control hint lives on the dial header line, not the Proxy box.
         assert!(text.contains("Shift-C connect"));
+    }
+
+    #[test]
+    fn connect_hint_hidden_while_listening() {
+        // One-pairing rule: a listening node cannot dial, so the Shift-C hint is hidden.
+        let snap = base_snapshot(true, Some("web1")); // listening = true
+        let text = render_text(&snap, &UiState::default());
+        assert!(!text.contains("Shift-C connect"));
     }
 
     #[test]
@@ -1236,7 +1213,9 @@ mod tests {
 
     #[test]
     fn dial_hint_shows_on_home_but_not_on_logs_screen() {
-        let snap = base_snapshot(true, Some("web1"));
+        // Not listening: dialing is allowed, so the connect hint can appear on home.
+        let mut snap = base_snapshot(true, Some("web1"));
+        snap.listening = false;
 
         let home = render_text(&snap, &UiState::default());
         assert!(home.contains("Shift-C connect"));
@@ -1346,15 +1325,17 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_title_matches_dial_state() {
-        let snap = base_snapshot(false, None);
+    fn socks_title_matches_pairing_state() {
+        // No live pairing: the Proxy box shows only set/clear and a "pair first" note.
+        let mut snap = base_snapshot(false, None);
+        snap.listening = false;
         let idle_text = render_text(&snap, &UiState::default());
-        // Idle (no dial session): no start/stop hint, and the Tunnel box carries only
-        // set/clear actions (the connect hint moved to the dial header line).
         assert!(!idle_text.contains("s start"));
-        assert!(idle_text.contains("[e set · d clear]"));
+        assert!(idle_text.contains("pair first"));
 
+        // A live outbound session enables start/stop of the local proxy.
         let mut connected = base_snapshot(false, None);
+        connected.listening = false;
         connected.dial_target = Some("peer".to_string());
         connected.conn_status = ConnStatus::Connected;
         let connected_text = render_text(&connected, &UiState::default());

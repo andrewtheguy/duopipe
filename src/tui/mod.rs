@@ -23,13 +23,13 @@ use ratatui::crossterm::event::{
 use crate::app_state::{
     AppSnapshot, AppState, DialCommand, DialTarget, NameCommand, NameConflict, Role,
 };
-use crate::config::{TransportTuning, TunnelEntry, validate_tunnel_spec};
+use crate::config::TransportTuning;
 use crate::logging::LogBuffer;
 use crate::peer_params::ResolvedPeer;
 use iroh::EndpointId;
 use setup::{SetupOutcome, SetupState, Step};
 use textinput::handle_edit;
-use ui::{AddField, AddTunnelForm, ConnectForm, Screen, UiState};
+use ui::{ConnectForm, Screen, SocksForm, UiState};
 
 /// Refresh interval for the render tick (also bounds key-input latency).
 const TICK: Duration = Duration::from_millis(200);
@@ -41,7 +41,7 @@ const GENERATED_TOKEN_AUTO_HIDE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Everything the TUI needs to run setup and build the runtime `PeerConfig`.
 pub struct TuiLaunch {
     pub logs: Arc<LogBuffer>,
-    pub tunnel: Option<TunnelEntry>,
+    pub socks_port: Option<u16>,
     pub relay_urls: Vec<String>,
     pub relay_only: bool,
     pub dns_server: Option<String>,
@@ -96,7 +96,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
         resolved.role,
         resolved.token_generated,
         launch.logs.clone(),
-        launch.tunnel.clone(),
+        launch.socks_port,
         launch.nostr_discovery,
         launch.peer_name.clone(),
         resolved.quick_pin,
@@ -195,7 +195,7 @@ fn build_peer_config(
     crate::iroh_mode::PeerConfig {
         role: resolved.role,
         peer_node_id: resolved.peer_node_id,
-        autostart_tunnels: false,
+        autostart_socks: false,
         auth_token: resolved.auth_token.clone(),
         nostr_relays: launch.nostr_relays.clone(),
         nostr_discovery: launch.nostr_discovery,
@@ -331,47 +331,47 @@ fn handle_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) -> bool {
 }
 
 /// Home-screen keys. `Shift` is reserved for session lifecycle (`Shift-L` start/stop the
-/// serve half, `Shift-C` connect / `Shift-D` disconnect the dial session); tunnel actions
-/// are plain keys.
+/// serve half, `Shift-C` connect / `Shift-D` disconnect the dial session); SOCKS proxy
+/// actions are plain keys.
 ///
-/// The tunnel belongs to the combined node's outbound dial session; a pure listen-only
-/// half shows only its connected peers. `e` opens the set-tunnel modal (set or replace
-/// the single tunnel, only while it is not running). `s`/`x` start/stop the listener —
-/// `s` is a deliberate key, never the accidental `Enter`. `d` removes the tunnel from
-/// the session (config is untouched). `w` writes (dumps) the connection info to a file.
+/// One-pairing rule: `Shift-C` is inert while listening and `Shift-L` while a dial
+/// session exists (the runtime refuses these too; the hints are hidden). The SOCKS5
+/// proxy is symmetric — once paired, either side can bind it: `e` opens the set-port
+/// modal (only while the proxy is not running), `s`/`x` start/stop it (`s` is a
+/// deliberate key, never the accidental `Enter`), `d` clears the port from the session
+/// (config is untouched). `w` writes (dumps) the connection info to a file.
 /// `Enter`/`Space` are intentionally inert here.
 fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     match key.code {
         // Start / stop the serve half (Shift+L). It does not auto-start: this is the only
-        // way to bring up the node id, PIN, and auth-token display. Toggling stop tears the
-        // endpoint down; a later start mints a fresh ephemeral id.
-        KeyCode::Char('L') if state.role == Role::Both => {
+        // way to bring up the node id, PIN, and auth-token display. Refused while a dial
+        // session exists (one pairing per run). Toggling stop tears the endpoint down; a
+        // later start mints a fresh ephemeral id.
+        KeyCode::Char('L') if state.role == Role::Both && state.can_listen() => {
             state.toggle_listen();
         }
-        // Connect / re-point the on-demand dial session (interactive serve+dial mode).
-        KeyCode::Char('C') if state.role == Role::Both => {
+        // Connect / re-point the on-demand dial session. Refused while listening (one
+        // pairing per run).
+        KeyCode::Char('C') if state.role == Role::Both && state.can_dial() => {
             ui.connect_form = Some(ConnectForm::default());
         }
-        // Disconnect the current dial session, returning to serve-only.
+        // Disconnect the current dial session, returning to idle.
         KeyCode::Char('D') if state.role == Role::Both => {
             state.send_dial(DialCommand::Disconnect);
         }
-        // The tunnel is driven by the dial half; a pure listen-only half initiates none.
-        // Set or replace the single tunnel — only while it is not running (a Listening
-        // tunnel must be stopped first so its bound port isn't orphaned).
-        KeyCode::Char('e')
-            if matches!(state.role, Role::Dial | Role::Both) && !state.tunnel_running() =>
-        {
-            ui.add_form = Some(match state.tunnel() {
-                Some(entry) => AddTunnelForm::edit(&entry),
-                None => AddTunnelForm::default(),
+        // Set or replace the local SOCKS5 port — only while the proxy is not running (a
+        // Listening proxy must be stopped first so its bound port isn't orphaned).
+        KeyCode::Char('e') if !state.socks_running() => {
+            ui.add_form = Some(match state.socks_port() {
+                Some(port) => SocksForm::edit(port),
+                None => SocksForm::default(),
             });
         }
-        // Start / stop the listener — a deliberate keypress, never automatic.
-        KeyCode::Char('s') => state.start_tunnel(),
-        KeyCode::Char('x') => state.stop_tunnel(),
-        // Remove the single tunnel from the session (config untouched).
-        KeyCode::Char('d') | KeyCode::Delete => state.clear_tunnel(),
+        // Start / stop the local SOCKS5 proxy — a deliberate keypress, never automatic.
+        KeyCode::Char('s') => state.start_socks(),
+        KeyCode::Char('x') => state.stop_socks(),
+        // Clear the SOCKS port from the session (config untouched).
+        KeyCode::Char('d') | KeyCode::Delete => state.clear_socks(),
         KeyCode::Char('w') => match dump_connection_info(&state.snapshot()) {
             Ok(path) => log::info!("Wrote connection info (no auth token) to {path}"),
             Err(e) => log::warn!("Failed to write connection info: {e}"),
@@ -467,15 +467,8 @@ fn maybe_auto_hide_generated_token_banner(ui: &mut UiState, snap: &AppSnapshot, 
     }
 }
 
-/// Accept printable ASCII for the address fields (no spaces).
-fn is_field_char(c: char) -> bool {
-    c.is_ascii_graphic()
-}
-
-/// Handle a key while the set-tunnel modal is open. Up/Down (or Tab/BackTab)
-/// move between fields; Enter advances, and Enter on the last field validates and
-/// (on success) sets the single tunnel. The listener stays Idle until `s`.
-/// Esc cancels.
+/// Handle a key while the set-SOCKS-port modal is open. Enter validates and (on
+/// success) sets the port; the proxy stays Idle until `s`. Esc cancels.
 fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
@@ -485,58 +478,28 @@ fn handle_add_form(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         KeyCode::Esc => {
             ui.add_form = None;
         }
-        // Vertical form: Up/Down (and Tab/BackTab) move between fields.
-        KeyCode::Down | KeyCode::Tab => {
-            form.field = next_field(form.field);
-        }
-        KeyCode::Up | KeyCode::BackTab => {
-            form.field = prev_field(form.field);
-        }
-        KeyCode::Enter => match form.field {
-            AddField::LocalListen => submit_tunnel_form(ui, state),
-            other => form.field = next_field(other),
-        },
-        _ => {
-            if let Some(input) = form.active_mut() {
-                handle_edit(input, key, is_field_char);
-            }
-        }
+        KeyCode::Enter => submit_socks_form(ui, state),
+        _ => handle_edit(&mut form.port, key, |c| c.is_ascii_digit()),
     }
 }
 
-/// The field reached by Down / Tab / Enter from `field`, cycling back to the top.
-fn next_field(field: AddField) -> AddField {
-    match field {
-        AddField::RemoteSource => AddField::LocalListen,
-        AddField::LocalListen => AddField::RemoteSource,
-    }
-}
-
-/// The field reached by Up / BackTab from `field`, cycling back to the bottom.
-fn prev_field(field: AddField) -> AddField {
-    match field {
-        AddField::RemoteSource => AddField::LocalListen,
-        AddField::LocalListen => AddField::RemoteSource,
-    }
-}
-
-/// Validate the modal's fields and, on success, set (or replace) the single tunnel.
-/// Both fields are bare `host:port`. Saving only *sets* the spec — it leaves the
-/// listener Idle; the user starts it deliberately with `s`.
-fn submit_tunnel_form(ui: &mut UiState, state: &Arc<AppState>) {
+/// Validate the modal's port and, on success, set (or replace) the SOCKS5 port.
+/// Saving only *sets* the port — it leaves the proxy Idle; the user starts it
+/// deliberately with `s`. Port must be a decimal in 1..=65535.
+fn submit_socks_form(ui: &mut UiState, state: &Arc<AppState>) {
     let Some(form) = ui.add_form.as_mut() else {
         return;
     };
-    let entry = TunnelEntry {
-        remote_source: form.remote_source.value().trim().to_string(),
-        local_listen: form.local_listen.value().trim().to_string(),
-    };
-    if let Err(e) = validate_tunnel_spec(&entry) {
-        form.error = Some(e.to_string());
-        return;
+    let raw = form.port.value().trim();
+    match raw.parse::<u16>() {
+        Ok(port) if port != 0 => {
+            state.set_socks_port(port);
+            ui.add_form = None;
+        }
+        _ => {
+            form.error = Some("Enter a port number in 1..=65535".to_string());
+        }
     }
-    state.set_tunnel(entry);
-    ui.add_form = None;
 }
 
 /// Handle a key while the connect modal is open. Enter validates the target and (on
@@ -670,18 +633,18 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         let _ = writeln!(out, "token fp:  {}", crate::auth::token_fingerprint(token));
     }
 
-    let _ = writeln!(out, "\nTunnels:");
-    match &snap.tunnel {
+    let _ = writeln!(out, "\nSOCKS5 proxy:");
+    match &snap.socks {
         None => {
-            let _ = writeln!(out, "  (none configured)");
+            let _ = writeln!(out, "  (no port set)");
         }
-        Some(t) => {
+        Some(s) => {
             let _ = writeln!(
                 out,
-                "  {:<40} {:<10} {}",
-                t.spec,
-                t.status.label(),
-                t.detail
+                "  socks5 127.0.0.1:{:<12} {:<10} {}",
+                s.port,
+                s.status.label(),
+                s.detail
             );
         }
     }
@@ -805,100 +768,79 @@ mod tests {
     }
 
     #[test]
-    fn add_form_valid_submit_sets_tunnel_and_closes() {
+    fn add_form_valid_submit_sets_socks_port_and_closes() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddTunnelForm::default()),
+            add_form: Some(SocksForm::default()),
             ..Default::default()
         };
-        type_str(&mut ui, &st, "127.0.0.1:22"); // bare host:port
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
-        type_str(&mut ui, &st, "127.0.0.1:2222");
+        type_str(&mut ui, &st, "1080");
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit
 
         assert!(ui.add_form.is_none(), "form closes on successful submit");
-        let req = st.tunnel().expect("tunnel set");
-        assert_eq!(req.remote_source, "127.0.0.1:22");
-        assert_eq!(req.local_listen, "127.0.0.1:2222");
+        assert_eq!(st.socks_port(), Some(1080));
     }
 
     #[test]
-    fn add_form_up_down_navigate_fields() {
+    fn add_form_rejects_only_digits() {
+        // Non-digit characters are filtered by the field char guard.
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddTunnelForm::default()),
+            add_form: Some(SocksForm::default()),
             ..Default::default()
         };
-        let field = |ui: &UiState| ui.add_form.as_ref().unwrap().field;
-        assert_eq!(field(&ui), AddField::RemoteSource);
-
-        // Down/Up cycle between the two address fields.
-        handle_add_form(key(KeyCode::Down), &mut ui, &st);
-        assert_eq!(field(&ui), AddField::LocalListen);
-        handle_add_form(key(KeyCode::Down), &mut ui, &st);
-        assert_eq!(field(&ui), AddField::RemoteSource);
-        handle_add_form(key(KeyCode::Up), &mut ui, &st);
-        assert_eq!(field(&ui), AddField::LocalListen);
+        type_str(&mut ui, &st, "10a8b0");
+        assert_eq!(ui.add_form.as_ref().unwrap().port.value(), "1080");
     }
 
     #[test]
-    fn add_form_invalid_source_keeps_form_open_with_error() {
+    fn add_form_invalid_port_keeps_form_open_with_error() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddTunnelForm::default()),
+            add_form: Some(SocksForm::default()),
             ..Default::default()
         };
-        // Bad remote_source (host without a port); any local_listen.
-        type_str(&mut ui, &st, "127.0.0.1"); // missing :port
-        handle_add_form(key(KeyCode::Enter), &mut ui, &st); // -> LocalListen
-        type_str(&mut ui, &st, "127.0.0.1:2222");
+        // Port 0 is rejected.
+        type_str(&mut ui, &st, "0");
         handle_add_form(key(KeyCode::Enter), &mut ui, &st); // submit -> error
 
         let form = ui.add_form.as_ref().expect("form stays open on error");
         assert!(form.error.is_some());
-        assert!(!st.has_tunnel(), "no tunnel set on invalid input");
-    }
-
-    fn req(src: &str, listen: &str) -> TunnelEntry {
-        TunnelEntry {
-            remote_source: src.into(),
-            local_listen: listen.into(),
-        }
+        assert!(!st.has_socks(), "no port set on invalid input");
     }
 
     #[test]
-    fn d_key_clears_the_tunnel() {
+    fn d_key_clears_the_socks_port() {
         let st = state();
-        st.set_tunnel(req("127.0.0.1:1", "127.0.0.1:11"));
+        st.set_socks_port(1080);
         let mut ui = UiState::default();
 
-        // `d` clears the single tunnel.
+        // `d` clears the SOCKS port.
         assert!(!handle_key(key(KeyCode::Char('d')), &mut ui, &st));
-        assert!(!st.has_tunnel());
-        // Pressing delete with no tunnel is a harmless no-op.
+        assert!(!st.has_socks());
+        // Pressing delete with no port is a harmless no-op.
         assert!(!handle_key(key(KeyCode::Delete), &mut ui, &st));
-        assert!(!st.has_tunnel());
+        assert!(!st.has_socks());
     }
 
     #[test]
-    fn e_key_opens_set_form_prefilled_from_current_tunnel() {
+    fn e_key_opens_set_form_prefilled_from_current_port() {
         let st = state();
-        st.set_tunnel(req("127.0.0.1:53", "127.0.0.1:5353"));
+        st.set_socks_port(5353);
         let mut ui = UiState::default();
 
         assert!(!handle_key(key(KeyCode::Char('e')), &mut ui, &st));
         let form = ui.add_form.as_ref().expect("set form opened");
-        assert_eq!(form.remote_source.value(), "127.0.0.1:53");
-        assert_eq!(form.local_listen.value(), "127.0.0.1:5353");
+        assert_eq!(form.port.value(), "5353");
     }
 
     #[test]
-    fn s_x_drive_tunnel_and_enter_is_inert() {
-        // With a tunnel configured, `s`/`x` are accepted (no panic, no quit) and bare
-        // Enter/Space do nothing on the dashboard (no accidental start). There is no
-        // supervisor in a unit test, so this asserts the keymap wiring, not the bind.
+    fn s_x_drive_socks_and_enter_is_inert() {
+        // With a port configured, `s`/`x` are accepted (no panic, no quit) and bare
+        // Enter/Space do nothing on the dashboard. There is no supervisor in a unit
+        // test, so this asserts the keymap wiring, not the bind.
         let st = state();
-        st.set_tunnel(req("127.0.0.1:1", "127.0.0.1:11"));
+        st.set_socks_port(1080);
         let mut ui = UiState::default();
 
         for code in [
@@ -909,28 +851,44 @@ mod tests {
         ] {
             assert!(!handle_key(key(code), &mut ui, &st), "{code:?} must not quit");
         }
-        // None of these open a modal or clear the tunnel.
+        // None of these open a modal or clear the port.
         assert!(ui.add_form.is_none() && ui.connect_form.is_none());
-        assert!(st.has_tunnel());
+        assert!(st.has_socks());
     }
 
     #[test]
     fn set_form_submit_replaces_in_place() {
         let st = state();
-        st.set_tunnel(req("127.0.0.1:1", "127.0.0.1:11"));
-        // Simulate the user editing the form to new values.
-        let edited = req("127.0.0.1:9", "127.0.0.1:99");
+        st.set_socks_port(1080);
         let mut ui = UiState {
-            add_form: Some(AddTunnelForm::edit(&edited)),
+            add_form: Some(SocksForm::edit(9090)),
             ..Default::default()
         };
 
-        submit_tunnel_form(&mut ui, &st);
+        submit_socks_form(&mut ui, &st);
 
         assert!(ui.add_form.is_none(), "form closes on successful submit");
-        let got = st.tunnel().expect("tunnel still present");
-        assert_eq!(got.remote_source, "127.0.0.1:9");
-        assert_eq!(got.local_listen, "127.0.0.1:99");
+        assert_eq!(st.socks_port(), Some(9090));
+    }
+
+    #[test]
+    fn shift_c_ignored_while_listening_and_shift_l_ignored_while_dialing() {
+        use crate::app_state::ListenStatus;
+        // Shift+C must be inert while listening (one pairing per run).
+        let st = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, false);
+        st.set_listen_status(ListenStatus::Listening);
+        let mut ui = UiState::default();
+        handle_key(key(KeyCode::Char('C')), &mut ui, &st);
+        assert!(ui.connect_form.is_none(), "Shift+C must not open while listening");
+
+        // Shift+L Start must be inert while a dial session exists.
+        let st = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, false);
+        st.set_dial_target(Some("peer".into()));
+        assert!(!st.can_listen());
+        let mut ui = UiState::default();
+        handle_key(key(KeyCode::Char('L')), &mut ui, &st);
+        // toggle_listen was not called, so the status stays Stopped.
+        assert!(!st.listening(), "Shift+L must not start listening while dialing");
     }
 
     #[test]
@@ -1130,30 +1088,30 @@ mod tests {
     fn add_form_field_supports_cursor_editing() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddTunnelForm::default()),
+            add_form: Some(SocksForm::default()),
             ..Default::default()
         };
-        type_str(&mut ui, &st, "ace");
-        // Cursor is at end; step left once and insert between 'c' and 'e'.
+        type_str(&mut ui, &st, "135"); // digits only
+        // Cursor is at end; step left once and insert between '3' and '5'.
         handle_add_form(key(KeyCode::Left), &mut ui, &st);
-        type_str(&mut ui, &st, "d");
-        // Step left twice more and insert between 'a' and 'c'.
+        type_str(&mut ui, &st, "4");
+        // Step left twice more and insert between '1' and '3'.
         handle_add_form(key(KeyCode::Left), &mut ui, &st);
         handle_add_form(key(KeyCode::Left), &mut ui, &st);
-        type_str(&mut ui, &st, "b");
-        assert_eq!(ui.add_form.as_ref().unwrap().remote_source.value(), "abcde");
+        type_str(&mut ui, &st, "2");
+        assert_eq!(ui.add_form.as_ref().unwrap().port.value(), "12345");
     }
 
     #[test]
     fn add_form_esc_cancels() {
         let st = state();
         let mut ui = UiState {
-            add_form: Some(AddTunnelForm::default()),
+            add_form: Some(SocksForm::default()),
             ..Default::default()
         };
-        type_str(&mut ui, &st, "x");
+        type_str(&mut ui, &st, "1");
         handle_add_form(key(KeyCode::Esc), &mut ui, &st);
         assert!(ui.add_form.is_none());
-        assert!(!st.has_tunnel());
+        assert!(!st.has_socks());
     }
 }
