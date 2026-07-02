@@ -376,9 +376,12 @@ async fn run_dial_manager(config: PeerConfig, semaphore: Arc<Semaphore>) -> Resu
             _ = shutdown.cancelled() => break,
             cmd = dial_rx.recv() => match cmd {
                 Ok(DialCommand::Connect(target)) => {
-                    // One-pairing rule: refuse to dial while this run is the listening side of a
-                    // pairing. The TUI hides Shift+C in that state; this guards test-mode/races.
-                    if !config.status.can_dial() {
+                    // One-pairing rule (cross-half): refuse to dial while this run is the listening
+                    // side of a pairing. The TUI hides Shift+C in that state; this guards
+                    // test-mode/races. The "no re-point while already dialing" half of the rule is a
+                    // TUI-level gate (`can_dial`) — it must NOT be re-checked here, since the connect
+                    // form optimistically sets `dial_target` before this command is processed.
+                    if config.status.listening() {
                         log::warn!(
                             "Refusing to dial: this run is already listening (a run holds one pairing)."
                         );

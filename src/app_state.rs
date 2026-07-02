@@ -493,16 +493,16 @@ impl AppState {
         self.dial_target.read().is_some()
     }
 
-    /// One-pairing rule: dialing out is allowed only while this run is not the
-    /// listening side of a pairing. Strict exclusivity — listening at all (even
-    /// before a peer pairs in) blocks dialing, so there is no window where an
-    /// inbound pairing lands mid-dial.
+    /// One-pairing rule: a new dial may start only from a fully idle run — not
+    /// while listening (even before a peer pairs in, so an inbound pairing can't
+    /// land mid-dial) and not while an outbound dial session already exists (so a
+    /// paired run can't be re-pointed to another peer; disconnect first).
     pub fn can_dial(&self) -> bool {
-        !self.listening()
+        !self.listening() && !self.dial_session_active()
     }
 
     /// One-pairing rule, the other direction: listening may start only while no
-    /// outbound dial session exists.
+    /// outbound dial session exists. (Stopping an active listen is always allowed.)
     pub fn can_listen(&self) -> bool {
         !self.dial_session_active()
     }
@@ -810,13 +810,15 @@ mod tests {
         state.clear_listen();
         assert!(state.can_dial());
 
-        // An outbound dial session blocks listening.
+        // An outbound dial session blocks BOTH listening and a new dial (no re-point;
+        // disconnect first).
         state.set_dial_target(Some("peer".into()));
         assert!(state.dial_session_active());
         assert!(!state.can_listen());
-        assert!(state.can_dial());
+        assert!(!state.can_dial());
         state.set_dial_target(None);
         assert!(state.can_listen());
+        assert!(state.can_dial());
     }
 
     #[test]

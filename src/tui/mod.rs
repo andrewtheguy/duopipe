@@ -889,6 +889,15 @@ mod tests {
         handle_key(key(KeyCode::Char('L')), &mut ui, &st);
         // toggle_listen was not called, so the status stays Stopped.
         assert!(!st.listening(), "Shift+L must not start listening while dialing");
+
+        // Shift+C must also be inert once a dial session exists (no re-point while
+        // paired — disconnect first).
+        let mut ui = UiState::default();
+        handle_key(key(KeyCode::Char('C')), &mut ui, &st);
+        assert!(
+            ui.connect_form.is_none(),
+            "Shift+C must not open while a dial session exists"
+        );
     }
 
     #[test]
