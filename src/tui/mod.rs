@@ -379,7 +379,13 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         // Start / stop the local SOCKS5 proxy — a deliberate keypress, never automatic.
         // Start is gated on a live pairing (same predicate the Proxy table advertises): with
         // no session there is nothing to tunnel through. Stop stays ungated (harmless).
-        KeyCode::Char('s') if state.has_live_pairing() => state.start_socks(),
+        KeyCode::Char('s') if state.has_live_pairing() => {
+            if !state.start_socks() {
+                // Reached only with a live pairing but no port set (or a rare supervisor
+                // race): tell the user rather than silently dropping the command.
+                log::warn!("Cannot start the SOCKS5 proxy: set a port first with `e`.");
+            }
+        }
         KeyCode::Char('x') => state.stop_socks(),
         // Clear the SOCKS port from the session (config untouched).
         KeyCode::Char('d') | KeyCode::Delete => state.clear_socks(),

@@ -391,9 +391,12 @@ impl AppState {
         self.socks_tx.subscribe()
     }
 
-    /// Send a SOCKS command to any active connection supervisor(s).
-    pub fn send_socks_cmd(&self, cmd: SocksCommand) {
-        let _ = self.socks_tx.send(cmd);
+    /// Send a SOCKS command to any active connection supervisor(s). Returns `true` if it
+    /// reached a live supervisor; `false` if none is subscribed (no active connection),
+    /// consistent with [`send_dial`](Self::send_dial) so callers can surface a dropped
+    /// command instead of silently no-op'ing.
+    pub fn send_socks_cmd(&self, cmd: SocksCommand) -> bool {
+        self.socks_tx.send(cmd).is_ok()
     }
 
     /// Subscribe to dial commands. The dial manager subscribes once at startup.
@@ -540,22 +543,26 @@ impl AppState {
         *self.pin_deadline.write() = None;
     }
 
-    /// Start the local SOCKS5 proxy. A no-op when no port is configured; the
-    /// supervisor ignores a redundant Start if it is already running.
-    pub fn start_socks(&self) {
+    /// Start the local SOCKS5 proxy. Returns `false` (nothing sent) when no port is
+    /// configured or when no connection supervisor is listening (no live pairing), so the
+    /// caller can tell the user the start was dropped; `true` once delivered. The supervisor
+    /// ignores a redundant Start if it is already running.
+    #[must_use]
+    pub fn start_socks(&self) -> bool {
         if self.socks_port.read().is_none() {
-            return;
+            return false;
         }
-        self.send_socks_cmd(SocksCommand::Start);
+        self.send_socks_cmd(SocksCommand::Start)
     }
 
     /// Stop the local SOCKS5 proxy. A no-op when no port is configured; the
-    /// supervisor ignores a Stop if it is not running.
+    /// supervisor ignores a Stop if it is not running. A dropped Stop (nothing to stop) is
+    /// expected, so the delivery result is intentionally ignored.
     pub fn stop_socks(&self) {
         if self.socks_port.read().is_none() {
             return;
         }
-        self.send_socks_cmd(SocksCommand::Stop);
+        let _ = self.send_socks_cmd(SocksCommand::Stop);
     }
 
     pub fn set_endpoint_id(&self, id: String) {
@@ -661,7 +668,9 @@ impl AppState {
     /// proxy is running, a `Stop` is broadcast first so the supervisor cancels its
     /// task and frees the bound local port.
     pub fn clear_socks(&self) {
-        self.send_socks_cmd(SocksCommand::Stop);
+        // A dropped Stop (nothing running) is expected here; clearing the port proceeds
+        // regardless, so the delivery result is intentionally ignored.
+        let _ = self.send_socks_cmd(SocksCommand::Stop);
         *self.socks_port.write() = None;
         self.reset_socks_status();
     }
@@ -797,6 +806,21 @@ mod tests {
         state.clear_socks();
         assert!(!state.has_socks());
         assert!(state.snapshot().socks.is_none());
+    }
+
+    #[test]
+    fn start_socks_reports_delivery() {
+        let state = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, false);
+        // No port configured: nothing to start.
+        assert!(!state.start_socks());
+
+        // Port set but no connection supervisor subscribed: the Start can't be delivered.
+        state.set_socks_port(1080);
+        assert!(!state.start_socks(), "start with no live supervisor must report failure");
+
+        // With a supervisor subscribed (a live connection), the Start is delivered.
+        let _rx = state.subscribe_socks();
+        assert!(state.start_socks(), "start with a live supervisor must succeed");
     }
 
     #[test]
