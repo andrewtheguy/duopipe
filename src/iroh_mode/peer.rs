@@ -87,7 +87,13 @@ impl RecentPins {
 /// quick PIN mode, without re-typing a PIN that may since have rotated). A fresh listen session
 /// mints a new endpoint id and a new (empty) claim.
 #[derive(Clone, Default)]
-struct PairClaim(Arc<parking_lot::Mutex<Option<ClaimedPeer>>>);
+struct PairClaim {
+    peer: Arc<parking_lot::Mutex<Option<ClaimedPeer>>>,
+    /// Fires the first time a peer commits the claim. The PIN publisher watches this so it can
+    /// stop rotating/publishing (and clear the displayed code) once paired — no more peers will
+    /// be accepted this session.
+    paired: CancellationToken,
+}
 
 /// The peer that holds a [`PairClaim`], plus the material needed to let it reconnect.
 #[derive(Clone)]
@@ -103,7 +109,13 @@ struct ClaimedPeer {
 impl PairClaim {
     /// Snapshot the current claim (cheap clone) for the pre-auth gate.
     fn peek(&self) -> Option<ClaimedPeer> {
-        self.0.lock().clone()
+        self.peer.lock().clone()
+    }
+
+    /// A token that is cancelled the first time a peer commits the claim, so watchers (the PIN
+    /// publisher) can react to pairing without polling.
+    fn paired_signal(&self) -> CancellationToken {
+        self.paired.clone()
     }
 
     /// Commit a freshly authenticated peer as the pair. Returns `true` if `node_id` now holds the
@@ -111,12 +123,14 @@ impl PairClaim {
     /// already held it (a reconnect/retry). Returns `false` if another node id won the claim first
     /// (a race between two first-time dialers), in which case the caller must reject this peer.
     fn commit(&self, node_id: EndpointId, pin_key: Option<nostr_sdk::Keys>) -> bool {
-        let mut g = self.0.lock();
+        let mut g = self.peer.lock();
         match g.as_ref() {
             Some(c) if c.node_id != node_id => false,
             Some(_) => true,
             None => {
                 *g = Some(ClaimedPeer { node_id, pin_key });
+                // First pairing: signal watchers (the PIN publisher stops here).
+                self.paired.cancel();
                 true
             }
         }
@@ -799,6 +813,12 @@ async fn run_listen(
     // name-based node-id discovery above; runs only when explicitly enabled.
     let recent_pins = RecentPins::default();
     let pin_cache = config.pin_rendezvous.then(|| recent_pins.clone());
+
+    // This serve endpoint pairs with one peer at a time (all modes). The claim is empty until the
+    // first dialer authenticates and lives for this whole listen session — a Shift+L stop tears
+    // `run_listen` down and starts the next session with a fresh endpoint id and a fresh claim.
+    let claim = PairClaim::default();
+
     let _pin_publisher = if config.pin_rendezvous {
         Some(PublisherGuard(tokio::spawn(crate::logging::inherit_source(
             run_pin_publisher(
@@ -807,6 +827,8 @@ async fn run_listen(
                 config.nostr_relays.clone(),
                 config.status.clone(),
                 listen_shutdown.clone(),
+                // Once a peer pairs, stop rotating/publishing PINs — no more peers are accepted.
+                claim.paired_signal(),
             ),
         ))))
     } else {
@@ -816,11 +838,6 @@ async fn run_listen(
     let shutdown = listen_shutdown;
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
-
-    // This serve endpoint pairs with one peer at a time (all modes). The claim is empty until the
-    // first dialer authenticates and lives for this whole listen session — a Shift+L stop tears
-    // `run_listen` down and starts the next session with a fresh endpoint id and a fresh claim.
-    let claim = PairClaim::default();
 
     loop {
         while connection_tasks.try_join_next().is_some() {}
@@ -1097,8 +1114,17 @@ async fn run_pin_publisher(
     relays: Vec<String>,
     state: Arc<AppState>,
     shutdown: CancellationToken,
+    paired: CancellationToken,
 ) {
     loop {
+        // A peer may already have paired (e.g. a reconnect landed before this loop turn). Once
+        // paired, the listener accepts no further peers, so publishing a fresh PIN is pointless
+        // and misleading — clear the header and stop.
+        if paired.is_cancelled() {
+            state.clear_current_pin();
+            break;
+        }
+
         let pin = crate::pin::generate_pin();
         let bucket = crate::pin::current_bucket();
         let remaining = crate::pin::secs_until_next_bucket();
@@ -1118,10 +1144,15 @@ async fn run_pin_publisher(
         }
 
         // Sleep to the next bucket boundary, then rotate. `max(1)` avoids a busy spin if we
-        // happen to land exactly on the boundary.
+        // happen to land exactly on the boundary. Wake early on shutdown or when a peer pairs.
         let sleep_for = Duration::from_secs(crate::pin::secs_until_next_bucket().max(1));
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = paired.cancelled() => {
+                // Paired mid-cycle: drop the now-stale PIN from the header and stop publishing.
+                state.clear_current_pin();
+                break;
+            }
             _ = tokio::time::sleep(sleep_for) => {}
         }
     }
@@ -2361,10 +2392,62 @@ mod tests {
 
         let claim = PairClaim::default();
         assert!(claim.peek().is_none(), "starts unclaimed");
+        let paired = claim.paired_signal();
+        assert!(!paired.is_cancelled(), "paired signal is idle before pairing");
         assert!(claim.commit(id_a, None), "first committer wins");
+        assert!(paired.is_cancelled(), "first commit fires the paired signal");
         assert!(claim.commit(id_a, None), "same peer may re-commit (reconnect)");
         assert!(!claim.commit(id_b, None), "a different peer is refused");
         assert_eq!(claim.peek().map(|c| c.node_id), Some(id_a));
+    }
+
+    /// The PIN publisher stops and clears the displayed code the moment a peer pairs: if the
+    /// paired signal is already fired, it must not publish or set a PIN. Fully offline — it
+    /// returns before ever touching a relay.
+    #[tokio::test]
+    async fn pin_publisher_stops_once_paired() {
+        let ep = hermetic_endpoint().await;
+        let node_id = ep.id();
+        ep.close().await;
+
+        let state = AppState::new(
+            Role::Listen,
+            false,
+            LogBuffer::new(16),
+            None,
+            false,
+            None,
+            false,
+        );
+        // Simulate a code already on the header from a prior rotation.
+        state.set_current_pin("test-pin".into(), Instant::now() + Duration::from_secs(60));
+        assert!(state.snapshot().current_pin.is_some());
+
+        // A peer has paired: fire the signal before the publisher runs.
+        let claim = PairClaim::default();
+        assert!(claim.commit(node_id, None));
+        let paired = claim.paired_signal();
+
+        // Publisher must exit promptly (its top-of-loop guard trips) and clear the PIN, without
+        // hanging or reaching the network.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_pin_publisher(
+                node_id,
+                RecentPins::default(),
+                Vec::new(),
+                state.clone(),
+                CancellationToken::new(),
+                paired,
+            ),
+        )
+        .await
+        .expect("publisher returns once paired");
+
+        assert!(
+            state.snapshot().current_pin.is_none(),
+            "paired publisher clears the stale PIN from the header"
+        );
     }
 
     /// Wait until `ep` publishes a direct address, then return it (hermetic endpoints only

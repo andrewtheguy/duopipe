@@ -355,9 +355,18 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
         KeyCode::Char('C') if state.role == Role::Both && state.can_dial() => {
             ui.connect_form = Some(ConnectForm::default());
         }
-        // Disconnect the current dial session, returning to idle.
+        // Disconnect and reset to idle, whichever side this run committed to. For a dial
+        // session it drops the outbound connection; for the serve half it stops listening —
+        // tearing down the endpoint and releasing the pairing claim/reservation — so a new
+        // peer can pair (or the run can switch to dialing). Symmetric so the reset key is the
+        // same on both sides. Exclusivity means at most one branch actually fires.
         KeyCode::Char('D') if state.role == Role::Both => {
-            state.send_dial(DialCommand::Disconnect);
+            if state.dial_session_active() {
+                state.send_dial(DialCommand::Disconnect);
+            }
+            if state.listening() {
+                state.stop_listen();
+            }
         }
         // Set or replace the local SOCKS5 port — only while the proxy is not running (a
         // Listening proxy must be stopped first so its bound port isn't orphaned).
@@ -897,6 +906,41 @@ mod tests {
         assert!(
             ui.connect_form.is_none(),
             "Shift+C must not open while a dial session exists"
+        );
+    }
+
+    #[test]
+    fn shift_d_resets_listener_to_idle() {
+        use crate::app_state::{ListenCommand, ListenStatus};
+        // A listener whose peer disconnected is still `Listening` with a retained reservation.
+        // Shift+D must send a Stop so the supervisor tears the serve half down and returns to
+        // idle (re-enabling Shift+L / Shift+C), symmetric with the dialer's Shift+D.
+        let st = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, false);
+        st.set_listen_status(ListenStatus::Listening);
+        let mut listen_rx = st.subscribe_listen();
+        let mut ui = UiState::default();
+
+        handle_key(key(KeyCode::Char('D')), &mut ui, &st);
+
+        assert!(
+            matches!(listen_rx.try_recv(), Ok(ListenCommand::Stop)),
+            "Shift+D while listening must stop the serve half"
+        );
+    }
+
+    #[test]
+    fn shift_d_disconnects_dial_session() {
+        use crate::app_state::DialCommand;
+        let st = AppState::new(Role::Both, false, LogBuffer::new(16), None, false, None, false);
+        st.set_dial_target(Some("peer".into()));
+        let mut dial_rx = st.subscribe_dial();
+        let mut ui = UiState::default();
+
+        handle_key(key(KeyCode::Char('D')), &mut ui, &st);
+
+        assert!(
+            matches!(dial_rx.try_recv(), Ok(DialCommand::Disconnect)),
+            "Shift+D while dialing must disconnect the dial session"
         );
     }
 

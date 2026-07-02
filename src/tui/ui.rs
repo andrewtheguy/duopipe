@@ -377,10 +377,13 @@ fn render_header(
     if snap.listening {
         // Truncated to the same short form as the inbound-peer line — the full
         // 64-char id is visual noise (and not needed to pair in any mode).
-        lines.push(Line::from(vec![
-            Span::raw("node id: "),
-            Span::raw(short_id(endpoint)),
-        ]));
+        let mut node_line = vec![Span::raw("node id: "), Span::raw(short_id(endpoint))];
+        // Shift+D resets the serve half to idle (releasing the pairing claim so a new peer can
+        // pair, or the run can switch to dialing). Home-only, like the dial controls.
+        if show_dial_hint {
+            node_line.push(listen_reset_hint());
+        }
+        lines.push(Line::from(node_line));
     } else if !dialing {
         lines.push(Line::from(Span::styled(
             "not listening — press Shift+L to start",
@@ -559,6 +562,16 @@ fn dial_hint(connected: bool) -> Span<'static> {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// The serve-half reset hint (Shift-D), styled like [`dial_hint`]. Shown on the node-id line
+/// while listening so the same key resets either side back to idle — including recovering a
+/// listener whose paired peer has disconnected (the claim is retained until reset).
+fn listen_reset_hint() -> Span<'static> {
+    Span::styled(
+        "   [Shift-D reset]",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )
 }
 

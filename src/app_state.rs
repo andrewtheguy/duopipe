@@ -439,6 +439,14 @@ impl AppState {
         let _ = self.listen_tx.send(cmd);
     }
 
+    /// Stop the serve half unconditionally (Shift+D reset on the listen side). Tears down the
+    /// endpoint and releases the pairing claim/reservation, returning to idle so a new peer can
+    /// pair — or the run can switch to dialing. The supervisor no-ops a redundant Stop, so this
+    /// is safe to send even when already stopped.
+    pub fn stop_listen(&self) {
+        let _ = self.listen_tx.send(ListenCommand::Stop);
+    }
+
     /// Tear down the serve half's surfaced state once it has stopped: back to `Stopped`,
     /// drop the displayed node id, and clear any rotating PIN (a fresh start mints new
     /// ones). Also drops the paired inbound peer / reservation (set only by the listener side)
@@ -512,6 +520,13 @@ impl AppState {
     pub fn set_current_pin(&self, pin: String, deadline: Instant) {
         *self.current_pin.write() = Some(pin);
         *self.pin_deadline.write() = Some(deadline);
+    }
+
+    /// Clear the displayed PIN and its rollover deadline. Called when the listener pairs with a
+    /// peer: no further peers will be accepted, so the PIN is stale and must leave the header.
+    pub fn clear_current_pin(&self) {
+        *self.current_pin.write() = None;
+        *self.pin_deadline.write() = None;
     }
 
     /// Start the local SOCKS5 proxy. A no-op when no port is configured; the
