@@ -150,6 +150,12 @@ pub async fn read_connect_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
         ATYP_DOMAIN => {
             let len = stream.read_u8().await? as usize;
+            // A zero-length domain is malformed: reject it with a local failure reply before
+            // constructing an empty `Target::Domain` or forwarding it to the remote resolver.
+            if len == 0 {
+                write_reply(stream, REP_GENERAL_FAILURE).await?;
+                return Err(io::Error::other("SOCKS5 domain length is zero"));
+            }
             let mut host = vec![0u8; len];
             stream.read_exact(&mut host).await?;
             let port = stream.read_u16().await?;
@@ -262,6 +268,19 @@ mod tests {
         client.write_all(&req).await.unwrap();
         let target = read_connect_request(&mut server).await.unwrap();
         assert_eq!(target, Target::Domain("localhost".into(), 8080));
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_zero_length_domain() {
+        let (mut client, mut server) = duplex(64);
+        // ATYP_DOMAIN with a zero length byte, then a port.
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x03, 0x00, 0x00, 0x50])
+            .await
+            .unwrap();
+        assert!(read_connect_request(&mut server).await.is_err());
+        let reply = read_n(&mut client, 10).await;
+        assert_eq!(reply[1], REP_GENERAL_FAILURE);
     }
 
     #[tokio::test]
