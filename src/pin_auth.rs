@@ -162,19 +162,23 @@ where
 /// already been read off the stream (the listener reads it to choose the auth method).
 ///
 /// `candidates` are the PIN auth keypairs for the recent rotation buckets; the dialer's proof is
-/// verified against each. Returns `Ok(matched_key)` — the candidate key that verified the proof —
-/// when one matches (and our proof has been sent), so the caller can retain it to re-authenticate a
-/// reconnecting peer after the PIN has rotated out of the recent cache. Otherwise sends a rejection
-/// and returns `Err`.
-pub async fn listener_handshake<W, R>(
+/// verified against each. Once a candidate verifies the proof, `commit` is invoked with it **before**
+/// acceptance is sent: returning `false` (e.g. another peer won the one-pair claim first) turns this
+/// into a rejection, so a race loser is never told it was accepted. Returns `Ok(matched_key)` — the
+/// candidate key that verified the proof — when one matches and `commit` accepts it (and our proof
+/// has been sent), so the caller can retain it to re-authenticate a reconnecting peer after the PIN
+/// has rotated out of the recent cache. Otherwise sends a rejection and returns `Err`.
+pub async fn listener_handshake<W, R, F>(
     send: &mut W,
     recv: &mut R,
     candidates: &[Keys],
     nonce_d: &str,
+    commit: F,
 ) -> Result<Keys>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
+    F: FnOnce(&Keys) -> bool,
 {
     let nonce_l = generate_nonce();
 
@@ -188,12 +192,24 @@ where
         .iter()
         .find(|k| verify_proof(k, Direction::Dialer, nonce_d, &nonce_l, &response.proof));
 
-    // 4. Confirm (with our own proof) or reject.
+    // 4. Confirm (with our own proof) or reject. Even once the proof verifies, `commit` has the
+    //    final say *before* acceptance is written, so a peer that loses the one-pair race is
+    //    rejected rather than briefly told it was accepted and then dropped.
     match matched {
-        Some(keys) => {
+        Some(keys) if commit(keys) => {
             let proof_l = seal_proof(keys, Direction::Listener, nonce_d, &nonce_l)?;
             write_frame(send, &encode_pin_confirm(&PinConfirm::accepted(proof_l))?).await?;
             Ok((*keys).clone())
+        }
+        Some(_) => {
+            write_frame(
+                send,
+                &encode_pin_confirm(&PinConfirm::rejected(
+                    "listener already paired with another device",
+                ))?,
+            )
+            .await?;
+            anyhow::bail!("valid PIN but the listener paired with another device first");
         }
         None => {
             write_frame(
@@ -274,7 +290,7 @@ mod tests {
             async move { dialer_handshake(&mut a_write, &mut a_read, &dialer).await };
         let listener_task = async move {
             let nonce_d = read_pin_request(&mut b_read).await?;
-            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d)
+            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d, |_| true)
                 .await
                 .map(|_| ())
         };
@@ -297,6 +313,29 @@ mod tests {
         let (d, l) = run_handshake(&dialer_pin, &[&newer, &dialer_pin]).await;
         assert!(d.is_ok(), "dialer: {d:?}");
         assert!(l.is_ok(), "listener: {l:?}");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_when_commit_denies() {
+        // Even with a valid PIN, a `commit` that returns false (e.g. a lost one-pair race) must
+        // turn into a rejection — the dialer is told rejected, never accepted-then-dropped.
+        let pin = test_pin();
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut a_read, mut a_write) = tokio::io::split(a);
+        let (mut b_read, mut b_write) = tokio::io::split(b);
+        let candidates = vec![derive_auth_keys(&pin).unwrap()];
+
+        let dialer = pin.clone();
+        let dialer_task = async move { dialer_handshake(&mut a_write, &mut a_read, &dialer).await };
+        let listener_task = async move {
+            let nonce_d = read_pin_request(&mut b_read).await?;
+            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d, |_| false)
+                .await
+                .map(|_| ())
+        };
+        let (d, l) = tokio::join!(dialer_task, listener_task);
+        assert!(d.is_err(), "dialer must be rejected when the commit is denied");
+        assert!(l.is_err(), "listener must reject when the commit is denied");
     }
 
     #[tokio::test]

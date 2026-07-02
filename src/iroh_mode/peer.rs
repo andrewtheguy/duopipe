@@ -1595,10 +1595,19 @@ async fn auth_as_listener(
                     send.finish()?;
                     anyhow::bail!("{reason}");
                 }
+                // Win the one-pair claim *before* telling the dialer it is accepted, so a race
+                // loser is rejected rather than briefly told "accepted" and then dropped.
+                if !claim.commit(remote_id, None) {
+                    let response =
+                        AuthResponse::rejected("Listener is already paired with another device");
+                    send.write_all(&encode_auth_response(&response)?).await?;
+                    send.finish()?;
+                    anyhow::bail!("listener paired with another device first");
+                }
                 let response = AuthResponse::accepted();
                 send.write_all(&encode_auth_response(&response)?).await?;
                 send.finish()?;
-                Ok::<Option<nostr_sdk::Keys>, anyhow::Error>(None)
+                Ok::<(), anyhow::Error>(())
             }
             AuthRequest::Pin { nonce, .. } => {
                 // Verify the dialer's PIN proof against the recent-bucket keys, plus (for a
@@ -1613,42 +1622,37 @@ async fn auth_as_listener(
                 if let Some(key) = &reconnect_key {
                     candidates.push(key.clone());
                 }
-                let matched =
-                    crate::pin_auth::listener_handshake(&mut send, &mut recv, &candidates, &nonce)
-                        .await?;
+                // The claim is committed inside the handshake, right after the proof verifies and
+                // *before* the acceptance frame is sent — so a race loser is rejected in-band, not
+                // accepted-then-dropped.
+                crate::pin_auth::listener_handshake(
+                    &mut send,
+                    &mut recv,
+                    &candidates,
+                    &nonce,
+                    |key| claim.commit(remote_id, Some(key.clone())),
+                )
+                .await?;
                 let _ = send.finish();
                 log::info!("Peer {remote_id} authenticated via PIN");
-                Ok(Some(matched))
+                Ok(())
             }
         }
     })
     .await;
 
-    let matched_pin_key = match auth_result {
-        Ok(Ok(key)) => key,
+    match auth_result {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             conn.close(AUTH_FAILED_CODE.into(), b"auth_failed");
-            return Err(TunnelError::auth(anyhow::anyhow!("auth_failed: {}", e)).into());
+            Err(TunnelError::auth(anyhow::anyhow!("auth_failed: {}", e)).into())
         }
         Err(_) => {
             log::warn!("Authentication timeout for {}", remote_id);
             conn.close(AUTH_TIMEOUT_CODE.into(), b"auth_timeout");
-            return Err(TunnelError::auth(anyhow::anyhow!("auth_timeout")).into());
+            Err(TunnelError::auth(anyhow::anyhow!("auth_timeout")).into())
         }
-    };
-
-    // Commit this peer as the pair (or confirm its reconnect). This closes the race where two
-    // first-time dialers both authenticate against a fresh, unclaimed endpoint: only the one that
-    // wins the claim is served; the loser is rejected here even though its handshake succeeded.
-    if !claim.commit(remote_id, matched_pin_key) {
-        log::warn!("{remote_id} authenticated but another device claimed the pairing first");
-        conn.close(AUTH_FAILED_CODE.into(), b"already_paired");
-        return Err(TunnelError::auth(anyhow::anyhow!(
-            "listener paired with another device first"
-        ))
-        .into());
     }
-    Ok(())
 }
 
 // ============================================================================
