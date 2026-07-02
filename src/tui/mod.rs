@@ -377,7 +377,9 @@ fn handle_home_key(key: KeyEvent, ui: &mut UiState, state: &Arc<AppState>) {
             });
         }
         // Start / stop the local SOCKS5 proxy — a deliberate keypress, never automatic.
-        KeyCode::Char('s') => state.start_socks(),
+        // Start is gated on a live pairing (same predicate the Proxy table advertises): with
+        // no session there is nothing to tunnel through. Stop stays ungated (harmless).
+        KeyCode::Char('s') if state.has_live_pairing() => state.start_socks(),
         KeyCode::Char('x') => state.stop_socks(),
         // Clear the SOCKS port from the session (config untouched).
         KeyCode::Char('d') | KeyCode::Delete => state.clear_socks(),
@@ -906,6 +908,28 @@ mod tests {
         assert!(
             ui.connect_form.is_none(),
             "Shift+C must not open while a dial session exists"
+        );
+    }
+
+    #[test]
+    fn shift_s_start_socks_requires_live_pairing() {
+        use crate::app_state::{ConnStatus, SocksCommand};
+        // A SOCKS port is set, but with no live pairing `s` must not dispatch Start — matching
+        // the Proxy table, which only advertises `s start` once paired.
+        let st = AppState::new(Role::Both, false, LogBuffer::new(16), Some(1080), false, None, false);
+        let mut rx = st.subscribe_socks();
+        let mut ui = UiState::default();
+
+        handle_key(key(KeyCode::Char('s')), &mut ui, &st);
+        assert!(rx.try_recv().is_err(), "s must be inert without a live pairing");
+
+        // Once an outbound session is Connected, `s` dispatches Start.
+        st.set_dial_target(Some("peer".into()));
+        st.set_conn_status(ConnStatus::Connected);
+        handle_key(key(KeyCode::Char('s')), &mut ui, &st);
+        assert!(
+            matches!(rx.try_recv(), Ok(SocksCommand::Start)),
+            "s must start the proxy once paired"
         );
     }
 

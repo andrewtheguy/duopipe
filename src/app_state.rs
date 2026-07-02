@@ -501,6 +501,17 @@ impl AppState {
         self.dial_target.read().is_some()
     }
 
+    /// Whether a live authenticated connection exists in either direction — an outbound dial
+    /// that reached `Connected`, or a currently-connected inbound peer. The local SOCKS proxy
+    /// only has a session to tunnel through when this holds, so the TUI gates the start
+    /// shortcut on it (the Proxy table advertises the same state).
+    pub fn has_live_pairing(&self) -> bool {
+        let dial_up = self.dial_target.read().is_some()
+            && matches!(*self.conn_status.read(), ConnStatus::Connected);
+        let inbound_up = self.inbound.read().as_ref().is_some_and(|p| p.connected());
+        dial_up || inbound_up
+    }
+
     /// One-pairing rule: a new dial may start only from a fully idle run — not
     /// while listening (even before a peer pairs in, so an inbound pairing can't
     /// land mid-dial) and not while an outbound dial session already exists (so a
