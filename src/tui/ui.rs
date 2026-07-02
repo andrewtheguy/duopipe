@@ -210,7 +210,7 @@ fn inbound_status_line(snap: &AppSnapshot) -> Option<Line<'static>> {
         Some(p) => Line::from(vec![
             Span::raw("inbound: "),
             Span::styled(
-                format!("reserved for {} (disconnected)", short_id(&p.remote_id)),
+                reserved_inbound_label(&short_id(&p.remote_id)),
                 Style::default().fg(Color::Yellow),
             ),
         ]),
@@ -220,6 +220,13 @@ fn inbound_status_line(snap: &AppSnapshot) -> Option<Line<'static>> {
         )),
     };
     Some(line)
+}
+
+/// Shared wording for the paired-but-disconnected (reserved) inbound state, so the header line and
+/// the `w` connection dump describe it identically. `id` is the caller's chosen form of the peer's
+/// node id (truncated in the header, full in the dump).
+pub(super) fn reserved_inbound_label(id: &str) -> String {
+    format!("reserved for {id} (disconnected)")
 }
 
 /// One-line footer for the home screen carrying the global key hints (the per-pane

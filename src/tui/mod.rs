@@ -701,7 +701,7 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
             );
         }
         Some(p) => {
-            let _ = writeln!(out, "  {}  (reserved — disconnected)", p.remote_id);
+            let _ = writeln!(out, "  {}", ui::reserved_inbound_label(&p.remote_id));
         }
     }
 
