@@ -195,7 +195,7 @@ fn inbound_status_line(snap: &AppSnapshot) -> Option<Line<'static>> {
         return None;
     }
     let line = match &snap.inbound {
-        Some(p) if p.connected => Line::from(vec![
+        Some(p) if p.connected() => Line::from(vec![
             Span::raw("inbound ← "),
             Span::styled(
                 short_id(&p.remote_id),
@@ -1201,7 +1201,7 @@ mod tests {
         // Paired and connected: the short id shows on the inbound line.
         snap.inbound = Some(InboundPeer {
             remote_id: id.to_string(),
-            connected: true,
+            active_conns: 1,
             connected_since: Instant::now(),
             path: PathInfo::establishing(),
         });
@@ -1212,7 +1212,7 @@ mod tests {
         // Disconnected: the endpoint stays reserved for that peer.
         snap.inbound = Some(InboundPeer {
             remote_id: id.to_string(),
-            connected: false,
+            active_conns: 0,
             connected_since: Instant::now(),
             path: PathInfo::establishing(),
         });

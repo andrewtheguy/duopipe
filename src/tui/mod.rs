@@ -691,7 +691,7 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         None => {
             let _ = writeln!(out, "  (none)");
         }
-        Some(p) if p.connected => {
+        Some(p) if p.connected() => {
             let _ = writeln!(
                 out,
                 "  {}  up {}s  {}",
