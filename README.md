@@ -13,7 +13,7 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 **Features:**
 - **No account or registration required** — Just download and run
 - **No publicly accessible IPs or port forwarding required** — Automatic NAT hole punching
-- **Many peers, one forward each** — A listener serves several dialers at once over one endpoint; each dial session carries a single TCP forward, with bidirectional traffic
+- **One pair at a time** — A listener pairs with a single dialer per listen session (all modes); the first peer to authenticate claims the endpoint and others are refused until you stop listening. That dial session carries a single TCP forward, with bidirectional traffic
 - **TCP forwarding** — Seamlessly tunnel a single TCP stream per session (UDP is intentionally out of scope — see [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs))
 - **Cross-platform** — Works on Linux, macOS, and Windows
 - **No root required** — Runs as unprivileged user
@@ -31,7 +31,7 @@ Duopipe is for **one person connecting their own devices** — laptop, homelab b
 
 ## Overview
 
-duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each of which opens an interactive terminal UI. The dashboard opens **idle**: press **`Shift-L`** to start listening, and it then accepts **many inbound peers at once** over one iroh endpoint and serves their tunnel request (press `Shift-L` again to stop). Alongside that, each instance can hold **one outbound dial session** that *it* drives — SSH `-L`–style local forwarding: it binds a local listener and asks the connected peer to connect out to a remote source. Dialing is available immediately, even before listening is started. Each individual connection is one-directional (one requester, one server); your process is just both at once.
+duopipe runs as a peer launched in one of two modes — `duopipe quick` (configless) or `duopipe run` (config-driven) — each of which opens an interactive terminal UI. The dashboard opens **idle**: press **`Shift-L`** to start listening, and it then pairs with **one inbound peer** over one iroh endpoint and serves its tunnel request (press `Shift-L` again to stop; the first peer to authenticate claims the endpoint for that session, and other peers are refused until you stop). Alongside that, each instance can hold **one outbound dial session** that *it* drives — SSH `-L`–style local forwarding: it binds a local listener and asks the connected peer to connect out to a remote source. Dialing is available immediately, even before listening is started. Each individual connection is one-directional (one requester, one server); your process is just both at once.
 
 > **Note:** v1 forwards a **single TCP stream** per dial session — one `remote_source` reached through one `local_listen`. A single SOCKS5 listener (so one tunnel can reach many destinations) is the planned future direction, modeled on [flextunnel](https://github.com/andrewtheguy/flextunnel). UDP is intentionally out of scope; that role belongs to [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs).
 
@@ -43,12 +43,12 @@ There is **no listen/dial choice at startup**. Quick mode runs fully ephemeral (
 
 > **Note:** The iroh identity is **ephemeral** — a fresh identity is generated on every run, so a node id **changes every run**. In config mode peers find each other by `name` regardless; in quick mode re-copy the node id each run.
 
-A peer can serve **many inbound peers at once** — laptop + phone + VPS all dialing one homelab box — each shown in its peer list, while also dialing out itself. Each dial session carries one TCP forward. iroh provides NAT traversal with relay fallback and automatic discovery.
+A peer serves **one inbound peer per listen session** — the first device to authenticate (laptop *or* phone *or* VPS) claims the homelab box until it stops listening — shown inline in its header, while also dialing out itself. Each dial session carries one TCP forward. iroh provides NAT traversal with relay fallback and automatic discovery.
 
 > [!IMPORTANT]
-> **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS); the same auth token lives on each of your machines. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
-> - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth token is per-run too. Move the auth token between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in config mode the node id is then discovered automatically.
-> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, connected peers, and the tunnel's health — and **starts/stops the tunnel by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
+> **Intended use — one person linking their own devices.** duopipe assumes both peers are **devices you own** (e.g. laptop ↔ homelab box ↔ VPS), authenticated by the same **shared auth secret** — a pre-shared **auth token** in config and quick manual modes, or a **rotating PIN** in quick PIN mode. (Two parties who fully trust each other can use it too, but that is not the primary design point.) It is *not* a public service or a multi-tenant gateway. The design leans on this throughout:
+> - **Out-of-band coordination.** The ephemeral node id changes every run, and any generated auth secret is per-run too. In config and quick manual modes, move the **auth token** between your own devices over a side channel you already have (a password manager, an SSH session, a synced notes/secrets store) before connecting; in config mode the node id is then discovered automatically. In quick **PIN** mode there is nothing to pre-share — the listener shows a rotating PIN that you type on the dialer, which both finds the node id and authenticates the connection in-band.
+> - **Live, interactive operation.** Each device runs the TUI and watches shared status — connection state, the paired peer, and the tunnel's health — and **starts/stops the tunnel by hand**. Nothing forwards on its own; you decide *what* to expose and *when*.
 > - **Trust rests on the shared token.** Once the shared auth token passes, the connected peer is fully trusted — it may ask the serving peer to connect out to **any `host:port`** it requests. Keep the token only on devices you own (or fully trust).
 
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and technical deep-dives.
@@ -213,7 +213,7 @@ Each iroh connection carries one requested tunnel. The **dialer** *requests* the
 +-----------------+        +-----------------+        +-----------------+        +-----------------+
 ```
 
-One connection carries a single TCP request from the dialer, and one serving peer handles many dialers concurrently. For any single connection the serving side is a pure server — so to reach a service that lives near the *other* box, dial *from* the box that wants to reach it (every node can dial on demand).
+One connection carries a single TCP request from the dialer, and a serving peer is paired with one dialer per listen session. For that connection the serving side is a pure server — so to reach a service that lives near the *other* box, dial *from* the box that wants to reach it (every node can dial on demand).
 
 For deeper architecture diagrams and protocol flows, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -248,7 +248,7 @@ local_listen = "127.0.0.1:15678"
 - This makes the **dialing** side listen on `127.0.0.1:15678`; connections are forwarded to `127.0.0.1:5678`, which the **connected peer** connects out to (it is fully trusted once the shared token passes).
 - The direction is per-connection: whoever pressed `c` is the requester. To pull a service the *other* way, dial from the other box (or both dial each other — each instance serves and dials at once).
 
-The request is started/stopped from the TUI. A single instance serves several inbound peers at once while holding one outbound dial session.
+The request is started/stopped from the TUI. A single instance serves one paired inbound peer per listen session while holding one outbound dial session.
 
 ### 3. SSH over a requested tunnel
 
@@ -477,5 +477,5 @@ The peer process uses categorized exit codes so wrapper scripts can distinguish 
 5. **Authentication phase:** the dialing peer opens a dedicated auth stream and sends `AuthRequest` with the shared auth token
 6. **The listening peer validates the token** (10s timeout) against its single accepted token — an invalid token is rejected with an error response
    - *If authentication fails, the connection is closed and the following steps do not occur*
-7. **After auth, the tunnel request:** once authenticated, the **dialer** *requests* the tunnel and the **listener serves** it — connecting out to whatever `host:port` the now-trusted dialer names. A listener admits many dialers concurrently (no single-peer binding).
+7. **After auth, the tunnel request:** once authenticated, the **dialer** *requests* the tunnel and the **listener serves** it — connecting out to whatever `host:port` the now-trusted dialer names. A listener pairs with a single dialer per listen session: the first peer to authenticate claims the endpoint (by its node id) and other peers are refused until the session is stopped, but the paired peer may reconnect without re-authenticating.
 8. The requested tunnel is negotiated over the connection; within the tunnel, TCP traffic flows in both directions

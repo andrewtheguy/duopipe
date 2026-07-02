@@ -19,12 +19,6 @@ outbound dial session. Two interactive subcommands — `duopipe quick` (configle
 dial by node id) and `duopipe connect` (config-driven, dial by `name`). Headless test
 mode is gated by `DUOPIPE_TEST_MODE=1` and still auto-listens.
 
-**Scope (v1):** a dial session forwards exactly **one TCP** stream — the single
-`[tunnel]` (`remote_source` / `local_listen`, both bare `host:port`). This is the
-groundwork for a single SOCKS5 listener per host (cf. `../flextunnel`). **UDP is not
-supported** — that role lives in `../tunnel-rs`. There is no multi-tunnel/multi-port
-support; don't reintroduce it.
-
 # Automation / AI agents
 The interactive `quick`/`connect` subcommands need a TTY and are not scriptable, but
 `duopipe generate-auth-token` is. For programmatic use pass `--json` to get a

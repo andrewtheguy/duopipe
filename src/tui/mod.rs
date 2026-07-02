@@ -128,7 +128,7 @@ pub async fn run_tui(launch: TuiLaunch) -> Result<()> {
                 // dialer already has what it needs). It's a one-shot, not a per-tick force,
                 // so the user can still toggle it back with `h` afterwards (e.g. to pair
                 // another device in PIN mode).
-                if !snap.peers.is_empty() && !ui_state.peers_seen {
+                if snap.inbound.is_some() && !ui_state.peers_seen {
                     ui_state.peers_seen = true;
                     hide_token_banner(&mut ui_state);
                 }
@@ -686,11 +686,12 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
         }
     }
 
-    let _ = writeln!(out, "\nConnected peers:");
-    if snap.peers.is_empty() {
-        let _ = writeln!(out, "  (none)");
-    } else {
-        for p in &snap.peers {
+    let _ = writeln!(out, "\nInbound peer:");
+    match &snap.inbound {
+        None => {
+            let _ = writeln!(out, "  (none)");
+        }
+        Some(p) if p.connected() => {
             let _ = writeln!(
                 out,
                 "  {}  up {}s  {}",
@@ -698,6 +699,9 @@ fn dump_connection_info(snap: &AppSnapshot) -> std::io::Result<String> {
                 p.connected_since.elapsed().as_secs(),
                 p.path.describe()
             );
+        }
+        Some(p) => {
+            let _ = writeln!(out, "  {}", ui::reserved_inbound_label(&p.remote_id));
         }
     }
 

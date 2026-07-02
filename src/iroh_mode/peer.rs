@@ -74,6 +74,51 @@ impl RecentPins {
     }
 }
 
+/// The single peer a serve endpoint is paired with, for the lifetime of one listen session
+/// (one Shift+L Start→Stop, or the whole process in headless `Role::Listen`). duopipe links a
+/// single user's own devices **one pair at a time** by design: once a dialer authenticates, its
+/// (QUIC/TLS-authenticated) node id claims the endpoint and any other node id is refused until the
+/// user stops listening. The claim is intentionally *not* released when the paired peer
+/// disconnects, so that peer — and only that peer — can reconnect without re-authenticating (in
+/// quick PIN mode, without re-typing a PIN that may since have rotated). A fresh listen session
+/// mints a new endpoint id and a new (empty) claim.
+#[derive(Clone, Default)]
+struct PairClaim(Arc<parking_lot::Mutex<Option<ClaimedPeer>>>);
+
+/// The peer that holds a [`PairClaim`], plus the material needed to let it reconnect.
+#[derive(Clone)]
+struct ClaimedPeer {
+    /// The paired dialer's node id (its public key; authenticated by the iroh/QUIC handshake).
+    node_id: EndpointId,
+    /// The PIN auth key that verified this peer at pairing (quick PIN mode only). Retained so the
+    /// paired peer can complete the in-band challenge-response on reconnect even after its PIN has
+    /// rotated out of the listener's recent-bucket cache. `None` for token-authenticated pairings.
+    pin_key: Option<nostr_sdk::Keys>,
+}
+
+impl PairClaim {
+    /// Snapshot the current claim (cheap clone) for the pre-auth gate.
+    fn peek(&self) -> Option<ClaimedPeer> {
+        self.0.lock().clone()
+    }
+
+    /// Commit a freshly authenticated peer as the pair. Returns `true` if `node_id` now holds the
+    /// claim — either because it was unclaimed and we just took it, or because this same peer
+    /// already held it (a reconnect/retry). Returns `false` if another node id won the claim first
+    /// (a race between two first-time dialers), in which case the caller must reject this peer.
+    fn commit(&self, node_id: EndpointId, pin_key: Option<nostr_sdk::Keys>) -> bool {
+        let mut g = self.0.lock();
+        match g.as_ref() {
+            Some(c) if c.node_id != node_id => false,
+            Some(_) => true,
+            None => {
+                *g = Some(ClaimedPeer { node_id, pin_key });
+                true
+            }
+        }
+    }
+}
+
 /// How a connection authenticates. Chosen by the caller from the dial target (outbound) or the
 /// listener's mode (inbound), and consumed by [`handle_connection`].
 enum AuthMode {
@@ -82,10 +127,13 @@ enum AuthMode {
     /// Outbound: prove PIN possession in-band (quick PIN mode).
     DialPin(String),
     /// Inbound: accept any of `tokens`; if `pin_cache` is `Some` (quick-mode listener), also
-    /// accept a valid PIN proof against the retained recent-bucket keys.
+    /// accept a valid PIN proof against the retained recent-bucket keys. `claim` enforces the
+    /// one-pair-at-a-time rule: the first peer to authenticate claims the endpoint and all other
+    /// node ids are refused until the listen session ends.
     Listen {
         tokens: HashSet<String>,
         pin_cache: Option<RecentPins>,
+        claim: PairClaim,
     },
 }
 
@@ -382,6 +430,11 @@ async fn run_managed_dial_session(
 ) {
     let shutdown = config.status.shutdown.clone();
     let mut backoff = Duration::from_secs(1);
+    // For a PIN target: the node id resolved on the first successful pairing. Reused on every
+    // reconnect thereafter — the typed PIN has since rotated off the relay (so a fresh lookup would
+    // fail), but the listener retains our pairing key, so we reconnect by node id and re-prove the
+    // same PIN in-band without the user re-typing a code.
+    let mut pinned_pin_id: Option<EndpointId> = None;
 
     loop {
         config.status.set_conn_status(ConnStatus::Connecting);
@@ -413,6 +466,9 @@ async fn run_managed_dial_session(
                     }
                 }
             },
+            // Reconnect fast-path: once paired, dial the remembered node id directly instead of
+            // re-resolving the (now-rotated) PIN on the relay.
+            DialTarget::Pin(_) if pinned_pin_id.is_some() => Ok(pinned_pin_id.unwrap()),
             DialTarget::Pin(pin) => {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
@@ -457,6 +513,10 @@ async fn run_managed_dial_session(
                     .set_dial_target(Some(DialTarget::NodeId(*id).describe()));
             }
         }
+
+        // The id we're about to dial this attempt, captured before `resolved` is consumed so a
+        // successful PIN pairing below can remember it for reconnects.
+        let attempt_id: Option<EndpointId> = resolved.as_ref().ok().copied();
 
         let connect = match resolved {
             Ok(id) => {
@@ -505,6 +565,11 @@ async fn run_managed_dial_session(
                     // Session cancelled (disconnect or replaced by a new target).
                     None => return,
                     Some(Ok(())) => {
+                        // First successful PIN pairing: remember the node id so reconnects dial it
+                        // directly instead of re-resolving the rotated PIN (see `pinned_pin_id`).
+                        if matches!(target, DialTarget::Pin(_)) && pinned_pin_id.is_none() {
+                            pinned_pin_id = attempt_id;
+                        }
                         backoff = Duration::from_secs(1);
                         log::info!("Connection closed; will reconnect");
                     }
@@ -730,6 +795,11 @@ async fn run_listen(
     let config = Arc::new(config);
     let mut connection_tasks: JoinSet<()> = JoinSet::new();
 
+    // This serve endpoint pairs with one peer at a time (all modes). The claim is empty until the
+    // first dialer authenticates and lives for this whole listen session — a Shift+L stop tears
+    // `run_listen` down and starts the next session with a fresh endpoint id and a fresh claim.
+    let claim = PairClaim::default();
+
     loop {
         while connection_tasks.try_join_next().is_some() {}
 
@@ -763,6 +833,7 @@ async fn run_listen(
         let auth = AuthMode::Listen {
             tokens: config.auth_token.iter().cloned().collect(),
             pin_cache: pin_cache.clone(),
+            claim: claim.clone(),
         };
         connection_tasks.spawn(crate::logging::inherit_source(async move {
             if let Err(e) = handle_connection(conn, config, semaphore, auth).await {
@@ -1278,9 +1349,13 @@ async fn handle_connection(
             auth_as_dialer_pin(&conn, pin).await?;
             config.status.set_conn_status(ConnStatus::Connected);
         }
-        AuthMode::Listen { tokens, pin_cache } => {
-            auth_as_listener(&conn, tokens, pin_cache.as_ref()).await?;
-            config.status.add_peer(remote_id.to_string());
+        AuthMode::Listen {
+            tokens,
+            pin_cache,
+            claim,
+        } => {
+            auth_as_listener(&conn, tokens, pin_cache.as_ref(), claim).await?;
+            config.status.mark_peer_connected(remote_id.to_string());
             log::info!("Peer {remote_id} authenticated");
         }
     }
@@ -1343,7 +1418,7 @@ async fn handle_connection(
     if is_dialer {
         config.status.set_conn_status(ConnStatus::Closed);
     } else {
-        config.status.remove_peer(&remote_id.to_string());
+        config.status.mark_peer_disconnected(&remote_id.to_string());
     }
     tasks.shutdown().await;
     Ok(())
@@ -1469,12 +1544,33 @@ async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Res
 
 /// Authenticate as the listener. Accepts either a pre-shared token or (quick mode) a PIN proof;
 /// `pin_cache` holds the recent-bucket PIN keys and is `None` outside quick mode.
+///
+/// `claim` enforces the one-pair-at-a-time rule across all modes: if another node id already holds
+/// the claim this peer is refused up front; otherwise a successful handshake commits this peer as
+/// the pair. The claimed peer may reconnect freely — its own node id always passes the gate, and in
+/// quick PIN mode the key it paired with is added to the candidate set so its proof still verifies
+/// after the PIN has rotated out of `pin_cache`.
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
     auth_tokens: &HashSet<String>,
     pin_cache: Option<&RecentPins>,
+    claim: &PairClaim,
 ) -> Result<()> {
     let remote_id = conn.remote_id();
+
+    // Pre-auth gate: this endpoint pairs with one peer at a time. `existing` is the current claim;
+    // if it belongs to a different node id we still run the handshake (so the dialer gets a proper
+    // rejection instead of a bare connection drop) but with no valid credentials, guaranteeing it
+    // fails. If it belongs to this peer, `reconnect_key` lets its rotated PIN still verify.
+    let existing = claim.peek();
+    let claimed_by_other = existing.as_ref().is_some_and(|c| c.node_id != remote_id);
+    let reconnect_key = existing
+        .as_ref()
+        .filter(|c| c.node_id == remote_id)
+        .and_then(|c| c.pin_key.clone());
+    if claimed_by_other {
+        log::warn!("Refusing {remote_id}: listener is already paired with another device");
+    }
 
     let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
         let (mut send, mut recv) = conn
@@ -1487,24 +1583,56 @@ async fn auth_as_listener(
             .context("Failed to read auth request")?;
         match decode_auth_request(&request_bytes).context("Invalid auth request")? {
             AuthRequest::Token { auth_token, .. } => {
-                if !is_token_valid(auth_token.as_str(), auth_tokens) {
-                    log::warn!("Invalid auth token from {}", remote_id);
-                    let response = AuthResponse::rejected("Invalid authentication token");
+                if claimed_by_other || !is_token_valid(auth_token.as_str(), auth_tokens) {
+                    let reason = if claimed_by_other {
+                        "Listener is already paired with another device"
+                    } else {
+                        log::warn!("Invalid auth token from {}", remote_id);
+                        "Invalid authentication token"
+                    };
+                    let response = AuthResponse::rejected(reason);
                     send.write_all(&encode_auth_response(&response)?).await?;
                     send.finish()?;
-                    anyhow::bail!("Invalid auth token");
+                    anyhow::bail!("{reason}");
+                }
+                // Win the one-pair claim *before* telling the dialer it is accepted, so a race
+                // loser is rejected rather than briefly told "accepted" and then dropped.
+                if !claim.commit(remote_id, None) {
+                    let response =
+                        AuthResponse::rejected("Listener is already paired with another device");
+                    send.write_all(&encode_auth_response(&response)?).await?;
+                    send.finish()?;
+                    anyhow::bail!("listener paired with another device first");
                 }
                 let response = AuthResponse::accepted();
                 send.write_all(&encode_auth_response(&response)?).await?;
                 send.finish()?;
-                Ok::<_, anyhow::Error>(())
+                Ok::<(), anyhow::Error>(())
             }
             AuthRequest::Pin { nonce, .. } => {
-                // Verify the dialer's PIN proof against the recent-bucket keys. An empty candidate
-                // set (this listener isn't in quick mode) yields a clean rejection.
-                let candidates = pin_cache.map(|c| c.snapshot()).unwrap_or_default();
-                crate::pin_auth::listener_handshake(&mut send, &mut recv, &candidates, &nonce)
-                    .await?;
+                // Verify the dialer's PIN proof against the recent-bucket keys, plus (for a
+                // reconnecting paired peer) the key it originally paired with. An empty candidate
+                // set — a non-quick listener, or a peer refused by the gate — yields a clean
+                // rejection.
+                let mut candidates = if claimed_by_other {
+                    Vec::new()
+                } else {
+                    pin_cache.map(|c| c.snapshot()).unwrap_or_default()
+                };
+                if let Some(key) = &reconnect_key {
+                    candidates.push(key.clone());
+                }
+                // The claim is committed inside the handshake, right after the proof verifies and
+                // *before* the acceptance frame is sent — so a race loser is rejected in-band, not
+                // accepted-then-dropped.
+                crate::pin_auth::listener_handshake(
+                    &mut send,
+                    &mut recv,
+                    &candidates,
+                    &nonce,
+                    |key| claim.commit(remote_id, Some(key.clone())),
+                )
+                .await?;
                 let _ = send.finish();
                 log::info!("Peer {remote_id} authenticated via PIN");
                 Ok(())
@@ -1909,6 +2037,7 @@ mod tests {
             let auth = AuthMode::Listen {
                 tokens: std::iter::once(token.to_string()).collect(),
                 pin_cache: None,
+                claim: PairClaim::default(),
             };
             let _ = handle_connection(conn, server_cfg, test_semaphore(), auth).await;
         });
@@ -1985,7 +2114,7 @@ mod tests {
             let incoming = server_ep2.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("accept connection");
             let accepted: HashSet<String> = std::iter::once(token.to_string()).collect();
-            auth_as_listener(&conn, &accepted, None)
+            auth_as_listener(&conn, &accepted, None, &PairClaim::default())
                 .await
                 .expect("listener auth");
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -2061,7 +2190,9 @@ mod tests {
         let listener_task = tokio::spawn(async move {
             let incoming = server_ep2.accept().await.expect("incoming connection");
             let conn = incoming.await.expect("accept connection");
-            let res = auth_as_listener(&conn, &HashSet::new(), Some(&recent)).await;
+            let res =
+                auth_as_listener(&conn, &HashSet::new(), Some(&recent), &PairClaim::default())
+                    .await;
             (res, conn)
         });
 
@@ -2106,5 +2237,157 @@ mod tests {
         let (dialer, listener) = run_pin_auth(&pin, &[]).await;
         assert!(dialer.is_err(), "dialer must be rejected with no candidates");
         assert!(listener.is_err(), "listener with empty cache must reject");
+    }
+
+    /// `PairClaim` gives the first committer exclusive hold: that node id (and only it) may
+    /// commit again (reconnect); any other node id is refused until the claim is dropped.
+    #[tokio::test]
+    async fn pair_claim_is_exclusive_and_reentrant() {
+        let a = hermetic_endpoint().await;
+        let b = hermetic_endpoint().await;
+        let (id_a, id_b) = (a.id(), b.id());
+        a.close().await;
+        b.close().await;
+
+        let claim = PairClaim::default();
+        assert!(claim.peek().is_none(), "starts unclaimed");
+        assert!(claim.commit(id_a, None), "first committer wins");
+        assert!(claim.commit(id_a, None), "same peer may re-commit (reconnect)");
+        assert!(!claim.commit(id_b, None), "a different peer is refused");
+        assert_eq!(claim.peek().map(|c| c.node_id), Some(id_a));
+    }
+
+    /// Wait until `ep` publishes a direct address, then return it (hermetic endpoints only
+    /// ever surface a direct addr — relay is disabled).
+    async fn ready_addr(ep: &Endpoint) -> iroh::EndpointAddr {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addr = ep.addr();
+                if addr.ip_addrs().next().is_some() {
+                    break addr;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("direct address ready")
+    }
+
+    /// One token-auth attempt against a shared listener endpoint + claim. Returns the dialer's
+    /// and listener's auth results. Keeps the accepted connection alive until the dialer has read
+    /// its response, mirroring production (which holds the connection open after auth).
+    async fn token_attempt(
+        server_ep: &Endpoint,
+        addr: &iroh::EndpointAddr,
+        client_ep: &Endpoint,
+        token: &str,
+        accepted: &HashSet<String>,
+        claim: &PairClaim,
+    ) -> (Result<()>, Result<()>) {
+        let server_ep2 = server_ep.clone();
+        let accepted = accepted.clone();
+        let claim = claim.clone();
+        let listener = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("accept connection");
+            let res = auth_as_listener(&conn, &accepted, None, &claim).await;
+            (res, conn)
+        });
+        let conn = client_ep.connect(addr.clone(), ALPN).await.expect("connect");
+        let dialer_res = auth_as_dialer(&conn, token).await;
+        let (listener_res, _conn) = listener.await.expect("listener task panicked");
+        (dialer_res, listener_res)
+    }
+
+    /// The serve endpoint pairs with the first peer to authenticate; a second, different node id
+    /// is refused even with a valid token, while the paired peer may reconnect freely — the
+    /// one-pair-at-a-time rule that now applies to every mode.
+    #[tokio::test]
+    async fn listener_pairs_with_one_peer_across_reconnects() {
+        let token = "one-pair-token";
+        let server_ep = hermetic_endpoint().await;
+        let addr = ready_addr(&server_ep).await;
+        let client_a = hermetic_endpoint().await;
+        let client_b = hermetic_endpoint().await;
+        let claim = PairClaim::default();
+        let accepted: HashSet<String> = std::iter::once(token.to_string()).collect();
+
+        // First peer claims the endpoint.
+        let (d, l) = token_attempt(&server_ep, &addr, &client_a, token, &accepted, &claim).await;
+        assert!(d.is_ok() && l.is_ok(), "first peer pairs: d={d:?} l={l:?}");
+
+        // A different device with the same valid token is refused.
+        let (d, l) = token_attempt(&server_ep, &addr, &client_b, token, &accepted, &claim).await;
+        assert!(d.is_err(), "second device must be rejected");
+        assert!(l.is_err(), "listener must refuse the second device");
+
+        // The paired peer reconnects without trouble.
+        let (d, l) = token_attempt(&server_ep, &addr, &client_a, token, &accepted, &claim).await;
+        assert!(d.is_ok() && l.is_ok(), "paired peer reconnects: d={d:?} l={l:?}");
+
+        client_a.close().await;
+        client_b.close().await;
+        server_ep.close().await;
+    }
+
+    /// One PIN-auth attempt against a shared listener endpoint + claim + recent-bucket cache.
+    async fn pin_attempt(
+        server_ep: &Endpoint,
+        addr: &iroh::EndpointAddr,
+        client_ep: &Endpoint,
+        pin: &str,
+        recent: &RecentPins,
+        claim: &PairClaim,
+    ) -> (Result<()>, Result<()>) {
+        let server_ep2 = server_ep.clone();
+        let recent = recent.clone();
+        let claim = claim.clone();
+        let listener = tokio::spawn(async move {
+            let incoming = server_ep2.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("accept connection");
+            let res = auth_as_listener(&conn, &HashSet::new(), Some(&recent), &claim).await;
+            (res, conn)
+        });
+        let conn = client_ep.connect(addr.clone(), ALPN).await.expect("connect");
+        let dialer_res = auth_as_dialer_pin(&conn, pin).await;
+        let (listener_res, _conn) = listener.await.expect("listener task panicked");
+        (dialer_res, listener_res)
+    }
+
+    /// Quick PIN mode: the paired peer reconnects even after its PIN has rotated out of the
+    /// recent-bucket cache (the listener retained its pairing key), while a *different* device
+    /// presenting the very same, still-cached PIN is refused because the endpoint is already
+    /// paired.
+    #[tokio::test]
+    async fn pin_pair_reconnects_after_rotation_and_blocks_others() {
+        let pin = crate::pin::generate_pin();
+        let server_ep = hermetic_endpoint().await;
+        let addr = ready_addr(&server_ep).await;
+        let client_a = hermetic_endpoint().await;
+        let client_b = hermetic_endpoint().await;
+        let claim = PairClaim::default();
+
+        // First pairing: the PIN is in the recent cache and populates the claim.
+        let recent = RecentPins::default();
+        recent.push(crate::pin_auth::derive_auth_keys(&pin).unwrap());
+        let (d, l) = pin_attempt(&server_ep, &addr, &client_a, &pin, &recent, &claim).await;
+        assert!(d.is_ok() && l.is_ok(), "first PIN pairing: d={d:?} l={l:?}");
+
+        // Rotation: the PIN is gone from the cache, but the paired peer still reconnects.
+        let rotated = RecentPins::default();
+        let (d, l) = pin_attempt(&server_ep, &addr, &client_a, &pin, &rotated, &claim).await;
+        assert!(d.is_ok(), "paired peer must reconnect after rotation: {d:?}");
+        assert!(l.is_ok(), "listener must accept the reconnect: {l:?}");
+
+        // A different device presenting the same (freshly re-cached) PIN is still refused.
+        let same_pin_cached = RecentPins::default();
+        same_pin_cached.push(crate::pin_auth::derive_auth_keys(&pin).unwrap());
+        let (d, l) = pin_attempt(&server_ep, &addr, &client_b, &pin, &same_pin_cached, &claim).await;
+        assert!(d.is_err(), "a second device must be rejected even with the PIN");
+        assert!(l.is_err(), "listener must refuse a second device");
+
+        client_a.close().await;
+        client_b.close().await;
+        server_ep.close().await;
     }
 }

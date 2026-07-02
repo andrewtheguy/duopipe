@@ -252,13 +252,31 @@ fn tunnel_spec_label(entry: &TunnelEntry) -> String {
     format!("{} <- {}", entry.local_listen, entry.remote_source)
 }
 
-/// A currently-connected, authenticated inbound peer. The serve half handles
-/// many of these at once — one row per live inbound connection.
+/// The single inbound peer the serve half is paired with this listen session. duopipe pairs one
+/// dialer at a time, so there is at most one. The peer is [`connected`](Self::connected) while it
+/// holds at least one live authenticated connection; when that count reaches zero it is still
+/// retained as the endpoint's reservation — it stays reserved for that peer (which may reconnect
+/// without re-authenticating) until the user stops listening.
+///
+/// `active_conns` is a refcount rather than a bool so a brief **reconnect overlap** (the peer's new
+/// connection authenticates before its previous one has finished closing) never shows as
+/// "disconnected": the count only reaches zero once *every* connection from the peer is gone.
 #[derive(Clone)]
-pub struct PeerRow {
+pub struct InboundPeer {
     pub remote_id: String,
+    /// Number of live authenticated connections from this peer (normally 0 or 1; transiently 2
+    /// during a reconnect overlap).
+    pub active_conns: usize,
     pub connected_since: Instant,
     pub path: PathInfo,
+}
+
+impl InboundPeer {
+    /// Whether the peer currently holds any live connection. `false` means it is disconnected but
+    /// the endpoint remains reserved for it.
+    pub fn connected(&self) -> bool {
+        self.active_conns > 0
+    }
 }
 
 /// Shared application state. Construct via [`AppState::new`], wrap in `Arc`.
@@ -275,9 +293,10 @@ pub struct AppState {
     endpoint_id: RwLock<Option<String>>,
     conn_status: RwLock<ConnStatus>,
     path: RwLock<PathInfo>,
-    /// Currently-connected inbound peers (the serve half handles many at once; the
-    /// dial session tracks its own outbound path separately via `path`).
-    peers: RwLock<Vec<PeerRow>>,
+    /// The single inbound peer paired with the serve half this listen session (`None` until one
+    /// authenticates). Retained through a disconnect as the endpoint's reservation and cleared only
+    /// when the serve half stops. The dial session tracks its own outbound path separately via `path`.
+    inbound: RwLock<Option<InboundPeer>>,
     /// The single configured tunnel spec (`None` until set from config or the TUI).
     /// The supervisor reads it on `Start`; the TUI sets/clears it.
     tunnel: RwLock<Option<TunnelEntry>>,
@@ -344,7 +363,7 @@ impl AppState {
             endpoint_id: RwLock::new(None),
             conn_status: RwLock::new(ConnStatus::Connecting),
             path: RwLock::new(PathInfo::establishing()),
-            peers: RwLock::new(Vec::new()),
+            inbound: RwLock::new(None),
             tunnel: RwLock::new(tunnel),
             tunnel_status: RwLock::new(TunnelStatus::Idle),
             tunnel_detail: RwLock::new(String::new()),
@@ -423,17 +442,19 @@ impl AppState {
 
     /// Tear down the serve half's surfaced state once it has stopped: back to `Stopped`,
     /// drop the displayed node id, and clear any rotating PIN (a fresh start mints new
-    /// ones). Also drops the inbound peer rows (added only by the listener side) and any
-    /// nostr name-conflict prompt/warning (raised only by the serve half's publisher):
+    /// ones). Also drops the paired inbound peer / reservation (set only by the listener side)
+    /// and any nostr name-conflict prompt/warning (raised only by the serve half's publisher):
     /// their owning tasks are aborted on stop and don't run their own cleanup, so without
-    /// this the TUI would show stale peers/conflicts after the serve half is down. The auth
-    /// token value is left seeded — the UI gates its display on `listening()` instead.
+    /// this the TUI would show a stale pairing/conflict after the serve half is down. The auth
+    /// token value is left seeded — the UI gates its display on `listening()` instead. Clearing
+    /// the reservation here matches the serve half minting a fresh, empty pairing claim on the
+    /// next start, so a different device can then pair.
     pub fn clear_listen(&self) {
         *self.listen_status.write() = ListenStatus::Stopped;
         *self.endpoint_id.write() = None;
         *self.current_pin.write() = None;
         *self.pin_deadline.write() = None;
-        self.peers.write().clear();
+        *self.inbound.write() = None;
         *self.name_conflict.write() = NameConflict::Inactive;
     }
 
@@ -515,30 +536,51 @@ impl AppState {
         *self.streams_max.write() = max;
     }
 
-    /// Update the path of a connected inbound peer, matched by `remote_id`.
+    /// Update the path of the paired inbound peer, matched by `remote_id`.
     pub fn set_peer_path(&self, remote_id: &str, path: PathInfo) {
-        let mut peers = self.peers.write();
-        if let Some(peer) = peers.iter_mut().find(|p| p.remote_id == remote_id) {
+        let mut inbound = self.inbound.write();
+        if let Some(peer) = inbound.as_mut().filter(|p| p.remote_id == remote_id) {
             peer.path = path;
         }
     }
 
-    /// Register a newly-authenticated inbound peer. The serve half handles many
-    /// peers at once, so this simply adds a row; duplicate `remote_id`s (a brief
-    /// reconnect overlap) are de-duplicated rather than rejected.
-    pub fn add_peer(&self, remote_id: String) {
-        let mut peers = self.peers.write();
-        if !peers.iter().any(|p| p.remote_id == remote_id) {
-            peers.push(PeerRow {
-                remote_id,
-                connected_since: Instant::now(),
-                path: PathInfo::establishing(),
-            });
+    /// Register a newly-authenticated connection from the inbound peer — called after each
+    /// successful auth (including reconnects). It becomes (or, in the rare case a different id
+    /// appears, replaces) this listen session's single paired peer. Since only one pair is allowed
+    /// this is a set, not an append; overlapping connections from the same peer bump a refcount so a
+    /// reconnect overlap never reads as disconnected. `connected_since` is stamped only on the
+    /// idle→connected transition so it reflects the current session, not each overlapping dial.
+    pub fn mark_peer_connected(&self, remote_id: String) {
+        let mut inbound = self.inbound.write();
+        match inbound.as_mut() {
+            Some(p) if p.remote_id == remote_id => {
+                if p.active_conns == 0 {
+                    p.connected_since = Instant::now();
+                    p.path = PathInfo::establishing();
+                }
+                p.active_conns += 1;
+            }
+            _ => {
+                *inbound = Some(InboundPeer {
+                    remote_id,
+                    active_conns: 1,
+                    connected_since: Instant::now(),
+                    path: PathInfo::establishing(),
+                });
+            }
         }
     }
 
-    pub fn remove_peer(&self, remote_id: &str) {
-        self.peers.write().retain(|p| p.remote_id != remote_id);
+    /// Drop one live connection from the paired inbound peer. When its last connection closes the
+    /// peer is kept as the endpoint's reservation (just flagged disconnected), so the header still
+    /// shows the endpoint is reserved for it (it may reconnect without re-authenticating); the
+    /// reservation is released only when the serve half stops (`clear_listen`). The refcount means a
+    /// reconnect overlap (a newer connection still live) keeps the peer shown as connected.
+    pub fn mark_peer_disconnected(&self, remote_id: &str) {
+        let mut inbound = self.inbound.write();
+        if let Some(p) = inbound.as_mut().filter(|p| p.remote_id == remote_id) {
+            p.active_conns = p.active_conns.saturating_sub(1);
+        }
     }
 
     /// Reset the tunnel's status to `Idle` (clearing any detail) on each
@@ -617,7 +659,7 @@ impl AppState {
             path: self.path.read().clone(),
             dial_target: self.dial_target.read().clone(),
             name_conflict: self.name_conflict.read().clone(),
-            peers: self.peers.read().clone(),
+            inbound: self.inbound.read().clone(),
             tunnel,
             streams_used,
             streams_max,
@@ -648,7 +690,9 @@ pub struct AppSnapshot {
     pub dial_target: Option<String>,
     /// Current nostr name-conflict state (drives the conflict modal / warning).
     pub name_conflict: NameConflict,
-    pub peers: Vec<PeerRow>,
+    /// The single inbound peer paired this listen session, or `None`. `connected == false` means it
+    /// is currently disconnected but the endpoint stays reserved for it.
+    pub inbound: Option<InboundPeer>,
     /// The single configured tunnel's row, or `None` when none is set.
     pub tunnel: Option<TunnelRow>,
     pub streams_used: usize,
@@ -722,23 +766,37 @@ mod tests {
     }
 
     #[test]
-    fn listener_tracks_multiple_peers() {
+    fn listener_pairs_with_one_peer_and_reserves_on_disconnect() {
         let state = AppState::new(Role::Listen, false, LogBuffer::new(16), None, false, None, false);
 
-        // Many distinct peers connect at once — all are tracked.
-        state.add_peer("peer-a".into());
-        state.add_peer("peer-b".into());
-        assert_eq!(state.snapshot().peers.len(), 2);
+        // The first peer to authenticate becomes the single paired peer.
+        state.mark_peer_connected("peer-a".into());
+        let p = state.snapshot().inbound.expect("paired");
+        assert_eq!(p.remote_id, "peer-a");
+        assert!(p.connected());
 
-        // A duplicate remote_id (brief reconnect overlap) is de-duplicated.
-        state.add_peer("peer-a".into());
-        assert_eq!(state.snapshot().peers.len(), 2);
+        // Reconnect overlap: a second connection from the same peer authenticates before the first
+        // has closed (refcount 2). Dropping the older one must keep the peer shown as connected.
+        state.mark_peer_connected("peer-a".into());
+        state.mark_peer_disconnected("peer-a");
+        let p = state.snapshot().inbound.expect("still paired");
+        assert_eq!(p.remote_id, "peer-a");
+        assert!(p.connected(), "an overlapping live connection must stay connected");
 
-        // Peers drop independently as they disconnect.
-        state.remove_peer("peer-a");
-        let peers = state.snapshot().peers;
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].remote_id, "peer-b");
+        // Once the last connection closes the peer is retained as the reservation, flagged
+        // disconnected.
+        state.mark_peer_disconnected("peer-a");
+        let p = state.snapshot().inbound.expect("still reserved");
+        assert_eq!(p.remote_id, "peer-a");
+        assert!(!p.connected());
+
+        // An extra disconnect (e.g. a late close) cannot underflow the refcount.
+        state.mark_peer_disconnected("peer-a");
+        assert!(!state.snapshot().inbound.expect("still reserved").connected());
+
+        // Stopping the serve half releases the reservation.
+        state.clear_listen();
+        assert!(state.snapshot().inbound.is_none());
     }
 
     #[test]
